@@ -9,6 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
+.vscode
 
 checkpoints
 data

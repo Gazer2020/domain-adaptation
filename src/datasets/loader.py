@@ -1,24 +1,24 @@
 import os
 from pathlib import Path
-from loguru import logger
+
 import torch
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 
 
-def get_class_splits(dataset_cfg):
+def get_class_splits(config):
     """
     Return shared_classes, source_private_classes, target_private_classes
     based on the configuration.
     """
-    setting = dataset_cfg.setting
+    setting = config.method.setting
 
     assert (
-        setting in dataset_cfg.splits
+        setting in config.dataset.splits
     ), f"Setting {setting} not found in splits configuration."
 
-    split_cfg = dataset_cfg.splits[setting]
+    split_cfg = config.dataset.splits[setting]
 
     src_classes = split_cfg.source
     tgt_classes = split_cfg.target
@@ -71,10 +71,10 @@ def get_dataloader(config):
     target_domain = config.dataset.target
 
     batch_size = config.batch_size
-    num_workers = config.get("num_workers", 4)
+    num_workers = config.num_workers
 
     # Determine classes
-    src_classes, tgt_classes, shared_classes = get_class_splits(config.dataset)
+    src_classes, tgt_classes, shared_classes = get_class_splits(config)
 
     # Transforms
     train_transform = transforms.Compose(

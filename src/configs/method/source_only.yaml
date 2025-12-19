@@ -1,7 +1,5 @@
-method:
-  name: SourceOnly
-  lr: 0.001
-  epochs: 1
+name: SourceOnly
+lr: 0.001
+epochs: 1
 
-dataset:
-  setting: csda
+setting: csda

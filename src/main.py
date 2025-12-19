@@ -1,13 +1,18 @@
-import sys
+import logging
 import random
-import numpy as np
-import torch
 from pathlib import Path
-from loguru import logger
-from utils import get_config
+
+import hydra
+import torch
+import numpy as np
+from omegaconf import OmegaConf, DictConfig
+
 from datasets.loader import get_dataloader
 from methods.base_solver import BaseSolver
 from methods.ros import RotationSolver
+
+
+logger = logging.getLogger(__name__)
 
 
 def set_seed(seed):
@@ -22,65 +27,44 @@ def set_seed(seed):
     logger.info(f"Random seed set to {seed}")
 
 
-def main():
-    # 1. Load Config
-    try:
-        config = get_config()
-    except Exception as e:
-        logger.error(f"Failed to load config: {e}")
-        sys.exit(1)
+@hydra.main(version_base="1.3", config_path="configs", config_name="config")
+def main(cfg: DictConfig):
+    # 1. Log config
+    logger.debug(OmegaConf.to_yaml(cfg))
+
+    # 2. Set seed
+    set_seed(cfg.get("seed", 42))
+
+    # 3. Get dataLoaders
+    source_loader, target_loader, target_test_loader = get_dataloader(cfg)
 
     logger.info(
-        f"Loaded config for dataset: {config.dataset.name}, method: {config.method.name}"
-    )
-
-    # 2. Set Seed
-    set_seed(config.get("seed", 42))
-
-    # 3. Get DataLoaders
-    source_loader, target_loader, target_test_loader = get_dataloader(config)
-
-    logger.info(
-        f"Data loaded. Source: {config.dataset.source}, Target: {config.dataset.target}, "
+        f"Data loaded. Source: {cfg.dataset.source}, Target: {cfg.dataset.target}, ",
     )
 
     # 4. Initialize Solver
     loaders = (source_loader, target_loader, target_test_loader)
-
-    # In the future, use a factory pattern here based on config.method.name
-    method_name = config.method.get("name", "SourceOnly")
-    if method_name == "SourceOnly":
-        solver = BaseSolver(config, loaders)
-    elif method_name == "ROS":
-        solver = RotationSolver(config, loaders)
+    name = cfg.method.name
+    if name == "ros":
+        solver = RotationSolver(cfg, loaders)
+    elif name == "sourceonly":
+        solver = BaseSolver(cfg, loaders)
     else:
-        logger.warning(
-            f"Unknown method {method_name}, falling back to BaseSolver"
-        )
-        solver = BaseSolver(config, loaders)
+        raise NotImplementedError(f"Unknown method {name}")
+
+    logger.info(f"Initialized solver for method: {name}")
 
     # 5. Train
     logger.info("Starting training...")
     solver.train()
 
     # 6. Save Model
-    # Determine save path
-    # Assuming we want to save in a 'checkpoints' dir in project root
-    # or relative to main.py
-    # Let's use config.exp_name to create a unique file
-    src_dir = Path(__file__).resolve()
-    project_root = src_dir.parent.parent
-    save_dir = (
-        project_root
-        / "checkpoints"
-        / config.dataset.name
-        / config.dataset.setting
-    )
-    save_name = f"{config.exp_name}.pth"
-    save_path = save_dir / save_name
-
+    save_dir = Path("checkpoints")
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / f"{cfg.exp_name}.pth"
     solver.save_checkpoint(save_path)
-    logger.info("Experiment finished successfully.")
+
+    logger.info(f"Model saved to: {save_path.absolute()}")
 
 
 if __name__ == "__main__":

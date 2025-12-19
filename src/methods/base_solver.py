@@ -1,9 +1,15 @@
+import logging
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from pathlib import Path
-from loguru import logger
 from tqdm import tqdm
+
+from models.backbones import get_resnet18
+from utils import AverageMeter
+
+logger = logging.getLogger(__name__)
 
 
 class BaseSolver:
@@ -11,6 +17,7 @@ class BaseSolver:
     Base solver class implementing source only training.
     Mainly used for smoke testing.
     """
+
     def __init__(self, config, loaders):
         """
         Initialize the BaseSolver.
@@ -23,7 +30,7 @@ class BaseSolver:
         self.source_loader, self.target_loader, self.target_test_loader = loaders
         self.device = torch.device(config.device)
 
-        if self.config.dataset.setting == "csda":
+        if self.config.method.setting == "csda":
             self.num_classes = self.config.dataset.num_classes
         else:
             raise NotImplementedError("BaseSolver only supports csda setting.")
@@ -32,10 +39,10 @@ class BaseSolver:
         # For base implementation, we'll use a simple ResNet-like backbone if possible,
         # or just a simple convnet for demonstration if torchvision is not preferred heavily here.
         # But usually DA uses ResNet50. Let's use a simple placeholder model.
-        self.net = self.build_model().to(self.device)
+        self.build_model()
 
         # Optimizer
-        self.optimizer = self.build_optimizer()
+        self.build_optimizer()
 
         # Loss function
         self.criterion = nn.CrossEntropyLoss()
@@ -44,22 +51,22 @@ class BaseSolver:
         """
         Build the network architecture.
         """
-        # For simplicity in BaseSolver, let's use a torchvision resnet18
-        # In a real scenario, this might come from a models/ backbone file
-        from torchvision.models import resnet18, ResNet18_Weights
+        resnet18_backbone = get_resnet18()
+        resnet18_backbone.fc = nn.Linear(
+            resnet18_backbone.fc.in_features, self.num_classes
+        )
 
-        model = resnet18(weights=ResNet18_Weights.DEFAULT)
-        # Replace fc layer
-        model.fc = nn.Linear(model.fc.in_features, self.num_classes)
-        return model
+        self.net = resnet18_backbone.to(self.device)
 
     def build_optimizer(self):
         """
         Build the optimizer.
         """
         # Simple SGD or Adam
-        lr = self.config.get("lr", 0.001)
-        return optim.SGD(self.net.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
+        lr = self.config.method.lr
+        self.optimizer = optim.SGD(
+            self.net.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4
+        )
 
     def train(self):
         """
@@ -67,25 +74,19 @@ class BaseSolver:
         """
         max_epochs = self.config.method.epochs
 
+        def cycle(iterable):
+            while True:
+                for x in iterable:
+                    yield x
+
         logger.info(f"Start training for {max_epochs} epochs...")
 
         for epoch in range(max_epochs):
             self.net.train()
 
-            # Use zip to iterate over both domains (assuming same length or truncate)
-            # In DA, we usually iterate max_iters per epoch or loop over source
-            # For simplicity, we loop over source and cycle target if needed
-
-            # Helper to cycle target loader
-            def cycle(iterable):
-                while True:
-                    for x in iterable:
-                        yield x
-
             tgt_iter = cycle(self.target_loader)
 
-            total_loss = 0.0
-            num_batches = 0
+            loss_meter = AverageMeter()
 
             pbar = tqdm(self.source_loader, desc=f"Epoch {epoch+1}/{max_epochs}")
             for src_imgs, src_labels in pbar:
@@ -105,15 +106,14 @@ class BaseSolver:
                 loss.backward()
                 self.optimizer.step()
 
-                total_loss += loss.item()
-                num_batches += 1
+                loss_meter.update(loss.item())
 
-                pbar.set_postfix({"loss": total_loss / num_batches})
+                pbar.set_postfix({"loss": loss_meter.avg})
 
             # Evaluation after each epoch
             acc = self.evaluate()
             logger.info(
-                f"Epoch {epoch+1} finished. Avg Loss: {total_loss/num_batches:.4f}, Target Acc: {acc:.2f}%"
+                f"Epoch {epoch+1} finished. Avg Loss: {loss_meter.avg:.4f}, Target Acc: {acc:.2f}%"
             )
 
         logger.info("Training finished.")
@@ -167,7 +167,6 @@ class BaseSolver:
         """
         Save model checkpoint.
         """
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self.net.state_dict(), path)
+        
         logger.info(f"Model saved to {path}")

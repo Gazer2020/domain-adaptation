@@ -1,30 +1,26 @@
-dataset:
-  name: Mini-Office-31
-  # Update this root path to where your data is actually stored
-  root: data/mini_office-31
-  
-  # Default domains
-  source: amazon
-  target: webcam
-  
-  # Default setting
-  setting: csda
-  
-  # Office-31 has 31 classes (Index 0-30)
-  num_classes: 31
-  splits:
-    csda:
-      source: ${range:0-30}
-      target: ${range:0-30}
-      
-    osda:
-      source: ${range:0-9}
-      target: ${range:0-9,20-30}
-      
-    pda:
-      source: ${range:0-9,20-30}
-      target: ${range:0-9}
-      
-    unida:
-      source: ${range:0-19}
-      target: ${range:0-9,20-30}
+name: Mini-Office-31
+# Update this root path to where your data is actually stored
+root: data/mini-office-31
+
+# Default domains
+source: amazon
+target: webcam
+
+# Office-31 has 31 classes (Index 0-30)
+num_classes: 31
+splits:
+  csda:
+    source: ${range:0-30}
+    target: ${range:0-30}
+    
+  osda:
+    source: ${range:0-9}
+    target: ${range:0-9,20-30}
+    
+  pda:
+    source: ${range:0-9,20-30}
+    target: ${range:0-9}
+    
+  unida:
+    source: ${range:0-19}
+    target: ${range:0-9,20-30}

@@ -1,15 +1,17 @@
+import logging
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms.functional as F
-from pathlib import Path
-from loguru import logger
 from tqdm import tqdm
 
 from utils import AverageMeter
-from models.backbones import resnet18_backbone
+from models.backbones import get_resnet18
 from methods.base_solver import BaseSolver
+
+
+logger = logging.getLogger(__name__)
 
 
 class RotationSolver(BaseSolver):
@@ -29,14 +31,12 @@ class RotationSolver(BaseSolver):
         self.source_loader, self.target_loader, self.target_test_loader = loaders
         self.device = torch.device(config.device)
 
-        if self.config.dataset.setting == "csda":
+        if self.config.method.setting == "csda":
             self.num_classes = self.config.dataset.num_classes
         else:
             raise NotImplementedError("RotationSolver only supports csda setting.")
 
         self.build_model()
-
-        self.build_optimizer()
 
         # Loss function
         self.criterion = nn.CrossEntropyLoss()
@@ -45,6 +45,7 @@ class RotationSolver(BaseSolver):
         """
         Build the network architecture.
         """
+        resnet18_backbone = get_resnet18()
         layers = list(resnet18_backbone.children())
         self.feature_extractor = nn.Sequential(*(layers[:-1]), nn.Flatten())
         in_features = layers[-1].in_features
@@ -57,19 +58,58 @@ class RotationSolver(BaseSolver):
         self.rotation_classifier.to(self.device)
         self.semantic_classifier.to(self.device)
 
-    def build_optimizer(self):
+    def build_rotation_optimizer(self):
         """
-        Build the optimizer.
+        Build the optimizer for rotation classification.
         """
-        self.optimizer = optim.Adam(
+        base_lr = self.config.method.lr
+        # pretrain optimizer for rotation
+        self.rot_optimizer = optim.Adam(
             list(self.feature_extractor.parameters())
-            + list(self.rotation_classifier.parameters())
-            + list(self.semantic_classifier.parameters()),
-            lr=self.config.get("lr", 0.001),
+            + list(self.rotation_classifier.parameters()),
+            lr=base_lr,
             betas=(0.9, 0.9),
             eps=1e-08,
             weight_decay=5e-4,
         )
+
+    def build_semantic_optimizer(self):
+        """
+        Build the optimizer for semantic classification.
+        """
+        base_lr = self.config.method.lr
+        # finetune optimizer for semantic classification
+        params = [
+            {
+                "params": filter(
+                    lambda p: p.requires_grad, self.feature_extractor.parameters()
+                ),
+                "lr": base_lr * 0.1,
+            },
+            {"params": self.semantic_classifier.parameters(), "lr": base_lr},
+        ]
+        self.sem_optimizer = optim.SGD(
+            params,
+            momentum=0.9,
+            weight_decay=1e-4,
+        )
+
+    def rotation(self, imgs):
+        """
+        Apply random rotation to images and return rotated images and their labels.
+        Labels: 0 - 0 degree, 1 - 90 degrees, 2 - 180 degrees, 3 - 270 degrees
+        """
+        batch_size = imgs.size(0)
+
+        rot_labels = torch.randint(0, 4, (batch_size,), device=self.device)
+        rot_imgs = torch.stack(
+            [
+                torch.rot90(imgs[i], k=rot_labels[i], dims=[-2, -1])  # type: ignore
+                for i in range(batch_size)
+            ]
+        )
+
+        return rot_imgs, rot_labels
 
     def train(self):
         """
@@ -77,104 +117,92 @@ class RotationSolver(BaseSolver):
         """
         max_epochs = self.config.method.epochs
 
-        source_rotation_loader = DataLoader(
-            RotationDataset(self.source_loader.dataset),
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=self.config.get("num_workers", 4)
-        )
-        target_rotation_loader = DataLoader(
-            RotationDataset(self.target_loader.dataset),
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=self.config.get("num_workers", 4),
-        )
-
         logger.info(f"Start training for {max_epochs} epochs...")
 
+        def cycle(iterable):
+            while True:
+                for x in iterable:
+                    yield x
+
+        self.build_rotation_optimizer()
+        # stage 1
+        logger.info("Start rotation training...")
         for epoch in range(max_epochs):
             self.feature_extractor.train()
             self.rotation_classifier.train()
-            self.semantic_classifier.train()
-
-            def cycle(iterable):
-                while True:
-                    for x in iterable:
-                        yield x
-
-            src_rot_iter = cycle(source_rotation_loader)
-            tgt_rot_iter = cycle(target_rotation_loader)
 
             # meters
-            total_loss_meter = AverageMeter()
             rot_loss_meter = AverageMeter()
-            semantic_loss_meter = AverageMeter()
 
-            pbar = tqdm(self.source_loader, desc=f"Epoch {epoch+1}/{max_epochs}")
+            target_iter = cycle(self.target_loader)
+            pbar = tqdm(
+                self.source_loader, desc=f"Rotation Epoch {epoch+1}/{max_epochs}"
+            )
+            for src_imgs, _ in pbar:
+                self.rot_optimizer.zero_grad()
+
+                tgt_imgs, _ = next(target_iter)
+
+                ori_imgs = torch.cat([src_imgs, tgt_imgs], dim=0).to(self.device)
+                rot_imgs, rot_labels = self.rotation(ori_imgs)
+
+                ori_feats = self.feature_extractor(ori_imgs)
+                rot_feats = self.feature_extractor(rot_imgs)
+
+                rot_preds = self.rotation_classifier(ori_feats, rot_feats)
+
+                loss_rot = self.criterion(rot_preds, rot_labels)
+                loss_rot.backward()
+                self.rot_optimizer.step()
+
+                rot_loss_meter.update(loss_rot.item())
+
+                pbar.set_postfix({"Rot Loss": rot_loss_meter.avg})
+
+            acc = self.evaluate()
+            logger.info(f"Rotation Epoch {epoch+1} finished. Target Acc: {acc:.2f}%")
+
+        # freeze lower part of feature extractor
+        logger.info("Freeze lower part of feature extractor...")
+        modules = list(self.feature_extractor.children())
+        for i in range(6):
+            for param in modules[i].parameters():
+                param.requires_grad = False
+
+        self.build_semantic_optimizer()
+
+        # stage 2
+        logger.info("Start semantic training...")
+        for epoch in range(max_epochs):
+            self.feature_extractor.train()
+            self.semantic_classifier.train()
+
+            sem_loss_meter = AverageMeter()
+
+            pbar = tqdm(
+                self.source_loader, desc=f"Semantic Epoch {epoch+1}/{max_epochs}"
+            )
+
             for src_imgs, src_labels in pbar:
-                src_ori_imgs, src_rot_imgs, src_rot_labels = next(src_rot_iter)
-                tgt_ori_imgs, tgt_rot_imgs, tgt_rot_labels = next(tgt_rot_iter)
+                self.sem_optimizer.zero_grad()
 
                 src_imgs = src_imgs.to(self.device)
                 src_labels = src_labels.to(self.device)
 
-                src_ori_imgs = src_ori_imgs.to(self.device)
-                src_rot_imgs = src_rot_imgs.to(self.device)
-                src_rot_labels = src_rot_labels.to(self.device)
+                src_feats = self.feature_extractor(src_imgs)
+                sem_preds = self.semantic_classifier(src_feats)
 
-                tgt_ori_imgs = tgt_ori_imgs.to(self.device)
-                tgt_rot_imgs = tgt_rot_imgs.to(self.device)
-                tgt_rot_labels = tgt_rot_labels.to(self.device)
+                loss_sem = self.criterion(sem_preds, src_labels)
+                loss_sem.backward()
+                self.sem_optimizer.step()
 
-                self.optimizer.zero_grad()
+                sem_loss_meter.update(loss_sem.item())
 
-                # extract features
-                src_features = self.feature_extractor(src_imgs)
-
-                src_ori_features = self.feature_extractor(src_ori_imgs)
-                src_rot_features = self.feature_extractor(src_rot_imgs)
-                tgt_ori_features = self.feature_extractor(tgt_ori_imgs)
-                tgt_rot_features = self.feature_extractor(tgt_rot_imgs)
-
-                # classify rotation
-                src_rot_preds = self.rotation_classifier(
-                    src_ori_features, src_rot_features
-                )
-                tgt_rot_preds = self.rotation_classifier(
-                    tgt_ori_features, tgt_rot_features
-                )
-
-                # classify semantic
-                src_semantic_preds = self.semantic_classifier(src_features)
-
-                src_rot_loss = self.criterion(src_rot_preds, src_rot_labels)
-                tgt_rot_loss = self.criterion(tgt_rot_preds, tgt_rot_labels)
-                semantic_loss = self.criterion(src_semantic_preds, src_labels)
-
-                rot_loss = src_rot_loss + tgt_rot_loss
-                loss = rot_loss + semantic_loss
-
-                loss.backward()
-                self.optimizer.step()
-
-                # update meters
-                total_loss_meter.update(loss.item())
-                rot_loss_meter.update(rot_loss.item())
-                semantic_loss_meter.update(semantic_loss.item())
-
-                pbar.set_postfix({"loss": total_loss_meter.avg})
+                pbar.set_postfix({"Sem Loss": sem_loss_meter.avg})
 
             # Evaluation after each epoch
             acc = self.evaluate()
-            logger.info(
-                f"Epoch {epoch+1} finished. "
-                f"Avg Loss: {total_loss_meter.avg:.4f}, "
-                f"Rot Loss: {rot_loss_meter.avg:.4f}, "
-                f"Semantic Loss: {semantic_loss_meter.avg:.4f}, "
-                f"Target Acc: {acc:.2f}%"
-            )
+            logger.info(f"Semantic Epoch {epoch+1} finished. Target Acc: {acc:.2f}%")
 
         logger.info("Training finished.")
 
@@ -211,10 +239,8 @@ class RotationSolver(BaseSolver):
         """
         Save model checkpoint.
         """
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.feature_extractor.state_dict(), path)
-        torch.save(self.semantic_classifier.state_dict(), path.with_suffix('.semantic'))
+        torch.save(self.feature_extractor.state_dict(), path.with_suffix(".feature.pth"))
+        torch.save(self.semantic_classifier.state_dict(), path.with_suffix(".semantic.pth"))
 
         logger.info(f"Model saved to {path}")
 
@@ -256,23 +282,3 @@ class SemanticModel(nn.Module):
 
     def forward(self, feat):
         return self.classifier(feat)
-
-
-class RotationDataset(Dataset):
-    def __init__(self, dataset, num_classes=4):
-        self.dataset = dataset
-        self.num_classes = num_classes
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        img, _ = self.dataset[idx]
-        label = torch.randint(0, 4, (1,)).item()
-        
-        if label > 0:
-            rot_img = torch.rot90(img, k=label, dims=[-2, -1])
-        else:
-            rot_img = img
-            
-        return (img, rot_img, label)

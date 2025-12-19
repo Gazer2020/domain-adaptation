@@ -4,9 +4,10 @@ import numpy as np
 import torch
 from pathlib import Path
 from loguru import logger
-from utils.config import get_config
+from utils import get_config
 from datasets.loader import get_dataloader
 from methods.base_solver import BaseSolver
+from methods.ros import RotationSolver
 
 
 def set_seed(seed):
@@ -50,9 +51,11 @@ def main():
     method_name = config.method.get("name", "SourceOnly")
     if method_name == "SourceOnly":
         solver = BaseSolver(config, loaders)
+    elif method_name == "ROS":
+        solver = RotationSolver(config, loaders)
     else:
         logger.warning(
-            f"Unknown method {method_name}, falling back to BaseSolver (SourceOnly)"
+            f"Unknown method {method_name}, falling back to BaseSolver"
         )
         solver = BaseSolver(config, loaders)
 

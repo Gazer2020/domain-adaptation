@@ -4,10 +4,13 @@ import torch.optim as optim
 from pathlib import Path
 from loguru import logger
 from tqdm import tqdm
-import torch.nn.functional as F
 
 
 class BaseSolver:
+    """
+    Base solver class implementing source only training.
+    Mainly used for smoke testing.
+    """
     def __init__(self, config, loaders):
         """
         Initialize the BaseSolver.
@@ -21,9 +24,9 @@ class BaseSolver:
         self.device = torch.device(config.device)
 
         if self.config.dataset.setting == "csda":
-            self.num_classes = 31
+            self.num_classes = self.config.dataset.num_classes
         else:
-            self.num_classes = 10
+            raise NotImplementedError("BaseSolver only supports csda setting.")
 
         # Build Model (Placeholder - should be overridden or configurable)
         # For base implementation, we'll use a simple ResNet-like backbone if possible,

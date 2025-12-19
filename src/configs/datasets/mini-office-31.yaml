@@ -1,7 +1,7 @@
 dataset:
-  name: Office-31
+  name: Mini-Office-31
   # Update this root path to where your data is actually stored
-  root: data/office-31
+  root: data/mini_office-31
   
   # Default domains
   source: amazon

@@ -9,8 +9,8 @@ from loguru import logger
 MAIN_SCRIPT = os.path.abspath("../src/main.py")
 
 # 指定本次批量运行使用的数据集配置文件名和方法配置文件名 (无需 .yaml 后缀)
-DATASET_NAME = "office-31" 
-METHOD_NAME = "source_only"
+DATASET_NAME = "mini-office-31" 
+METHOD_NAME = "ros"
 
 # 任务列表：(Source, Target) - 只跑一个任务用于测试
 TASKS = [
@@ -39,7 +39,7 @@ def run_experiments():
     for source, target in TASKS:
         for lmbd in LAMBDAS:
             task_id = f"{source}2{target}_lambda_{lmbd}"
-            exp_name = f"SMOKETEST_{METHOD_NAME}_{task_id}_{int(time.time())}"
+            exp_name = f"TEST_{METHOD_NAME}_{task_id}_{int(time.time())}"
             
             logger.info("="*50)
             logger.info(f"正在启动任务: {task_id}")
@@ -55,7 +55,6 @@ def run_experiments():
                 f"dataset.target={target}",
                 f"dataset.setting=csda",
                 f"method.params.trade_off={lmbd}",
-                f"method.epochs=1", # 强制只跑1个epoch
                 f"exp_name={exp_name}",
                 f"batch_size=32"
             ]

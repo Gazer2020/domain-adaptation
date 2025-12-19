@@ -1,0 +1,7 @@
+method:
+  name: ROS
+  lr: 0.001
+  epochs: 2
+
+dataset:
+  setting: csda

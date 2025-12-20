@@ -14,7 +14,7 @@ exp_name: "test_run"
 
 hydra:
   run:
-    dir: ${hydra:runtime.cwd}/../results/${now:%Y-%m-%d}/${now:%H-%M-%S}_${exp_name}
+    dir: ${hydra:runtime.cwd}/../results/${exp_name}/${now:%Y-%m-%d_%H-%M-%S}
 
   job:
     chdir: True

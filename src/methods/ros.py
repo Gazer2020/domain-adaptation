@@ -239,8 +239,12 @@ class RotationSolver(BaseSolver):
         """
         Save model checkpoint.
         """
-        torch.save(self.feature_extractor.state_dict(), path.with_suffix(".feature.pth"))
-        torch.save(self.semantic_classifier.state_dict(), path.with_suffix(".semantic.pth"))
+        torch.save(
+            self.feature_extractor.state_dict(), path.with_suffix(".feature.pth")
+        )
+        torch.save(
+            self.semantic_classifier.state_dict(), path.with_suffix(".semantic.pth")
+        )
 
         logger.info(f"Model saved to {path}")
 

@@ -32,12 +32,12 @@ def main():
     # 1. 初始化 Hydra 配置 (获取实验矩阵)
     # config_path 是相对于当前脚本的路径，指向 src/configs
     with initialize(version_base="1.3", config_path="../src/configs"):
-        # 加载调度配置 (假设你把实验列表写在了 sweep_config.yaml 里)
-        # 如果没有专门的 sweep_config，也可以直接从代码定义
         cfg = compose(config_name="config")
 
         # --- 实验参数定义区域 ---
         # 你可以根据需要修改这里的任务列表
+        method = 'mic'
+        dataset = 'office-31'
         tasks = [("amazon", "webcam"), ("webcam", "dslr"), ("dslr", "amazon")]
         # -----------------------
 
@@ -46,8 +46,8 @@ def main():
 
         smoke_success = run_experiment(
             [
+                f"method={method}",
                 "dataset=mini-office-31",  # 使用超小型数据集配置
-                "method=ros",
                 "method.epochs=1",  # 只跑一个 epoch
                 "batch_size=2",  # 极小 batch
                 "exp_name=SMOKE_TEST",
@@ -67,11 +67,11 @@ def main():
 
             # 组合本次实验的参数
             overrides = [
-                f"dataset=mini-office-31",  # 使用超小型数据集配置
-                f"method=ros",
+                f"method={method}",
+                f"dataset={dataset}",
                 f"dataset.source={source}",
                 f"dataset.target={target}",
-                f"exp_name=EXP_{source}2{target}",
+                f"exp_name=EXP_{method}_{dataset}_{source}2{target}",
             ]
 
             run_experiment(overrides)

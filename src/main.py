@@ -10,6 +10,7 @@ from omegaconf import OmegaConf, DictConfig
 from datasets.loader import get_dataloader
 from methods.base_solver import BaseSolver
 from methods.ros import RotationSolver
+from methods.mic import MaskSolver
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,8 @@ def main(cfg: DictConfig):
     name = cfg.method.name
     if name == "ros":
         solver = RotationSolver(cfg, loaders)
+    elif name == "mic":
+        solver = MaskSolver(cfg, loaders)
     elif name == "sourceonly":
         solver = BaseSolver(cfg, loaders)
     else:

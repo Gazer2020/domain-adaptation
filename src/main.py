@@ -1,3 +1,11 @@
+"""
+Domain Adaptation Training Entry Point
+
+This module provides the main entry point for training domain adaptation models.
+Methods are automatically discovered via the registry pattern - just add a new
+method file with @register_solver decorator and a config file.
+"""
+
 import logging
 import random
 from pathlib import Path
@@ -8,15 +16,14 @@ import numpy as np
 from omegaconf import OmegaConf, DictConfig
 
 from datasets.loader import get_dataloader
-from methods.base_solver import BaseSolver
-from methods.ros import RotationSolver
-from methods.mic import MaskSolver
+from methods import get_solver, list_solvers
 
 
 logger = logging.getLogger(__name__)
 
 
-def set_seed(seed):
+def set_seed(seed: int):
+    """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -30,32 +37,32 @@ def set_seed(seed):
 
 @hydra.main(version_base="1.3", config_path="configs", config_name="config")
 def main(cfg: DictConfig):
+    """Main training function."""
     # 1. Log config
     logger.debug(OmegaConf.to_yaml(cfg))
+    logger.info(f"Available solvers: {list_solvers()}")
 
     # 2. Set seed
     set_seed(cfg.get("seed", 42))
 
     # 3. Get dataLoaders
     source_loader, target_loader, target_test_loader = get_dataloader(cfg)
+    loaders = (source_loader, target_loader, target_test_loader)
 
     logger.info(
-        f"Data loaded. Source: {cfg.dataset.source}, Target: {cfg.dataset.target}, ",
+        f"Data loaded. Source: {cfg.dataset.source}, Target: {cfg.dataset.target}"
     )
 
-    # 4. Initialize Solver
-    loaders = (source_loader, target_loader, target_test_loader)
-    name = cfg.method.name
-    if name == "ros":
-        solver = RotationSolver(cfg, loaders)
-    elif name == "mic":
-        solver = MaskSolver(cfg, loaders)
-    elif name == "sourceonly":
-        solver = BaseSolver(cfg, loaders)
-    else:
-        raise NotImplementedError(f"Unknown method {name}")
+    # 4. Initialize Solver via registry
+    method_name = cfg.method.name.lower()
+    try:
+        solver_cls = get_solver(method_name)
+    except KeyError as e:
+        logger.error(str(e))
+        raise
 
-    logger.info(f"Initialized solver for method: {name}")
+    solver = solver_cls(cfg, loaders)
+    logger.info(f"Initialized solver: {solver_cls.__name__} for method '{method_name}'")
 
     # 5. Train
     logger.info("Starting training...")

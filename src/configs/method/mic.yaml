@@ -3,5 +3,6 @@ lr: 0.01
 epochs: 10
 lambda_mic: 0.5
 momentum: 0.999
+backbone: resnet50
 
 setting: csda

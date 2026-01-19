@@ -8,7 +8,7 @@ defaults:
 # 全局参数
 batch_size: 32
 num_workers: 4
-device: cuda
+device: auto  # auto, cuda, mps, cpu
 seed: 42
 exp_name: "test_run"
 

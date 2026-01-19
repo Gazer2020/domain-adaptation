@@ -1,5 +1,6 @@
-name: SourceOnly
+name: sourceonly
 lr: 0.001
 epochs: 1
+backbone: resnet18
 
 setting: csda

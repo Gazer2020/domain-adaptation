@@ -10,17 +10,18 @@ target: webcam
 num_classes: 31
 splits:
   csda:
-    source: ${range:0-30}
-    target: ${range:0-30}
+    source: ${range:"0-30"}
+    target: ${range:"0-30"}
     
   osda:
-    source: ${range:0-9}
-    target: ${range:0-9,20-30}
+    source: ${range:"0-9"}
+    target: ${range:"0-9,20-30"}
     
   pda:
-    source: ${range:0-9,20-30}
-    target: ${range:0-9}
+    source: ${range:"0-9,20-30"}
+    target: ${range:"0-9"}
     
   unida:
-    source: ${range:0-19}
-    target: ${range:0-9,20-30}
+    source: ${range:"0-19"}
+    target: ${range:"0-9,20-30"}
+

@@ -1,0 +1,14 @@
+name: cad
+lr: 0.001
+backbone: resnet50
+
+# Training stages
+pretrain_epochs: 10
+adapt_epochs: 10
+
+# CAD-specific parameters
+setting: osda
+channel_reduction: 16
+unknown_threshold: 0.5
+lambda_channel: 0.1
+lambda_entropy: 0.1

@@ -122,3 +122,44 @@ class DomainHead(nn.Module):
             Domain prediction logits
         """
         return self.discriminator(feat)
+
+
+class ChannelSelector(nn.Module):
+    """
+    Learnable channel selection/weighting module.
+    
+    Uses SE-style (Squeeze-and-Excitation) attention mechanism to learn
+    which channels are most discriminative for separating known vs unknown.
+    """
+    
+    def __init__(self, in_channels: int, reduction: int = 16):
+        """
+        Args:
+            in_channels: Number of input channels (e.g., 2048 for ResNet50)
+            reduction: Reduction ratio for bottleneck
+        """
+        super().__init__()
+        self.in_channels = in_channels
+        
+        # SE-style channel attention
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # Global Average Pooling
+            nn.Flatten(),
+            nn.Linear(in_channels, in_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, channel_acts: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+        
+        Args:
+            channel_acts: Channel activations [B, C, H, W]
+            
+        Returns:
+            Channel weights [B, C] in range (0, 1)
+        """
+        return self.attention(channel_acts)
+

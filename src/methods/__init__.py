@@ -11,6 +11,7 @@ from methods.registry import get_solver, register_solver, list_solvers
 from methods.base_solver import BaseSolver
 from methods.ros import RotationSolver
 from methods.mic import MaskSolver
+from methods.cad import CADSolver
 
 __all__ = [
     "get_solver",
@@ -19,4 +20,6 @@ __all__ = [
     "BaseSolver",
     "RotationSolver",
     "MaskSolver",
+    "CADSolver",
 ]
+

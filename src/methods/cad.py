@@ -101,11 +101,6 @@ class CADSolver(BaseSolver):
             num_classes=self.num_classes
         ).to(self.device)
         
-        # Unknown class threshold (learnable)
-        self.unknown_threshold = nn.Parameter(
-            torch.tensor(self.config.method.get("unknown_threshold", 0.5))
-        )
-        
         # Feature fusion weight
         self.fusion_weight = self.config.method.get("fusion_weight", 0.1)
         

@@ -162,4 +162,3 @@ class ChannelSelector(nn.Module):
             Channel weights [B, C] in range (0, 1)
         """
         return self.attention(channel_acts)
-

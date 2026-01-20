@@ -23,7 +23,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
-from PIL import Image
 from sklearn.manifold import TSNE
 from tqdm import tqdm
 

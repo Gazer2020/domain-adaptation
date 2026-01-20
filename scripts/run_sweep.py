@@ -6,7 +6,6 @@ from pathlib import Path
 from hydra import compose, initialize
 
 
-# logging.basicConfig(level=logging.INFO, format='[%(asctime)s][SCHEDULER] %(message)s')
 logger = logging.getLogger(__name__)
 
 

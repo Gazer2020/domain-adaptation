@@ -22,9 +22,9 @@ logger = logging.getLogger(__name__)
 
 
 @register_solver("mic")
-class MaskSolver(BaseSolver):
+class MICSolver(BaseSolver):
     """
-    Masked Image Consistency solver with teacher-student framework.
+    Masked Image Consistency (MIC) solver with teacher-student framework.
     
     Uses a teacher model (EMA) to generate pseudo-labels on full images,
     while the student learns to predict on masked images.
@@ -152,15 +152,25 @@ class MaskSolver(BaseSolver):
         return self.stu_model(imgs)
 
     def save_checkpoint(self, path):
-        """Save student model checkpoint."""
-        torch.save(self.stu_model.state_dict(), path)
+        """Save student and teacher models to single checkpoint file."""
+        torch.save({
+            "method": "mic",
+            "student_model": self.stu_model.state_dict(),
+            "teacher_model": self.tea_model.state_dict(),
+        }, path)
         logger.info(f"Model saved to {path}")
 
     def load_checkpoint(self, path):
-        """Load student model checkpoint."""
-        self.stu_model.load_state_dict(
-            torch.load(path, map_location=self.device)
-        )
-        # Also update teacher to match
-        self.tea_model.load_state_dict(self.stu_model.state_dict())
+        """Load student and teacher models from checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        # Handle both old and new checkpoint formats
+        if "student_model" in checkpoint:
+            self.stu_model.load_state_dict(checkpoint["student_model"])
+            self.tea_model.load_state_dict(checkpoint["teacher_model"])
+        else:
+            # Old format: just model state dict
+            self.stu_model.load_state_dict(checkpoint)
+            self.tea_model.load_state_dict(checkpoint)
+            
         logger.info(f"Model loaded from {path}")

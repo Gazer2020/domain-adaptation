@@ -49,8 +49,15 @@ class RotationSolver(BaseSolver):
         self.semantic_head.to(self.device)
 
     def build_optimizer(self):
-        """Optimizers are built per-stage in train(), so skip default."""
-        pass
+        """
+        Build a dummy optimizer for compatibility with BaseSolver.
+        
+        ROS uses stage-specific optimizers built in train(), but we need
+        this to avoid AttributeError if self.optimizer is accessed.
+        """
+        # Create dummy optimizer that won't actually be used
+        self.optimizer = optim.SGD([torch.zeros(1)], lr=0.001)
+        logger.info("ROS uses stage-specific optimizers (see train method)")
 
     def _build_rotation_optimizer(self):
         """Build optimizer for rotation pretraining stage."""
@@ -67,10 +74,13 @@ class RotationSolver(BaseSolver):
     def _build_semantic_optimizer(self):
         """Build optimizer for semantic finetuning stage."""
         base_lr = self.config.method.lr
+        # Get feature extractor learning rate multiplier from config
+        feature_lr_mult = self.config.method.get("feature_lr_mult", 0.1)
+        
         params = [
             {
                 "params": filter(lambda p: p.requires_grad, self.feature_extractor.parameters()),
-                "lr": base_lr * 0.1,
+                "lr": base_lr * feature_lr_mult,
             },
             {"params": self.semantic_head.parameters(), "lr": base_lr},
         ]
@@ -209,21 +219,38 @@ class RotationSolver(BaseSolver):
         return self.semantic_head(features)
 
     def save_checkpoint(self, path):
-        """Save all model components."""
-        from pathlib import Path
-        path = Path(path)
-        torch.save(self.feature_extractor.state_dict(), path.with_suffix(".feature.pth"))
-        torch.save(self.semantic_head.state_dict(), path.with_suffix(".semantic.pth"))
+        """Save all model components to single checkpoint file."""
+        torch.save({
+            "method": "ros",
+            "feature_extractor": self.feature_extractor.state_dict(),
+            "rotation_head": self.rotation_head.state_dict(),
+            "semantic_head": self.semantic_head.state_dict(),
+        }, path)
         logger.info(f"Model saved to {path}")
 
     def load_checkpoint(self, path):
-        """Load all model components."""
-        from pathlib import Path
-        path = Path(path)
-        self.feature_extractor.load_state_dict(
-            torch.load(path.with_suffix(".feature.pth"), map_location=self.device)
-        )
-        self.semantic_head.load_state_dict(
-            torch.load(path.with_suffix(".semantic.pth"), map_location=self.device)
-        )
+        """Load all model components from checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        # Handle both old and new checkpoint formats
+        if "feature_extractor" in checkpoint:
+            # New format: single dict
+            self.feature_extractor.load_state_dict(checkpoint["feature_extractor"])
+            if "semantic_head" in checkpoint:
+                self.semantic_head.load_state_dict(checkpoint["semantic_head"])
+            if "rotation_head" in checkpoint:
+                self.rotation_head.load_state_dict(checkpoint["rotation_head"])
+        else:
+            # Old format: try loading from separate files
+            from pathlib import Path
+            path = Path(path)
+            if path.with_suffix(".feature.pth").exists():
+                self.feature_extractor.load_state_dict(
+                    torch.load(path.with_suffix(".feature.pth"), map_location=self.device)
+                )
+            if path.with_suffix(".semantic.pth").exists():
+                self.semantic_head.load_state_dict(
+                    torch.load(path.with_suffix(".semantic.pth"), map_location=self.device)
+                )
+                
         logger.info(f"Model loaded from {path}")

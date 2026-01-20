@@ -10,7 +10,7 @@ from methods.registry import get_solver, register_solver, list_solvers
 # Import all solvers to trigger registration
 from methods.base_solver import BaseSolver
 from methods.ros import RotationSolver
-from methods.mic import MaskSolver
+from methods.mic import MICSolver  # Renamed from MaskSolver
 from methods.cad import CADSolver
 
 __all__ = [
@@ -19,7 +19,6 @@ __all__ = [
     "list_solvers",
     "BaseSolver",
     "RotationSolver",
-    "MaskSolver",
+    "MICSolver",  # Renamed from MaskSolver
     "CADSolver",
 ]
-

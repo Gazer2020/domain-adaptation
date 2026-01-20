@@ -55,4 +55,3 @@ def get_device(device_str: str = "auto") -> str:
         else:
             return "cpu"
     return device_str
-

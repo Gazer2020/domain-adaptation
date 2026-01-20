@@ -46,11 +46,17 @@ def main(cfg: DictConfig):
     set_seed(cfg.get("seed", 42))
 
     # 3. Get dataLoaders
-    source_loader, target_loader, target_test_loader = get_dataloader(cfg)
+    source_loader, target_loader, target_test_loader, class_info = get_dataloader(cfg)
     loaders = (source_loader, target_loader, target_test_loader)
 
     logger.info(
         f"Data loaded. Source: {cfg.dataset.source}, Target: {cfg.dataset.target}"
+    )
+    logger.info(
+        f"Setting: {class_info['setting']}, "
+        f"Num classes: {class_info['num_classes']}, "
+        f"Shared: {len(class_info['shared_classes'])}, "
+        f"Unknown label: {class_info['unknown_label']}"
     )
 
     # 4. Initialize Solver via registry
@@ -61,7 +67,7 @@ def main(cfg: DictConfig):
         logger.error(str(e))
         raise
 
-    solver = solver_cls(cfg, loaders)
+    solver = solver_cls(cfg, loaders, class_info)
     logger.info(f"Initialized solver: {solver_cls.__name__} for method '{method_name}'")
 
     # 5. Train

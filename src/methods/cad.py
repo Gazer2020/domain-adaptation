@@ -7,12 +7,11 @@ It uses a learnable channel selector to emphasize discriminative channels.
 """
 
 import logging
-from typing import Dict, List, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from methods.registry import register_solver
@@ -107,8 +106,12 @@ class CADSolver(BaseSolver):
             torch.tensor(self.config.method.get("unknown_threshold", 0.5))
         )
         
+        # Feature fusion weight
+        self.fusion_weight = self.config.method.get("fusion_weight", 0.1)
+        
         logger.info(f"Built CAD model: backbone={backbone_name}, "
-                    f"feature_dim={self.feature_dim}, channels={self.channel_dim}")
+                    f"feature_dim={self.feature_dim}, channels={self.channel_dim}, "
+                    f"fusion_weight={self.fusion_weight}")
 
     def _get_trainable_params(self):
         """Get all trainable parameters."""
@@ -252,28 +255,40 @@ class CADSolver(BaseSolver):
                 
                 # Source forward with channel selection
                 src_features, src_channel_acts = self.feature_extractor(src_imgs)
-                src_channel_weights = self.channel_selector(src_channel_acts)
+                src_channel_weights = self.channel_selector(src_channel_acts)  # [B, C]
                 
-                # Apply channel weighting (element-wise on GAP features)
-                src_channel_acts_gap = src_channel_acts.mean(dim=[2, 3])
-                src_weighted = src_channel_acts_gap * src_channel_weights
-                src_weighted_pooled = src_weighted.mean(dim=1, keepdim=True)
+                # Apply channel weighting on the channel activations
+                # src_channel_acts: [B, C, H, W]
+                # src_channel_weights: [B, C]
+                # We apply weights channel-wise then do global average pooling
+                src_channel_acts_weighted = src_channel_acts * src_channel_weights.unsqueeze(-1).unsqueeze(-1)
+                src_weighted_features = src_channel_acts_weighted.mean(dim=[2, 3])  # [B, C]
                 
                 # Combine original features with channel-weighted features
-                src_combined = src_features + 0.1 * src_weighted_pooled.expand_as(src_features)
+                # Concatenate or add them based on dimensionality
+                if src_weighted_features.size(1) == src_features.size(1):
+                    # Same dimension: weighted addition
+                    src_combined = src_features + self.fusion_weight * src_weighted_features
+                else:
+                    # Different dimension: use original features (channel_dim != feature_dim)
+                    src_combined = src_features
                 
                 src_logits = self.classifier(src_combined)
                 cls_loss = self.criterion(src_logits, src_labels)
                 
                 # Target forward for entropy minimization
                 tgt_features, tgt_channel_acts = self.feature_extractor(tgt_imgs)
-                tgt_channel_weights = self.channel_selector(tgt_channel_acts)
+                tgt_channel_weights = self.channel_selector(tgt_channel_acts)  # [B, C]
                 
-                tgt_channel_acts_gap = tgt_channel_acts.mean(dim=[2, 3])
-                tgt_weighted = tgt_channel_acts_gap * tgt_channel_weights
-                tgt_weighted_pooled = tgt_weighted.mean(dim=1, keepdim=True)
+                # Apply channel weighting
+                tgt_channel_acts_weighted = tgt_channel_acts * tgt_channel_weights.unsqueeze(-1).unsqueeze(-1)
+                tgt_weighted_features = tgt_channel_acts_weighted.mean(dim=[2, 3])  # [B, C]
                 
-                tgt_combined = tgt_features + 0.1 * tgt_weighted_pooled.expand_as(tgt_features)
+                if tgt_weighted_features.size(1) == tgt_features.size(1):
+                    tgt_combined = tgt_features + self.fusion_weight * tgt_weighted_features
+                else:
+                    tgt_combined = tgt_features
+                    
                 tgt_logits = self.classifier(tgt_combined)
                 
                 # Entropy minimization on target (encourage confident predictions)
@@ -317,6 +332,7 @@ class CADSolver(BaseSolver):
     def save_checkpoint(self, path):
         """Save all model components."""
         torch.save({
+            "method": "cad",
             "feature_extractor": self.feature_extractor.state_dict(),
             "channel_selector": self.channel_selector.state_dict(),
             "classifier": self.classifier.state_dict(),
@@ -326,7 +342,14 @@ class CADSolver(BaseSolver):
     def load_checkpoint(self, path):
         """Load all model components."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=True)
-        self.feature_extractor.load_state_dict(checkpoint["feature_extractor"])
-        self.channel_selector.load_state_dict(checkpoint["channel_selector"])
-        self.classifier.load_state_dict(checkpoint["classifier"])
+        
+        # Handle both old and new formats
+        if "feature_extractor" in checkpoint:
+            self.feature_extractor.load_state_dict(checkpoint["feature_extractor"])
+            self.channel_selector.load_state_dict(checkpoint["channel_selector"])
+            self.classifier.load_state_dict(checkpoint["classifier"])
+        else:
+            # Old format compatibility (if needed)
+            logger.warning("Loading from old checkpoint format")
+            
         logger.info(f"Model loaded from {path}")

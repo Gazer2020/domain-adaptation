@@ -10,15 +10,17 @@ from methods.registry import get_solver, register_solver, list_solvers
 # Import all solvers to trigger registration
 from methods.base_solver import BaseSolver
 from methods.ros import RotationSolver
-from methods.mic import MICSolver  # Renamed from MaskSolver
+from methods.mic import MICSolver
 from methods.cad import CADSolver
 
 __all__ = [
+    # Registry
     "get_solver",
     "register_solver",
     "list_solvers",
+    # Solvers
     "BaseSolver",
     "RotationSolver",
-    "MICSolver",  # Renamed from MaskSolver
+    "MICSolver",
     "CADSolver",
 ]

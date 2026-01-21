@@ -48,16 +48,7 @@ class RotationSolver(BaseSolver):
         self.rotation_head.to(self.device)
         self.semantic_head.to(self.device)
 
-    def build_optimizer(self):
-        """
-        Build a dummy optimizer for compatibility with BaseSolver.
-        
-        ROS uses stage-specific optimizers built in train(), but we need
-        this to avoid AttributeError if self.optimizer is accessed.
-        """
-        # Create dummy optimizer that won't actually be used
-        self.optimizer = optim.SGD([torch.zeros(1)], lr=0.001)
-        logger.info("ROS uses stage-specific optimizers (see train method)")
+
 
     def _build_rotation_optimizer(self):
         """Build optimizer for rotation pretraining stage."""
@@ -199,9 +190,7 @@ class RotationSolver(BaseSolver):
             acc = self.evaluate()
             logger.info(f"Semantic Epoch {epoch+1} finished. Target Acc: {acc:.2f}%")
 
-    def compute_loss(self, src_imgs, src_labels, tgt_imgs):
-        """Not used in ROS (custom train loop), but required by ABC."""
-        raise NotImplementedError("ROS uses custom training stages")
+    # Note: compute_loss is not implemented - ROS uses custom train()
 
     def _set_train_mode(self):
         """Set all components to training mode."""

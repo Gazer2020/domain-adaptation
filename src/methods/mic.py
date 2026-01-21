@@ -128,15 +128,7 @@ class MICSolver(BaseSolver):
             ):
                 param_t.data.mul_(momentum).add_((1 - momentum) * param_s.data)
 
-    def compute_loss(self, src_imgs, src_labels, tgt_imgs):
-        """Compute combined loss (called if using default train loop)."""
-        lambda_mic = self.config.method.get("lambda_mic", 0.5)
-        
-        src_pred = self.stu_model(src_imgs)
-        sem_loss = self.criterion(src_pred, src_labels)
-        mic_loss = self.mic_plugin(self.stu_model, self.tea_model, tgt_imgs)
-        
-        return sem_loss + lambda_mic * mic_loss
+
 
     def _set_train_mode(self):
         """Set both models to training mode."""

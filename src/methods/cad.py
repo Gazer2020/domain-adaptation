@@ -430,9 +430,7 @@ class CADSolver(BaseSolver):
         
         return 100 * hscore
 
-    def compute_loss(self, src_imgs, src_labels, tgt_imgs):
-        """Not used in CAD (custom two-stage training), but required by ABC."""
-        raise NotImplementedError("CAD uses custom training stages (pretrain + adaptation)")
+    # Note: compute_loss is not implemented - CAD uses custom train()
 
     def forward_for_eval(self, imgs):
         """

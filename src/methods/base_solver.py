@@ -2,7 +2,7 @@
 Base solver class for domain adaptation methods.
 
 All domain adaptation methods should inherit from BaseSolver and implement
-the required abstract methods.
+the required abstract methods: build_model() and train().
 """
 
 import logging
@@ -11,12 +11,10 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from models.backbones import get_backbone
-from utils import AverageMeter, cycle, get_device
+from utils import get_device
 
 from methods.registry import register_solver
 
@@ -30,12 +28,12 @@ class BaseSolver(ABC):
     
     Subclasses must implement:
         - build_model(): Setup model architecture
-        - compute_loss(): Compute training loss
+        - train(): Full training procedure
         
     Subclasses may optionally override:
-        - build_optimizer(): Customize optimizer
         - forward_for_eval(): Customize inference logic
-        - train(): Completely customize training loop
+        - evaluate(): Customize evaluation metrics
+        - save_checkpoint() / load_checkpoint(): Customize checkpointing
     """
 
     def __init__(self, config, loaders: Tuple[DataLoader, DataLoader, DataLoader], 
@@ -71,10 +69,7 @@ class BaseSolver(ABC):
         # Build model (must be implemented by subclass)
         self.build_model()
         
-        # Build optimizer (can be overridden)
-        self.build_optimizer()
-        
-        # Default loss function
+        # Default loss function (can be overridden or unused)
         self.criterion = nn.CrossEntropyLoss()
 
     def _setup_num_classes(self):
@@ -83,11 +78,8 @@ class BaseSolver(ABC):
         
         For OSDA/UniDA: num_classes = len(src_classes) + 1 (includes unknown class)
         For CSDA/PDA: num_classes = len(src_classes)
-        
-        Subclasses can override this method to use custom num_classes logic.
         """
         if self.class_info and "num_classes" in self.class_info:
-            # Use precomputed num_classes from loader
             base_num_classes = self.class_info["num_classes"]
             self.unknown_label = self.class_info.get("unknown_label")
             self.shared_classes = self.class_info.get("shared_classes", [])
@@ -118,74 +110,15 @@ class BaseSolver(ABC):
         """
         pass
 
-    def build_optimizer(self):
-        """
-        Build the optimizer.
-        
-        Default implementation uses SGD. Override for custom optimizers.
-        """
-        lr = self.config.method.lr
-        self.optimizer = optim.SGD(
-            self._get_trainable_params(),
-            lr=lr,
-            momentum=0.9,
-            weight_decay=5e-4
-        )
-
-    def _get_trainable_params(self):
-        """
-        Get trainable parameters for the optimizer.
-        
-        Override this if your model has multiple components.
-        """
-        if hasattr(self, 'net'):
-            return self.net.parameters()
-        raise NotImplementedError(
-            "Subclass must either set self.net or override _get_trainable_params()"
-        )
-
+    @abstractmethod
     def train(self):
         """
-        Main training loop.
+        Execute the full training procedure.
         
-        Default implementation trains for max_epochs using source and target data.
-        Override for custom training procedures (e.g., multi-stage training).
+        Must be implemented by subclasses.
+        Each method defines its own training loop, optimizer, and losses.
         """
-        max_epochs = self.config.method.epochs
-
-        logger.info(f"Start training for {max_epochs} epochs...")
-
-        for epoch in range(max_epochs):
-            self._set_train_mode()
-            
-            tgt_iter = cycle(self.target_loader)
-            loss_meter = AverageMeter()
-
-            pbar = tqdm(self.source_loader, desc=f"Epoch {epoch+1}/{max_epochs}")
-            for src_imgs, src_labels in pbar:
-                tgt_imgs, _ = next(tgt_iter)
-
-                src_imgs = src_imgs.to(self.device)
-                src_labels = src_labels.to(self.device)
-                tgt_imgs = tgt_imgs.to(self.device)
-
-                self.optimizer.zero_grad()
-                
-                loss = self.compute_loss(src_imgs, src_labels, tgt_imgs)
-                
-                loss.backward()
-                self.optimizer.step()
-
-                loss_meter.update(loss.item())
-                pbar.set_postfix({"loss": loss_meter.avg})
-
-            # Evaluation after each epoch
-            acc = self.evaluate()
-            logger.info(
-                f"Epoch {epoch+1} finished. Avg Loss: {loss_meter.avg:.4f}, Target Acc: {acc:.2f}%"
-            )
-
-        logger.info("Training finished.")
+        pass
 
     def _set_train_mode(self):
         """Set model to training mode. Override for multi-component models."""
@@ -196,21 +129,6 @@ class BaseSolver(ABC):
         """Set model to evaluation mode. Override for multi-component models."""
         if hasattr(self, 'net'):
             self.net.eval()
-
-    @abstractmethod
-    def compute_loss(self, src_imgs, src_labels, tgt_imgs):
-        """
-        Compute the loss for a batch.
-        
-        Args:
-            src_imgs: Source domain images
-            src_labels: Source domain labels
-            tgt_imgs: Target domain images (labels typically not used in UDA)
-            
-        Returns:
-            loss: The computed loss tensor
-        """
-        pass
 
     def forward_for_eval(self, imgs):
         """
@@ -248,14 +166,13 @@ class BaseSolver(ABC):
         
         all_preds = []
         all_labels = []
-        all_probs = []  # For confidence-based rejection
+        all_probs = []
 
         with torch.no_grad():
             for imgs, labels in self.target_test_loader:
                 imgs = imgs.to(self.device)
                 outputs = self.forward_for_eval(imgs)
                 
-                # Get predictions and confidence
                 probs = torch.softmax(outputs, dim=1)
                 max_probs, predicted = torch.max(probs, dim=1)
                 
@@ -263,16 +180,13 @@ class BaseSolver(ABC):
                 all_labels.append(labels)
                 all_probs.append(max_probs.cpu())
         
-        # Concatenate all batches (more efficient than list + tensor conversion)
         all_preds = torch.cat(all_preds)
         all_labels = torch.cat(all_labels)
         all_probs = torch.cat(all_probs)
         
-        # Check if we're in OSDA/UniDA mode
         if self.unknown_label is not None and self.setting in ["osda", "unida"]:
             return self._compute_osda_metrics(all_preds, all_labels, all_probs)
         else:
-            # Standard accuracy for CSDA/PDA
             correct = (all_preds == all_labels).sum().item()
             total = len(all_labels)
             acc = 100 * correct / total if total > 0 else 0
@@ -281,31 +195,18 @@ class BaseSolver(ABC):
     def _compute_osda_metrics(self, preds, labels, probs):
         """
         Compute OSDA metrics: Known Accuracy, Unknown Accuracy, and H-score.
-        
-        Uses confidence-based rejection: samples with max_prob < unknown_threshold
-        are classified as unknown.
-        
-        Args:
-            preds: Predicted labels (tensor) [N]
-            labels: Ground truth labels (tensor) [N]
-            probs: Maximum prediction probabilities (tensor) [N]
-            
-        Returns:
-            hscore: H-score (harmonic mean of known and unknown accuracy)
         """
         unknown_label = self.unknown_label
         
         # Apply confidence-based rejection
-        # Predictions with low confidence are classified as unknown
         rejected_mask = probs < self.unknown_threshold
         preds_with_rejection = preds.clone()
         preds_with_rejection[rejected_mask] = unknown_label
         
-        # Separate known and unknown samples in ground truth
         known_mask = labels != unknown_label
         unknown_mask = labels == unknown_label
         
-        # Known accuracy (OS*): accuracy on shared classes
+        # Known accuracy
         if known_mask.sum() > 0:
             known_preds = preds_with_rejection[known_mask]
             known_labels = labels[known_mask]
@@ -315,23 +216,21 @@ class BaseSolver(ABC):
         else:
             known_acc = 0.0
         
-        # Unknown accuracy: rate of correctly predicting unknown for unknown samples
+        # Unknown accuracy
         if unknown_mask.sum() > 0:
             unknown_preds = preds_with_rejection[unknown_mask]
-            # Correct if predicted as unknown (== unknown_label)
             unknown_correct = (unknown_preds == unknown_label).sum().item()
             unknown_total = unknown_mask.sum().item()
             unknown_acc = unknown_correct / unknown_total
         else:
             unknown_acc = 0.0
         
-        # H-score: harmonic mean
+        # H-score
         if known_acc + unknown_acc > 0:
             hscore = 2 * known_acc * unknown_acc / (known_acc + unknown_acc)
         else:
             hscore = 0.0
         
-        # Log detailed metrics
         logger.info(
             f"OSDA Metrics - Known Acc: {100*known_acc:.2f}%, "
             f"Unknown Acc: {100*unknown_acc:.2f}%, H-score: {100*hscore:.2f}%, "
@@ -347,7 +246,6 @@ class BaseSolver(ABC):
         Override if you have multiple components to save.
         """
         if hasattr(self, 'net'):
-            # Save with metadata
             torch.save({
                 "method": "base",
                 "model": self.net.state_dict(),
@@ -367,11 +265,9 @@ class BaseSolver(ABC):
         if hasattr(self, 'net'):
             checkpoint = torch.load(path, map_location=self.device)
             
-            # Handle both old and new formats
             if "model" in checkpoint:
                 self.net.load_state_dict(checkpoint["model"])
             else:
-                # Old format: just state dict
                 self.net.load_state_dict(checkpoint)
                 
             logger.info(f"Model loaded from {path}")
@@ -387,21 +283,54 @@ class SourceOnlySolver(BaseSolver):
     Source-only baseline solver.
     
     Trains only on source domain data without any domain adaptation.
-    Useful as a baseline for comparison.
     """
 
     def build_model(self):
         """Build a simple classification network."""
         backbone = get_backbone(self.config.method.get("backbone", "resnet18"))
         
-        # Replace the final FC layer
         if hasattr(backbone, 'fc'):
             backbone.fc = nn.Linear(backbone.fc.in_features, self.num_classes)
         
         self.net = backbone.to(self.device)
 
-    def compute_loss(self, src_imgs, src_labels, tgt_imgs):
-        """Compute source classification loss only."""
-        src_logits = self.net(src_imgs)
-        loss = self.criterion(src_logits, src_labels)
-        return loss
+    def train(self):
+        """Train on source domain only."""
+        import torch.optim as optim
+        from tqdm import tqdm
+        from utils import AverageMeter
+        
+        max_epochs = self.config.method.epochs
+        lr = self.config.method.lr
+        
+        optimizer = optim.SGD(
+            self.net.parameters(),
+            lr=lr,
+            momentum=0.9,
+            weight_decay=5e-4
+        )
+        
+        logger.info(f"Start training for {max_epochs} epochs...")
+        
+        for epoch in range(max_epochs):
+            self.net.train()
+            loss_meter = AverageMeter()
+            
+            pbar = tqdm(self.source_loader, desc=f"Epoch {epoch+1}/{max_epochs}")
+            for src_imgs, src_labels in pbar:
+                src_imgs = src_imgs.to(self.device)
+                src_labels = src_labels.to(self.device)
+                
+                optimizer.zero_grad()
+                logits = self.net(src_imgs)
+                loss = self.criterion(logits, src_labels)
+                loss.backward()
+                optimizer.step()
+                
+                loss_meter.update(loss.item())
+                pbar.set_postfix({"loss": loss_meter.avg})
+            
+            acc = self.evaluate()
+            logger.info(f"Epoch {epoch+1} finished. Loss: {loss_meter.avg:.4f}, Acc: {acc:.2f}%")
+        
+        logger.info("Training finished.")

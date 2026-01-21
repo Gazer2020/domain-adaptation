@@ -124,41 +124,42 @@ class DomainHead(nn.Module):
         return self.discriminator(feat)
 
 
-class ChannelSelector(nn.Module):
+class ChannelGatingModule(nn.Module):
     """
-    Learnable channel selection/weighting module.
+    Channel Gating Module for feature recalibration.
     
-    Uses SE-style (Squeeze-and-Excitation) attention mechanism to learn
-    which channels are most discriminative for separating known vs unknown.
+    A simple FC network with Sigmoid that outputs gate values 
+    in (0, 1) for each feature dimension. Used to learn class-consistent
+    channel activation patterns for open set domain adaptation.
     """
     
-    def __init__(self, in_channels: int, reduction: int = 16):
+    def __init__(self, feature_dim: int, hidden_dim: int = None):
         """
         Args:
-            in_channels: Number of input channels (e.g., 2048 for ResNet50)
-            reduction: Reduction ratio for bottleneck
+            feature_dim: Dimension of input features
+            hidden_dim: Hidden layer dimension (default: feature_dim // 4)
         """
         super().__init__()
-        self.in_channels = in_channels
+        self.feature_dim = feature_dim
         
-        # SE-style channel attention
-        self.attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),  # Global Average Pooling
-            nn.Flatten(),
-            nn.Linear(in_channels, in_channels // reduction),
+        if hidden_dim is None:
+            hidden_dim = feature_dim // 4
+        
+        self.gate = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(in_channels // reduction, in_channels),
-            nn.Sigmoid(),
+            nn.Linear(hidden_dim, feature_dim),
+            nn.Sigmoid(),  # Output in (0, 1)
         )
-
-    def forward(self, channel_acts: torch.Tensor) -> torch.Tensor:
+    
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass.
+        Compute gate values for input features.
         
         Args:
-            channel_acts: Channel activations [B, C, H, W]
+            features: [B, D] feature vectors
             
         Returns:
-            Channel weights [B, C] in range (0, 1)
+            gate: [B, D] gate values in (0, 1)
         """
-        return self.attention(channel_acts)
+        return self.gate(features)

@@ -1,14 +1,17 @@
 name: cad
 lr: 0.001
+# CAD-specific parameters
+setting: osda
+# Backbone is usually defined in base, but can be here too
 backbone: resnet50
+num_workers: 4
 
 # Training stages
 pretrain_epochs: 10
 adapt_epochs: 10
 
-# CAD-specific parameters
-setting: osda
-channel_reduction: 16
+# Hyperparameters
+gating_hidden_dim: null
+lambda_structure: 1.0
+lambda_anomaly: 0.1
 unknown_threshold: 0.5
-lambda_channel: 0.1
-lambda_entropy: 0.1

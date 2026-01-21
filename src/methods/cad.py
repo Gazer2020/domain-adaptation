@@ -5,7 +5,9 @@ This method uses a Channel Gating Module to learn class-consistent channel
 activation patterns. The key insight is:
 1. Structure-Aware Loss: Forces known classes to have stable gate patterns
 2. Anomaly-Aware Loss: Suppresses target channels that source doesn't use
-3. Confidence-based rejection identifies unknown classes at inference time
+3. Prototype-based rejection: Uses structural fingerprints (class prototypes)
+   computed from gating vectors to identify unknown classes based on
+   cosine similarity rather than classification confidence
 """
 
 import logging
@@ -31,14 +33,17 @@ class CADSolver(BaseSolver):
     """
     Channel Activation-based Domain Adaptation solver.
     
-    Two-stage training:
+    Three-stage training:
     1. Pretrain: Standard classification on source domain
     2. Adaptation: Fine-tune with Structure-Aware and Anomaly-Aware losses
+    3. Prototype Computation: Calculate class prototypes from source gating vectors
     
     Key components:
     - Channel Gating Module: FC + Sigmoid that outputs gate values g ∈ (0,1)
     - Structure-Aware Loss: MSE between sample gates and class prototypes
     - Anomaly-Aware Loss: Penalizes target activations on source-unused channels
+    - Prototype-based Rejection: Uses cosine similarity between sample gates
+      and class prototypes to identify unknown classes (structural matching)
     """
     
     def build_model(self):
@@ -67,6 +72,12 @@ class CADSolver(BaseSolver):
         # Number of source classes (for structure loss, excludes unknown class)
         # Default to OSDA behavior: num_classes includes unknown, num_src_classes doesn't
         self.num_src_classes = self.num_classes - 1
+        
+        # Prototype storage for rejection mechanism
+        # Will be computed after training: [num_src_classes, feature_dim]
+        self.class_prototypes = torch.zeros(
+            self.num_src_classes, self.feature_dim, device=self.device
+        )
         
         logger.info(f"Built CAD model: backbone={backbone_name}, "
                     f"feature_dim={self.feature_dim}, "
@@ -195,6 +206,10 @@ class CADSolver(BaseSolver):
         logger.info(f"Stage 2: Adaptation for {adapt_epochs} epochs...")
         self._train_adaptation_stage(adapt_epochs)
         
+        # Stage 3: Compute class prototypes for rejection mechanism
+        logger.info("Computing class prototypes from source domain...")
+        self._compute_class_prototypes()
+        
         logger.info("Training finished.")
 
     def _train_pretrain_stage(self, max_epochs: int):
@@ -314,37 +329,109 @@ class CADSolver(BaseSolver):
         
         return loss, loss_dict
 
+    def _compute_class_prototypes(self):
+        """
+        Compute class prototypes (structural fingerprints) from source domain.
+        
+        For each known class, compute the average gating vector across all
+        source samples of that class. These prototypes represent the characteristic
+        channel activation patterns for each class.
+        """
+        self._set_eval_mode()
+        
+        # Accumulators for each class
+        class_gate_sums = torch.zeros(self.num_src_classes, self.feature_dim, device=self.device)
+        class_counts = torch.zeros(self.num_src_classes, device=self.device)
+        
+        with torch.no_grad():
+            for imgs, labels in tqdm(self.source_loader, desc="Computing prototypes"):
+                imgs = imgs.to(self.device)
+                labels = labels.to(self.device)
+                
+                # Get gating vectors
+                _, _, gates, _ = self._forward_with_gating(imgs)
+                
+                # Accumulate gates per class
+                class_gate_sums.index_add_(0, labels, gates)
+                class_counts.index_add_(0, labels, torch.ones(len(labels), device=self.device))
+        
+        # Compute prototypes (average gates per class)
+        class_counts = class_counts.clamp(min=1)  # Avoid division by zero
+        self.class_prototypes = class_gate_sums / class_counts.unsqueeze(1)
+        
+        logger.info(f"Computed prototypes for {self.num_src_classes} classes, "
+                    f"shape: {self.class_prototypes.shape}")
+
     def compute_loss(self, src_imgs, src_labels, tgt_imgs):
         """Not used in CAD (custom two-stage training), but required by ABC."""
         raise NotImplementedError("CAD uses custom training stages (pretrain + adaptation)")
 
     def forward_for_eval(self, imgs):
         """
-        Forward pass for evaluation.
+        Forward pass for evaluation with prototype-based rejection.
         
-        Returns logits for confidence-based rejection in base class evaluate().
+        Instead of confidence-based rejection, we use structural matching:
+        - Compute gating vector for each sample
+        - Calculate cosine similarity with all class prototypes
+        - If max similarity < threshold, boost unknown class logit
+        
+        Returns:
+            logits: Modified logits with unknown class boosted for anomalous samples
         """
-        logits, _, _, _ = self._forward_with_gating(imgs)
+        logits, _, gates, _ = self._forward_with_gating(imgs)
+        
+        # Check if prototypes have been computed (non-zero)
+        if self.class_prototypes.abs().sum() > 0:
+            # Normalize gates and prototypes for cosine similarity
+            gates_norm = F.normalize(gates, p=2, dim=1)  # [B, D]
+            prototypes_norm = F.normalize(self.class_prototypes, p=2, dim=1)  # [C, D]
+            
+            # Compute cosine similarity: [B, C]
+            similarities = torch.mm(gates_norm, prototypes_norm.t())
+            
+            # Get maximum similarity for each sample
+            max_similarities, _ = similarities.max(dim=1)  # [B]
+            
+            # Get threshold from config
+            threshold = self.config.method.prototype_similarity_threshold
+            
+            # Find anomalous samples (low structural match with all known classes)
+            is_anomalous = max_similarities < threshold  # [B]
+            
+            # Boost unknown class logit for anomalous samples
+            # Force them to be classified as unknown by setting a very high logit
+            if is_anomalous.any():
+                # Unknown class is the last class (index = num_classes - 1)
+                logits[is_anomalous, -1] = 100.0  # Large value to force unknown prediction
+        
         return logits
 
     def save_checkpoint(self, path):
-        """Save all model components."""
+        """Save all model components including prototypes."""
         torch.save({
             "method": "cad",
             "feature_extractor": self.feature_extractor.state_dict(),
             "gating_module": self.gating_module.state_dict(),
             "classifier": self.classifier.state_dict(),
+            "class_prototypes": self.class_prototypes,
         }, path)
         logger.info(f"Model saved to {path}")
 
     def load_checkpoint(self, path):
-        """Load all model components."""
+        """Load all model components including prototypes."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=True)
         
         if "feature_extractor" in checkpoint:
             self.feature_extractor.load_state_dict(checkpoint["feature_extractor"])
             self.gating_module.load_state_dict(checkpoint["gating_module"])
             self.classifier.load_state_dict(checkpoint["classifier"])
+            
+            # Load prototypes if available
+            if "class_prototypes" in checkpoint:
+                self.class_prototypes = checkpoint["class_prototypes"].to(self.device)
+                logger.info(f"Loaded class prototypes with shape {self.class_prototypes.shape}")
+            else:
+                logger.warning("No class prototypes found in checkpoint")
         else:
             logger.warning("Loading from old checkpoint format - may be incompatible")
             

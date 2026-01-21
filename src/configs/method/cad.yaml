@@ -15,3 +15,6 @@ gating_hidden_dim: null
 lambda_structure: 1.0
 lambda_anomaly: 0.1
 unknown_threshold: 0.5
+
+# Prototype-based rejection
+prototype_similarity_threshold: 0.7

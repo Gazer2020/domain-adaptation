@@ -41,7 +41,12 @@ class RotationSolver(BaseSolver):
         
         # Build heads
         self.rotation_head = RotationHead(in_features=in_features, num_classes=4)
-        self.semantic_head = SemanticHead(in_features=in_features, num_classes=self.num_classes)
+        semantic_hidden_dim = self.config.method.get("semantic_hidden_dim", 256)
+        self.semantic_head = SemanticHead(
+            in_features=in_features, 
+            num_classes=self.num_classes,
+            hidden_dim=semantic_hidden_dim
+        )
 
         # Move to device
         self.feature_extractor.to(self.device)

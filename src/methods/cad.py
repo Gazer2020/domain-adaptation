@@ -65,9 +65,12 @@ class CADSolver(BaseSolver):
         ).to(self.device)
         
         # Classification head
+        # Classification head
+        semantic_hidden_dim = self.config.method.get("semantic_hidden_dim", 256)
         self.classifier = SemanticHead(
             in_features=self.feature_dim,
-            num_classes=self.num_classes
+            num_classes=self.num_classes,
+            hidden_dim=semantic_hidden_dim
         ).to(self.device)
         
         # Number of source classes (for structure loss, excludes unknown class)

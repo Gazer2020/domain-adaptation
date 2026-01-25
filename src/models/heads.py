@@ -56,21 +56,22 @@ class SemanticHead(nn.Module):
     Simple MLP classifier for semantic (class) predictions.
     """
     
-    def __init__(self, in_features: int, num_classes: int):
+    def __init__(self, in_features: int, num_classes: int, hidden_dim: int = 256):
         """
         Args:
             in_features: Number of input features
             num_classes: Number of semantic classes
+            hidden_dim: Hidden layer dimension (default: 256)
         """
         super().__init__()
         self.num_classes = num_classes
 
         self.classifier = nn.Sequential(
-            nn.Linear(in_features, 256),
+            nn.Linear(in_features, hidden_dim),
             nn.ReLU(),
-            nn.Linear(256, 256),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(256, self.num_classes),
+            nn.Linear(hidden_dim, self.num_classes),
         )
 
     def forward(self, feat: torch.Tensor) -> torch.Tensor:

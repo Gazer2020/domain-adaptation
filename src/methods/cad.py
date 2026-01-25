@@ -448,7 +448,9 @@ class CADSolver(BaseSolver):
              self.rejection_threshold = 0.5
         else:
             try:
-                gmm = GaussianMixture(n_components=2, covariance_type='spherical', random_state=42)
+                # Use reg_covar to prevent ill-defined covariance (singular matrices)
+                gmm = GaussianMixture(n_components=2, covariance_type='spherical', 
+                                      reg_covar=1e-3, random_state=42)
                 gmm.fit(target_similarities)
                 
                 means = gmm.means_.flatten()

@@ -2,10 +2,10 @@ defaults:
   - _self_
   - dataset: office-31
   - method: ros
-  # 必须开启这个 override 才能使用彩色控制台
+  # Enable colorlog for colored console output
   - override hydra/job_logging: colorlog
 
-# 全局参数
+# Global parameters
 batch_size: 32
 num_workers: 4
 device: auto  # auto, cuda, mps, cpu

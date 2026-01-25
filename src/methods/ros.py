@@ -221,25 +221,13 @@ class RotationSolver(BaseSolver):
         """Load all model components from checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
         
-        # Handle both old and new checkpoint formats
-        if "feature_extractor" in checkpoint:
-            # New format: single dict
-            self.feature_extractor.load_state_dict(checkpoint["feature_extractor"])
-            if "semantic_head" in checkpoint:
-                self.semantic_head.load_state_dict(checkpoint["semantic_head"])
-            if "rotation_head" in checkpoint:
-                self.rotation_head.load_state_dict(checkpoint["rotation_head"])
-        else:
-            # Old format: try loading from separate files
-            from pathlib import Path
-            path = Path(path)
-            if path.with_suffix(".feature.pth").exists():
-                self.feature_extractor.load_state_dict(
-                    torch.load(path.with_suffix(".feature.pth"), map_location=self.device)
-                )
-            if path.with_suffix(".semantic.pth").exists():
-                self.semantic_head.load_state_dict(
-                    torch.load(path.with_suffix(".semantic.pth"), map_location=self.device)
-                )
+        if "feature_extractor" not in checkpoint:
+            raise ValueError(f"Invalid checkpoint format: {path}")
+        
+        self.feature_extractor.load_state_dict(checkpoint["feature_extractor"])
+        if "semantic_head" in checkpoint:
+            self.semantic_head.load_state_dict(checkpoint["semantic_head"])
+        if "rotation_head" in checkpoint:
+            self.rotation_head.load_state_dict(checkpoint["rotation_head"])
                 
         logger.info(f"Model loaded from {path}")

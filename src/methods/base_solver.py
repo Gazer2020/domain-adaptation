@@ -185,23 +185,52 @@ class BaseSolver(ABC):
         all_probs = torch.cat(all_probs)
         
         if self.unknown_label is not None and self.setting in ["osda", "unida"]:
-            return self._compute_osda_metrics(all_preds, all_labels, all_probs)
+            # Apply rejection mechanism
+            final_preds = self.predict_with_rejection(all_preds, all_probs)
+            return self._compute_osda_metrics(final_preds, all_labels)
         else:
             correct = (all_preds == all_labels).sum().item()
             total = len(all_labels)
             acc = 100 * correct / total if total > 0 else 0
             return acc
     
-    def _compute_osda_metrics(self, preds, labels, probs):
+    def predict_with_rejection(self, preds: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+        """
+        Apply unknown class rejection strategy.
+        
+        Default implementation uses confidence thresholding.
+        Subclasses can override this for custom rejection methods (e.g. entropy, extensive/proto).
+        
+        Args:
+            preds: Base predictions [N]
+            probs: Confidence scores [N] or [N, C]
+            
+        Returns:
+            final_preds: Predictions with unknown label assigned to rejected samples
+        """
+        # If probs is [N, C], take max
+        if probs.ndim > 1:
+            probs, _ = torch.max(probs, dim=1)
+            
+        rejected_mask = probs < self.unknown_threshold
+        final_preds = preds.clone()
+        final_preds[rejected_mask] = self.unknown_label
+        
+        return final_preds
+
+    def _compute_osda_metrics(self, preds, labels):
         """
         Compute OSDA metrics: Known Accuracy, Unknown Accuracy, and H-score.
+        
+        Args:
+            preds: Predictions (already processed with rejection)
+            labels: Ground truth labels
         """
         unknown_label = self.unknown_label
         
-        # Apply confidence-based rejection
-        rejected_mask = probs < self.unknown_threshold
-        preds_with_rejection = preds.clone()
-        preds_with_rejection[rejected_mask] = unknown_label
+        # preds already have rejection applied
+        preds_with_rejection = preds
+
         
         known_mask = labels != unknown_label
         unknown_mask = labels == unknown_label
@@ -233,8 +262,7 @@ class BaseSolver(ABC):
         
         logger.info(
             f"OSDA Metrics - Known Acc: {100*known_acc:.2f}%, "
-            f"Unknown Acc: {100*unknown_acc:.2f}%, H-score: {100*hscore:.2f}%, "
-            f"Rejection threshold: {self.unknown_threshold:.3f}"
+            f"Unknown Acc: {100*unknown_acc:.2f}%, H-score: {100*hscore:.2f}%"
         )
         
         return 100 * hscore

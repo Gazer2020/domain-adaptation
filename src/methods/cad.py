@@ -16,6 +16,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 from tqdm import tqdm
 
 from methods.registry import register_solver
@@ -90,6 +91,15 @@ class CADSolver(BaseSolver):
         params += list(self.gating_module.parameters())
         params += list(self.classifier.parameters())
         return params
+
+    def _build_optimizer(self):
+        """Build optimizer for all training stages."""
+        self.optimizer = optim.SGD(
+            self._get_trainable_params(),
+            lr=self.config.method.lr,
+            momentum=0.9,
+            weight_decay=5e-4
+        )
 
     def _set_train_mode(self):
         """Set all components to training mode."""
@@ -195,6 +205,8 @@ class CADSolver(BaseSolver):
 
     def train(self):
         """Two-stage training: pretrain + adaptation."""
+        self._build_optimizer()
+        
         pretrain_epochs = self.config.method.pretrain_epochs
         adapt_epochs = self.config.method.adapt_epochs
         
@@ -367,68 +379,22 @@ class CADSolver(BaseSolver):
         logger.info(f"Computed prototypes for {self.num_src_classes} classes, "
                     f"shape: {self.class_prototypes.shape}")
 
-    def _compute_osda_metrics(self, preds, labels, probs):
+    def predict_with_rejection(self, preds: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
-        Override base class to better display prototype-based rejection metrics.
+        Custom rejection strategy for CAD.
         
-        CAD uses prototype-based rejection (structural matching) instead of 
-        confidence-based rejection. When prototypes are available, anomalous 
-        samples already have their unknown class logit boosted in forward_for_eval,
-        so we don't need additional confidence-based rejection here.
+        If prototypes are available, rejection is already handled in forward_for_eval
+        via structural matching (cosine similarity).
+        Otherwise, fall back to base class's confidence thresholding.
         """
-        unknown_label = self.unknown_label
-        
-        # For CAD, if prototypes exist, predictions already incorporate rejection
-        # (via boosted unknown class logits). So we don't apply confidence threshold.
         if self.class_prototypes.abs().sum() > 0:
             # Prototypes exist: predictions already reflect prototype-based rejection
-            preds_with_rejection = preds
-            rejection_method = "prototype-based (cosine similarity)"
+            # via forward_for_eval boosting unknown class logits
+            logger.info("Using prototype-based rejection (structural matching)")
+            return preds
         else:
-            # Prototypes not computed: fall back to confidence-based rejection
-            rejected_mask = probs < self.unknown_threshold
-            preds_with_rejection = preds.clone()
-            preds_with_rejection[rejected_mask] = unknown_label
-            rejection_method = "confidence-based"
-        
-        # Separate known and unknown samples in ground truth
-        known_mask = labels != unknown_label
-        unknown_mask = labels == unknown_label
-        
-        # Known accuracy (OS*): accuracy on shared classes
-        if known_mask.sum() > 0:
-            known_preds = preds_with_rejection[known_mask]
-            known_labels = labels[known_mask]
-            known_correct = (known_preds == known_labels).sum().item()
-            known_total = known_mask.sum().item()
-            known_acc = known_correct / known_total
-        else:
-            known_acc = 0.0
-        
-        # Unknown accuracy: rate of correctly predicting unknown for unknown samples
-        if unknown_mask.sum() > 0:
-            unknown_preds = preds_with_rejection[unknown_mask]
-            unknown_correct = (unknown_preds == unknown_label).sum().item()
-            unknown_total = unknown_mask.sum().item()
-            unknown_acc = unknown_correct / unknown_total
-        else:
-            unknown_acc = 0.0
-        
-        # H-score: harmonic mean
-        if known_acc + unknown_acc > 0:
-            hscore = 2 * known_acc * unknown_acc / (known_acc + unknown_acc)
-        else:
-            hscore = 0.0
-        
-        # Log detailed metrics with clear formatting
-        logger.info("─" * 60)
-        logger.info(f"  Rejection Method: {rejection_method}")
-        logger.info(f"  Known Accuracy (OS*):   {100*known_acc:6.2f}%")
-        logger.info(f"  Unknown Accuracy:       {100*unknown_acc:6.2f}%") 
-        logger.info(f"  H-score:                {100*hscore:6.2f}%")
-        logger.info("─" * 60)
-        
-        return 100 * hscore
+            logger.info(f"Using confidence-based rejection (threshold={self.unknown_threshold})")
+            return super().predict_with_rejection(preds, probs)
 
     # Note: compute_loss is not implemented - CAD uses custom train()
 

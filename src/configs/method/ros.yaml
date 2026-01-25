@@ -1,7 +1,6 @@
 name: ros
 lr: 0.001
 epochs: 10
-lambda_rot: 0.1
 backbone: resnet18
 
 setting: csda

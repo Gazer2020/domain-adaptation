@@ -5,11 +5,10 @@ These protocols define the expected interfaces for domain adaptation solvers,
 enabling static type checking and runtime validation.
 """
 
-from typing import List, Protocol, Tuple, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader
 
 
 @runtime_checkable
@@ -51,54 +50,6 @@ class SolverProtocol(Protocol):
     
     def load_checkpoint(self, path: str) -> None:
         """Load model checkpoint from path."""
-        ...
-
-
-@runtime_checkable 
-class MultiStageSolver(Protocol):
-    """
-    Protocol for multi-stage training solvers like CAD and ROS.
-    
-    Solvers with multiple training stages (e.g., pretrain + adapt)
-    can implement this protocol for structured stage management.
-    """
-    
-    def get_training_stages(self) -> List[str]:
-        """Return list of training stage names in order."""
-        ...
-    
-    def run_stage(self, stage_name: str, epochs: int) -> None:
-        """Execute a specific training stage."""
-        ...
-
-
-@runtime_checkable
-class LifecycleHooks(Protocol):
-    """
-    Protocol for training lifecycle hooks.
-    
-    Solvers implementing these hooks can customize training behavior
-    at specific points without overriding the entire train() method.
-    """
-    
-    def on_train_start(self) -> None:
-        """Called before training begins."""
-        ...
-    
-    def on_epoch_start(self, epoch: int) -> None:
-        """Called at the start of each epoch."""
-        ...
-    
-    def on_step_end(self, step: int, loss: float) -> None:
-        """Called after each training step."""
-        ...
-    
-    def on_epoch_end(self, epoch: int, avg_loss: float) -> float:
-        """Called at the end of each epoch. Returns evaluation result."""
-        ...
-    
-    def on_train_end(self) -> None:
-        """Called after training completes."""
         ...
 
 

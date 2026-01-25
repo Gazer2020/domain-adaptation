@@ -4,7 +4,6 @@ lr: 0.001
 setting: osda
 # Backbone is usually defined in base, but can be here too
 backbone: resnet50
-num_workers: 4
 
 # Training stages
 pretrain_epochs: 10

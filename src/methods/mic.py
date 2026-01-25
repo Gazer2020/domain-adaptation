@@ -61,8 +61,19 @@ class MICSolver(BaseSolver):
         """Return student model parameters for optimizer."""
         return self.stu_model.parameters()
 
+    def _build_optimizer(self):
+        """Build optimizer for training."""
+        self.optimizer = optim.SGD(
+            self._get_trainable_params(),
+            lr=self.config.method.lr,
+            momentum=0.9,
+            weight_decay=5e-4
+        )
+
     def train(self):
         """Training loop with MIC consistency loss."""
+        self._build_optimizer()
+        
         max_epochs = self.config.method.epochs
         lambda_mic = self.config.method.get("lambda_mic", 0.5)
         ema_momentum = self.config.method.get("momentum", 0.999)
@@ -127,8 +138,6 @@ class MICSolver(BaseSolver):
                 self.stu_model.parameters(), self.tea_model.parameters()
             ):
                 param_t.data.mul_(momentum).add_((1 - momentum) * param_s.data)
-
-
 
     def _set_train_mode(self):
         """Set both models to training mode."""

@@ -85,6 +85,9 @@ class CADSolver(BaseSolver):
                     f"num_src_classes={self.num_src_classes}, "
                     f"num_classes={self.num_classes}")
 
+        # Adaptive rejection threshold (to be computed)
+        self.rejection_threshold = 0.5
+
     def _get_trainable_params(self):
         """Get all trainable parameters."""
         params = list(self.feature_extractor.parameters())
@@ -376,8 +379,43 @@ class CADSolver(BaseSolver):
         class_counts = class_counts.clamp(min=1)  # Avoid division by zero
         self.class_prototypes = class_gate_sums / class_counts.unsqueeze(1)
         
+        
+        # Compute adaptive rejection threshold
+        # Based on distribution of source sample similarities to their class prototypes
+        logger.info("Computing adaptive rejection threshold...")
+        all_similarities = []
+        
+        with torch.no_grad():
+            for imgs, labels in tqdm(self.source_loader, desc="Computing threshold"):
+                imgs = imgs.to(self.device)
+                labels = labels.to(self.device)
+                
+                # Get gating vectors
+                _, _, gates, _ = self._forward_with_gating(imgs)
+                
+                # Normalize
+                gates_norm = F.normalize(gates, p=2, dim=1)
+                prototypes_norm = F.normalize(self.class_prototypes, p=2, dim=1)
+                
+                # Get prototype for each sample's ground truth class
+                sample_prototypes = prototypes_norm[labels]
+                
+                # Compute cosine similarity
+                # (B, D) * (B, D) -> (B,)
+                sim = (gates_norm * sample_prototypes).sum(dim=1)
+                all_similarities.append(sim)
+                
+        all_similarities = torch.cat(all_similarities)
+        
+        # Set threshold to 5th percentile (exclude outliers)
+        # "If target sample is less similar to nearest prototype than 95% of source samples 
+        # are to their own class prototype, reject it."
+        q = 0.05
+        self.rejection_threshold = torch.quantile(all_similarities, q).item()
+        
         logger.info(f"Computed prototypes for {self.num_src_classes} classes, "
                     f"shape: {self.class_prototypes.shape}")
+        logger.info(f"Adaptive rejection threshold (5th percentile): {self.rejection_threshold:.4f}")
 
     def predict_with_rejection(self, preds: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
@@ -424,8 +462,8 @@ class CADSolver(BaseSolver):
             # Get maximum similarity for each sample
             max_similarities, _ = similarities.max(dim=1)  # [B]
             
-            # Get threshold from config
-            threshold = self.config.method.prototype_similarity_threshold
+            # Get threshold (adaptive)
+            threshold = self.rejection_threshold
             
             # Find anomalous samples (low structural match with all known classes)
             is_anomalous = max_similarities < threshold  # [B]
@@ -446,6 +484,7 @@ class CADSolver(BaseSolver):
             "gating_module": self.gating_module.state_dict(),
             "classifier": self.classifier.state_dict(),
             "class_prototypes": self.class_prototypes,
+            "rejection_threshold": self.rejection_threshold,
         }, path)
         logger.info(f"Model saved to {path}")
 
@@ -464,6 +503,13 @@ class CADSolver(BaseSolver):
                 logger.info(f"Loaded class prototypes with shape {self.class_prototypes.shape}")
             else:
                 logger.warning("No class prototypes found in checkpoint")
+                
+            if "rejection_threshold" in checkpoint:
+                self.rejection_threshold = checkpoint["rejection_threshold"]
+                logger.info(f"Loaded adaptive rejection threshold: {self.rejection_threshold:.4f}")
+            else:
+                logger.warning("No rejection threshold found, using default 0.5")
+                self.rejection_threshold = 0.5
         else:
             logger.warning("Loading from old checkpoint format - may be incompatible")
             

@@ -18,6 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
+from sklearn.mixture import GaussianMixture
+import numpy as np
 
 from methods.registry import register_solver
 from methods.base_solver import BaseSolver
@@ -265,8 +267,39 @@ class CADSolver(BaseSolver):
                 loss_meter.update(loss.item())
                 pbar.set_postfix({"loss": loss_meter.avg})
             
-            hos = self.evaluate()
-            logger.info(f"Pretrain Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, HOS={hos:.2f}%")
+            # Evaluate known accuracy only during pretrain
+            known_acc = self._evaluate_known_accuracy()
+            logger.info(f"Pretrain Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, Known Acc={known_acc:.2f}%")
+
+    def _evaluate_known_accuracy(self):
+        """
+        Evaluate accuracy only on known classes (ignoring unknown class samples).
+        Used during pre-training to monitor source-like performance on target.
+        """
+        self._set_eval_mode()
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for imgs, labels in self.target_test_loader:
+                imgs = imgs.to(self.device)
+                labels = labels.to(self.device)
+                
+                # Skip unknown samples if any
+                if self.unknown_label is not None:
+                    mask = labels != self.unknown_label
+                    if mask.sum() == 0:
+                        continue
+                    imgs = imgs[mask]
+                    labels = labels[mask]
+                
+                outputs = self.forward_for_eval(imgs)
+                _, predicted = torch.max(outputs, 1)
+                
+                correct += (predicted.cpu() == labels.cpu()).sum().item()
+                total += labels.size(0)
+                
+        return 100.0 * correct / total if total > 0 else 0.0
 
     def _train_adaptation_stage(self, max_epochs: int):
         """
@@ -383,15 +416,14 @@ class CADSolver(BaseSolver):
         self.class_prototypes = class_gate_sums / class_counts.unsqueeze(1)
         
         
-        # Compute adaptive rejection threshold
-        # Based on distribution of source sample similarities to their class prototypes
-        logger.info("Computing adaptive rejection threshold...")
-        all_similarities = []
+        # Compute adaptive rejection threshold using Dual Gaussian Model (EM)
+        # Based on distribution of target sample similarities to nearest source prototype
+        logger.info("Computing adaptive rejection threshold using Dual Gaussian Model...")
+        target_similarities = []
         
         with torch.no_grad():
-            for imgs, labels in tqdm(self.source_loader, desc="Computing threshold"):
+            for imgs, _ in tqdm(self.target_loader, desc="Collecting target similarities"):
                 imgs = imgs.to(self.device)
-                labels = labels.to(self.device)
                 
                 # Get gating vectors
                 _, _, gates, _ = self._forward_with_gating(imgs)
@@ -400,25 +432,65 @@ class CADSolver(BaseSolver):
                 gates_norm = F.normalize(gates, p=2, dim=1)
                 prototypes_norm = F.normalize(self.class_prototypes, p=2, dim=1)
                 
-                # Get prototype for each sample's ground truth class
-                sample_prototypes = prototypes_norm[labels]
+                # Compute similarity to ALL prototypes: [B, num_prototypes]
+                sims = torch.mm(gates_norm, prototypes_norm.t())
                 
-                # Compute cosine similarity
-                # (B, D) * (B, D) -> (B,)
-                sim = (gates_norm * sample_prototypes).sum(dim=1)
-                all_similarities.append(sim)
+                # Take MAX similarity (feature is most similar to which known class?) -> [B]
+                max_sims, _ = sims.max(dim=1)
+                target_similarities.append(max_sims.cpu())
                 
-        all_similarities = torch.cat(all_similarities)
+        target_similarities = torch.cat(target_similarities).numpy().reshape(-1, 1)
         
-        # Set threshold to 5th percentile (exclude outliers)
-        # "If target sample is less similar to nearest prototype than 95% of source samples 
-        # are to their own class prototype, reject it."
-        q = 0.05
-        self.rejection_threshold = torch.quantile(all_similarities, q).item()
+        # Fit 2-component GMM (Unknown vs Known)
+        # We assume Unknowns have lower similarity, Knowns have higher similarity
+        if len(target_similarities) < 10:
+             logger.warning("Not enough target samples for GMM. Using default threshold 0.5")
+             self.rejection_threshold = 0.5
+        else:
+            try:
+                gmm = GaussianMixture(n_components=2, covariance_type='spherical', random_state=42)
+                gmm.fit(target_similarities)
+                
+                means = gmm.means_.flatten()
+                variances = gmm.covariances_.flatten()
+                weights = gmm.weights_.flatten()
+                
+                # Identify components
+                # Index 0 = Unknown (Low mean), Index 1 = Known (High mean)
+                if means[0] < means[1]:
+                    unk_idx, knw_idx = 0, 1
+                else:
+                    unk_idx, knw_idx = 1, 0
+                    
+                logger.info(f"GMM Results - Unknown Mean: {means[unk_idx]:.4f}, Known Mean: {means[knw_idx]:.4f}")
+                
+                # Find intersection point (threshold) using Bayesian decision boundary
+                m1, v1, w1 = means[unk_idx], variances[unk_idx], weights[unk_idx]
+                m2, v2, w2 = means[knw_idx], variances[knw_idx], weights[knw_idx]
+                
+                # Coefficients for ax^2 + bx + c = 0
+                a = 1/(2*v1) - 1/(2*v2)
+                b = m2/v2 - m1/v1
+                c = m1**2 / (2*v1) - m2**2 / (2*v2) - np.log(w1/np.sqrt(v1)) + np.log(w2/np.sqrt(v2))
+                
+                roots = np.roots([a, b, c])
+                
+                # We want the root that is between the two means
+                valid_roots = [r for r in roots if min(m1, m2) < r < max(m1, m2)]
+                
+                if len(valid_roots) > 0:
+                    self.rejection_threshold = float(valid_roots[0])
+                else:
+                    # Fallback if no valid root between means
+                    logger.warning("GMM intersection not finding valid root between means. Using weighted average.")
+                    self.rejection_threshold = float((m1 * v2 + m2 * v1) / (v1 + v2))
+            except Exception as e:
+                logger.error(f"GMM fitting failed: {e}. Using default threshold 0.5")
+                self.rejection_threshold = 0.5
         
         logger.info(f"Computed prototypes for {self.num_src_classes} classes, "
                     f"shape: {self.class_prototypes.shape}")
-        logger.info(f"Adaptive rejection threshold (5th percentile): {self.rejection_threshold:.4f}")
+        logger.info(f"Adaptive rejection threshold (GMM-Bayesian): {self.rejection_threshold:.4f}")
 
     def predict_with_rejection(self, preds: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """

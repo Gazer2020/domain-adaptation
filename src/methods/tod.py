@@ -351,9 +351,157 @@ class TODSolver(BaseSolver):
                 f"Cluster: {meter_cluster.avg:.4f} - HOS: {acc:.2f}%"
             )
 
+    def _compute_prototypes_and_threshold(self):
+        """
+        Compute prototypes and rejection threshold using Source Quantile Method.
+        """
+        self._set_eval_mode()
+        
+        # 1. Compute Prototypes (Mean of Gated Inv Features? Or Mean of Inv Features?)
+        # User formula: d = || f_inv - (mu_k * w) ||^2.
+        # This implies mu_k is the prototype of features f.
+        # So we should compute mu_k as mean of f (or f_inv) for each class.
+        # Let's assume mu_k is mean of f_inv.
+        
+        logger.info("Computing prototypes from source data...")
+        class_sums = torch.zeros(self.num_src_classes, self.feature_dim, device=self.device)
+        class_counts = torch.zeros(self.num_src_classes, device=self.device)
+        
+        # Store all source distances for threshold calculation
+        source_distances = []
+        
+        # First Pass: Compute Prototypes
+        with torch.no_grad():
+            for imgs, labels in tqdm(self.source_loader, desc="Computing Prototypes"):
+                imgs, labels = imgs.to(self.device), labels.to(self.device)
+                _, f_inv, _, _ = self._forward_decompose(imgs)
+                
+                # Accumulate
+                if self.feature_dim != f_inv.shape[1]: 
+                     # Should not happen
+                     pass
+                     
+                class_sums.index_add_(0, labels, f_inv)
+                class_counts.index_add_(0, labels, torch.ones(len(labels), device=self.device))
+        
+        class_counts = class_counts.clamp(min=1)
+        self.prototypes = class_sums / class_counts.unsqueeze(1)
+        
+        # Second Pass: Compute Threshold (Source Quantile)
+        logger.info("Computing rejection threshold...")
+        all_dists = []
+        
+        with torch.no_grad():
+            for imgs, labels in tqdm(self.source_loader, desc="Computing Threshold"):
+                imgs, labels = imgs.to(self.device), labels.to(self.device)
+                f, f_inv, _, gate = self._forward_decompose(imgs)
+                
+                # Formula: d_k = || f_inv - (mu_k * w) ||^2
+                # But here we know the label k. So we compute distance to correct prototype.
+                
+                # Get correct prototypes
+                protos = self.prototypes[labels] # [B, D]
+                
+                # Weighted prototype: mu_k * w
+                weighted_protos = protos * gate
+                
+                # Distance
+                # d = || f_inv - weighted_protos ||^2
+                # Sum over dimensions
+                dists = (f_inv - weighted_protos).pow(2).sum(dim=1) # [B]
+                all_dists.append(dists)
+        
+        all_dists = torch.cat(all_dists)
+        
+        # 95th Percentile
+        q = self.config.method.get("rejection_quantile", 0.95)
+        k = int(len(all_dists) * q)
+        top_k_dists, _ = torch.topk(all_dists, k=len(all_dists)-k, largest=True)
+        # topk gives largest. If we want 95th percentile, we want the value dividing 95% smaller from 5% larger.
+        # sort() is safer.
+        sorted_dists, _ = torch.sort(all_dists)
+        threshold_idx = int(len(sorted_dists) * q)
+        if threshold_idx >= len(sorted_dists):
+            threshold_idx = len(sorted_dists) - 1
+            
+        self.rejection_threshold = sorted_dists[threshold_idx].item()
+        
+        logger.info(f"Computed Threshold (Q={q}): {self.rejection_threshold:.4f}")
+
+    def evaluate(self):
+        """
+        Custom Evaluation Flow:
+        1. Decompose
+        2. Calc Structural Distance to all prototypes
+        3. Rejection logic
+        """
+        if self.prototypes is None:
+            self._compute_prototypes_and_threshold()
+            
+        self._set_eval_mode()
+        
+        all_preds = []
+        all_labels = []
+        all_dists = []
+        
+        with torch.no_grad():
+            for imgs, labels in tqdm(self.target_test_loader, desc="Evaluating"):
+                imgs = imgs.to(self.device)
+                labels = labels.to(self.device)
+                
+                # 1. Feature Decomposition
+                f, f_inv, _, gate = self._forward_decompose(imgs)
+                
+                # 2. Structural Distance Calculation
+                # Need distance to ALL prototypes.
+                # d_k = || f_inv - (mu_k * w) ||^2
+                # efficient broadcast?
+                # f_inv: [B, D]
+                # gate: [B, D]
+                # prototypes: [K, D]
+                
+                # Expand to [B, K, D]
+                B, D = f_inv.shape
+                K = self.num_src_classes
+                
+                f_inv_exp = f_inv.unsqueeze(1) # [B, 1, D]
+                gate_exp = gate.unsqueeze(1)   # [B, 1, D]
+                protos_exp = self.prototypes.unsqueeze(0) # [1, K, D]
+                
+                weighted_protos = protos_exp * gate_exp # [B, K, D]
+                
+                dists = (f_inv_exp - weighted_protos).pow(2).sum(dim=2) # [B, K]
+                
+                # 3. Find Min Distance and Best Class
+                min_dists, best_classes = dists.min(dim=1) # [B]
+                
+                # 4. Rejection
+                # If min_dist >= tau, unknown.
+                preds = best_classes.clone()
+                unknown_mask = min_dists >= self.rejection_threshold
+                
+                if self.unknown_label is not None:
+                    preds[unknown_mask] = self.unknown_label
+                    
+                all_preds.append(preds.cpu())
+                all_labels.append(labels.cpu())
+                
+        all_preds = torch.cat(all_preds)
+        all_labels = torch.cat(all_labels)
+        
+        # Use BaseSolver metrics
+        if self.unknown_label is not None and self.setting in ["osda", "unida"]:
+            return self._compute_osda_metrics(all_preds, all_labels)
+        else:
+            correct = (all_preds == all_labels).sum().item()
+            total = len(all_labels)
+            return 100 * correct / total if total > 0 else 0.0
+
     def forward_for_eval(self, imgs):
         """Evaluation uses only the Invariant features."""
         _, f_inv, _, _ = self._forward_decompose(imgs)
+        # Note: Standard forward_for_eval isn't used by custom evaluate(), 
+        # but kept for compatibility if called otherwise.
         return self.classifier(f_inv)
 
     def save_checkpoint(self, path):

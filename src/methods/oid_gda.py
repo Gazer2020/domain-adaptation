@@ -29,7 +29,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.autograd import Function
 from tqdm import tqdm
 
 from methods.registry import register_solver
@@ -41,23 +40,6 @@ from utils import AverageMeter, cycle
 logger = logging.getLogger(__name__)
 
 
-class GradReverse(Function):
-    """
-    Gradient Reversal Layer.
-    """
-    @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.save_for_backward(x)
-        ctx.alpha = alpha
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.alpha, None
-
-
-def grad_reverse(x, alpha=1.0):
-    return GradReverse.apply(x, alpha)
 
 
 @register_solver("oid_gda")
@@ -153,12 +135,46 @@ class OIDGDASolver(BaseSolver):
         self.classifier.train()
         self.discriminator.train()
         
+    def _set_eval_mode(self):
+        self.feature_extractor.eval()
+        self.gating_module.eval()
+        self.classifier.eval()
+        self.discriminator.eval()
+        
     def _forward_decompose(self, x):
         f = self.feature_extractor(x)
         gate = self.gating_module(f)
         f_inv = f * gate
         f_sp = f * (1.0 - gate)
         return f, f_inv, f_sp, gate
+    
+    def _apply_strong_augmentation(self, imgs: torch.Tensor) -> torch.Tensor:
+        """
+        Apply strong augmentation for consistency regularization.
+        
+        Combines random horizontal flip with additive Gaussian noise
+        to create diverse views for gate consistency.
+        
+        Args:
+            imgs: Input images [B, C, H, W]
+            
+        Returns:
+            Augmented images
+        """
+        augmented = imgs.clone()
+        
+        # Random horizontal flip (per-sample)
+        batch_size = imgs.size(0)
+        flip_mask = torch.rand(batch_size) > 0.5
+        augmented[flip_mask] = torch.flip(augmented[flip_mask], dims=[3])
+        
+        # Add Gaussian noise (simulates color jitter)
+        noise_std = 0.05
+        noise = torch.randn_like(augmented) * noise_std
+        augmented = augmented + noise
+        augmented = torch.clamp(augmented, 0.0, 1.0)
+        
+        return augmented
 
     def train(self):
         self._build_optimizers()
@@ -209,9 +225,9 @@ class OIDGDASolver(BaseSolver):
             
             for src_imgs, src_labels in pbar:
                 tgt_imgs, _ = next(tgt_iter)
-                # Strong aug for consistency
-                # Simulate strong aug by flipping or noise if no aug loader
-                tgt_imgs_aug = torch.flip(tgt_imgs, dims=[3]) 
+                # Strong augmentation for consistency loss
+                # Apply random horizontal flip + color jitter simulation via gaussian noise
+                tgt_imgs_aug = self._apply_strong_augmentation(tgt_imgs) 
                 
                 src_imgs, src_labels = src_imgs.to(self.device), src_labels.to(self.device)
                 tgt_imgs = tgt_imgs.to(self.device)
@@ -291,10 +307,10 @@ class OIDGDASolver(BaseSolver):
                     F.binary_cross_entropy_with_logits(d_pred_sp_t, torch.zeros_like(d_pred_sp_t))
                 ) * 0.5
                 
-                # 4. Entropy
+                # 4. Entropy minimization on target predictions
                 pred_t = self.classifier(f_inv_t)
                 prob_t = F.softmax(pred_t, dim=1)
-                loss_ent = -(prob_t * torch.log(pred_t.softmax(1) + 1e-6)).sum(1).mean()
+                loss_ent = -(prob_t * torch.log(prob_t + 1e-6)).sum(dim=1).mean()
                 
                 # Total
                 cfg = self.config.method

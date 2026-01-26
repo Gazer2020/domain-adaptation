@@ -21,5 +21,4 @@ lambda_sup_sp: 1.0    # Constraint B (Specific supervision)
 lambda_consist: 1.0   # GATE Consistency
 lambda_ent: 0.1       # Entropy
 
-# Gradient Reversal
-grl_alpha: 1.0
+

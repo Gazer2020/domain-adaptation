@@ -12,6 +12,7 @@ from methods.base_solver import BaseSolver
 from methods.ros import RotationSolver
 from methods.mic import MICSolver
 from methods.cad import CADSolver
+from methods.tod import TODSolver
 
 __all__ = [
     # Registry
@@ -23,4 +24,5 @@ __all__ = [
     "RotationSolver",
     "MICSolver",
     "CADSolver",
+    "TODSolver",
 ]

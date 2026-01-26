@@ -1,0 +1,28 @@
+# @package method
+name: tod
+setting: osda  # Optimized for Open Set Domain Adaptation
+
+# Architecture
+backbone: resnet50
+gating_hidden_dim: 256
+semantic_hidden_dim: 256
+discriminator_hidden_dim: 1024
+
+# Training
+pretrain_epochs: 10   # Stage 1: Source Initialization
+adapt_epochs: 20      # Stage 2: Tri-constraint Adaptation
+lr: 1e-3
+batch_size: 32
+num_workers: 4
+
+# Loss Weights
+lambda_dom_inv: 1.0   # Constraint A (Invariant decoupling)
+lambda_dom_sp: 0.1    # Constraint A (Specific collaboration)
+lambda_con: 1.0       # Constraint B (Consistency)
+lambda_ent: 0.1       # Constraint C (Info Max)
+lambda_cluster: 0.1   # Structured Clustering (Align/Reject)
+
+# Hyperparameters
+rejection_threshold: 0.5
+entropy_threshold: 0.5  # For selecting confident target samples
+cluster_margin: 0.5     # For triplet/contrastive loss

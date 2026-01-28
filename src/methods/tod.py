@@ -11,6 +11,7 @@ This method implements:
 """
 
 import logging
+import math
 from typing import Tuple, Dict
 
 import torch
@@ -38,7 +39,7 @@ class GradReverse(Function):
     """
     @staticmethod
     def forward(ctx, x, alpha):
-        ctx.save_for_backward(x)  # We don't actually need x, but standard practice
+        ctx.save_for_backward(x)
         ctx.alpha = alpha
         return x.view_as(x)
 
@@ -125,6 +126,11 @@ class TODSolver(BaseSolver):
         self.classifier.eval()
         self.discriminator.eval()
 
+    def _compute_alpha(self, epoch: int, total_epochs: int) -> float:
+        """Progressive alpha scheduling for GRL (DANN-style)."""
+        p = epoch / max(total_epochs, 1)
+        return float(2.0 / (1.0 + math.exp(-10 * p)) - 1.0)
+
     def _forward_decompose(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass with decomposition.
@@ -156,6 +162,8 @@ class TODSolver(BaseSolver):
         
         # Stage 2: Tri-Constraint Adaptation
         if adapt_epochs > 0:
+            # Reset prototypes to force recomputation with current model
+            self.prototypes = None
             logger.info(f"Starting Stage 2: Tri-Constraint Adaptation ({adapt_epochs} epochs)")
             self._train_adaptation_stage(adapt_epochs)
             
@@ -247,16 +255,15 @@ class TODSolver(BaseSolver):
                 
                 # --- Constraint A: Domain Decoupling ---
                 # A1: Invariant features should be domain-indistinguishable (Adversarial)
-                # We use GRL.
-                alpha = 1.0 # Schedule? For now fixed or linear.
+                # Progressive GRL alpha scheduling
+                alpha = self._compute_alpha(epoch, epochs)
                 f_inv_s_grl = grad_reverse(f_inv_s, alpha)
                 f_inv_t_grl = grad_reverse(f_inv_t, alpha)
                 
                 dom_pred_inv_s = self.discriminator(f_inv_s_grl)
                 dom_pred_inv_t = self.discriminator(f_inv_t_grl)
                 
-                # Domain Labels: Source=1, Target=0 (or vice versa)
-                # BCEWithLogitsLoss
+                # Domain Labels: Source=1, Target=0
                 d_labels_s = torch.ones_like(dom_pred_inv_s)
                 d_labels_t = torch.zeros_like(dom_pred_inv_t)
                 
@@ -265,14 +272,7 @@ class TODSolver(BaseSolver):
                     F.binary_cross_entropy_with_logits(dom_pred_inv_t, d_labels_t)
                 ) * 0.5
                 
-                # A2: Specific features should be distinct (Cooperative / Identification)
-                # "Collaborative": Force f_sp to contain domain info.
-                # So we train discriminator to classify them correctly, AND we train encoder to help it.
-                # i.e. NO GRL. Ascending gradient on D accuracy? No, minimizing domain error.
-                # Wait: Encoder should MAXIMIZE distinguishability? 
-                # User request: "Collaboration: Minimize domain prediction error".
-                # Yes, specific features SHOULD carry domain info.
-                
+                # A2: Specific features should be domain-distinguishable (Cooperative)
                 dom_pred_sp_s = self.discriminator(f_sp_s)
                 dom_pred_sp_t = self.discriminator(f_sp_t)
                 
@@ -285,12 +285,19 @@ class TODSolver(BaseSolver):
                 # f_inv should be invariant to augmentation
                 loss_con = F.mse_loss(f_inv_t, f_inv_t_aug)
                 
-                # --- Constraint C: Info Maximization ---
-                # Minimize entropy of predictions on Target Invariant features
+                # --- Constraint C: Selective Entropy Minimization ---
+                # Only minimize entropy on reliable (low-entropy) samples to preserve unknown detection
                 logits_t = self.classifier(f_inv_t)
                 probs_t = F.softmax(logits_t, dim=1)
-                entropy = -(probs_t * torch.log(probs_t + 1e-6)).sum(dim=1).mean()
-                loss_ent = entropy
+                sample_entropy = -(probs_t * torch.log(probs_t + 1e-6)).sum(dim=1)
+                
+                with torch.no_grad():
+                    reliable_mask = sample_entropy < self.config.method.entropy_threshold
+                
+                if reliable_mask.sum() > 0:
+                    loss_ent = sample_entropy[reliable_mask].mean()
+                else:
+                    loss_ent = torch.tensor(0.0, device=self.device)
                 
                 # --- Structured Clustering (Simplified) ---
                 # Ideally: maintain moving average prototypes. 
@@ -301,7 +308,7 @@ class TODSolver(BaseSolver):
                 # Source Clustering: Pull f_inv_s to boolean class centers
                 # Simple implementation: Same as CAD structure loss
                 # Calculate prototypes from current source batch
-                loss_cluster = 0.0
+                loss_cluster = torch.tensor(0.0, device=self.device)
                 if self.config.method.lambda_cluster > 0:
                     # Intra-class compactness on Source
                     # We can use the logic from CAD or simple center distance
@@ -333,8 +340,7 @@ class TODSolver(BaseSolver):
                 meter_dom.update(loss_dom_inv.item()) # Log adversarial part mainly
                 meter_con.update(loss_con.item())
                 meter_ent.update(loss_ent.item())
-                if isinstance(loss_cluster, torch.Tensor):
-                    meter_cluster.update(loss_cluster.item())
+                meter_cluster.update(loss_cluster.item())
                 
                 pbar.set_postfix({
                     "cls": f"{meter_cls.avg:.3f}",
@@ -377,10 +383,6 @@ class TODSolver(BaseSolver):
                 _, f_inv, _, _ = self._forward_decompose(imgs)
                 
                 # Accumulate
-                if self.feature_dim != f_inv.shape[1]: 
-                     # Should not happen
-                     pass
-                     
                 class_sums.index_add_(0, labels, f_inv)
                 class_counts.index_add_(0, labels, torch.ones(len(labels), device=self.device))
         
@@ -413,16 +415,10 @@ class TODSolver(BaseSolver):
         
         all_dists = torch.cat(all_dists)
         
-        # 95th Percentile
-        q = self.config.method.get("rejection_quantile", 0.95)
-        k = int(len(all_dists) * q)
-        top_k_dists, _ = torch.topk(all_dists, k=len(all_dists)-k, largest=True)
-        # topk gives largest. If we want 95th percentile, we want the value dividing 95% smaller from 5% larger.
-        # sort() is safer.
+        # Compute threshold at rejection_quantile percentile
+        q = self.config.method.rejection_quantile
         sorted_dists, _ = torch.sort(all_dists)
-        threshold_idx = int(len(sorted_dists) * q)
-        if threshold_idx >= len(sorted_dists):
-            threshold_idx = len(sorted_dists) - 1
+        threshold_idx = min(int(len(sorted_dists) * q), len(sorted_dists) - 1)
             
         self.rejection_threshold = sorted_dists[threshold_idx].item()
         

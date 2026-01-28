@@ -23,6 +23,6 @@ lambda_ent: 0.1       # Constraint C (Info Max)
 lambda_cluster: 0.1   # Structured Clustering (Align/Reject)
 
 # Hyperparameters
-rejection_threshold: 0.5
-entropy_threshold: 0.5  # For selecting confident target samples
-cluster_margin: 0.5     # For triplet/contrastive loss
+rejection_quantile: 0.95  # Percentile for computing rejection threshold from source distances
+entropy_threshold: 2.0    # For selecting confident target samples (max entropy for 10 classes is ~2.3)
+cluster_margin: 0.5       # For triplet/contrastive loss

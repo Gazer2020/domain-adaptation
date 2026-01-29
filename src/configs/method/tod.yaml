@@ -6,23 +6,23 @@ setting: osda  # Optimized for Open Set Domain Adaptation
 backbone: resnet50
 gating_hidden_dim: 256
 semantic_hidden_dim: 256
-discriminator_hidden_dim: 1024
 
 # Training
-pretrain_epochs: 10   # Stage 1: Source Initialization
-adapt_epochs: 20      # Stage 2: Tri-constraint Adaptation
+pretrain_epochs: 10   # Stage 1: Source Warmup (high temperature)
+adapt_epochs: 20      # Stage 2: Adaptation (temperature decreasing)
 lr: 1e-3
-batch_size: 32
-num_workers: 4
+
+# Gate Temperature Scheduling
+init_temperature: 10.0   # High temp → gates ≈ 1 → f_inv ≈ f
+final_temperature: 1.0   # Normal sigmoid
 
 # Loss Weights
-lambda_dom_inv: 1.0   # Constraint A (Invariant decoupling)
-lambda_dom_sp: 0.1    # Constraint A (Specific collaboration)
-lambda_con: 1.0       # Constraint B (Consistency)
-lambda_ent: 0.1       # Constraint C (Info Max)
-lambda_cluster: 0.1   # Structured Clustering (Align/Reject)
+lambda_struct: 0.1    # Structure consistency (gate patterns per class)
+lambda_sparse: 0.01   # Gate sparsity (encourage binary gates)
+lambda_orth: 0.1      # Orthogonality (f_inv ⊥ f_sp)
+lambda_mmd: 0.5       # Domain alignment via MMD
+lambda_pseudo: 1.0    # Pseudo-label weight
 
 # Hyperparameters
-rejection_quantile: 0.95  # Percentile for computing rejection threshold from source distances
-entropy_threshold: 2.0    # For selecting confident target samples (max entropy for 10 classes is ~2.3)
-cluster_margin: 0.5       # For triplet/contrastive loss
+pseudo_threshold: 0.9   # Confidence threshold for pseudo-labeling
+rejection_quantile: 0.95  # Fallback for quantile-based threshold

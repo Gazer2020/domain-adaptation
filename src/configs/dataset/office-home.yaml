@@ -1,0 +1,34 @@
+name: Office-Home
+# Update this root path to where your data is actually stored
+root: data/office-home
+
+# Default domains
+source: Art
+target: Clipart
+
+# Office-Home has 65 classes (Index 0-64)
+num_classes: 65
+
+splits:
+  # Closed-Set DA: 所有类别共享 (65类)
+  csda:
+    source: ${range:0-64}
+    target: ${range:0-64}
+    
+  # Open-Set DA: Source是前25类，Target包含全部65类 (其中25-64为未知类)
+  osda:
+    source: ${range:0-24}
+    target: ${range:0-64}
+    
+  # Partial DA: Source包含全部65类，Target只包含前25类
+  pda:
+    source: ${range:0-64}
+    target: ${range:0-24}
+    
+  # Universal DA: 
+  # - Shared (共享): 10类 (0-9)
+  # - Source Private (源域私有): 5类 (10-14) -> Source total: 0-14
+  # - Target Private (目标域私有): 50类 (15-64) -> Target total: 0-9 + 15-64
+  unida:
+    source: ${range:0-14}
+    target: ${range:0-9,15-64}

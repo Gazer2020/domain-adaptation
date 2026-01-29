@@ -6,7 +6,7 @@ defaults:
   - override hydra/job_logging: colorlog
 
 # Global parameters
-batch_size: 32
+batch_size: 16
 num_workers: 4
 device: auto  # auto, cuda, mps, cpu
 seed: 42

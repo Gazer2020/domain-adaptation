@@ -1,0 +1,35 @@
+# @package method
+name: dga
+setting: osda  # Open Set Domain Adaptation
+
+# Architecture
+backbone: resnet50
+gating_hidden_dim: 512
+semantic_hidden_dim: 512
+
+# Training Phases
+warmup_epochs: 15         # Strong source pretraining
+adapt_epochs: 35          # Self-training adaptation
+# Total: 50 epochs
+
+# Optimizer
+lr_backbone: 5e-5         # Very low for pretrained
+lr_head: 1e-3             # Standard for new modules
+
+# Gate Temperature
+init_temperature: 3.0     # Start soft
+final_temperature: 0.3    # End sharp
+
+# Loss Weights
+lambda_gate: 0.1          # Gate regularization
+lambda_contrastive: 0.3   # Contrastive loss
+lambda_pseudo: 1.0        # Pseudo-label weight
+lambda_gate_target: 0.5   # Target gate regularization
+lambda_entropy: 0.1       # Entropy minimization
+
+# Pseudo-labeling
+pseudo_threshold_start: 0.95  # High threshold initially
+pseudo_threshold_end: 0.7     # Lower threshold later
+
+# Contrastive
+contrastive_temperature: 0.1

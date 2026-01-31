@@ -1,14 +1,14 @@
 """
-Tri-partition Orthogonal Decomposition (TOD) for Open Set Domain Adaptation.
+Gated Adaptation Domain (GAD) for Open Set Domain Adaptation.
 
-Core Innovation: Channel Gating for Feature Decomposition
-- f_inv = f × gate → Invariant features (domain-shared)
-- f_sp = f × (1-gate) → Specific features (domain-specific)
+Combines best practices from TOD and CAD:
+- Dual-path decomposition: f_inv = f × gate, f_sp = f × (1-gate)
+- Unified gate loss: sparsity + class consistency
+- MMD alignment on invariant features
+- Pseudo-labeling for target domain
+- GMM-based adaptive rejection threshold
 
-Streamlined 3-Loss Architecture:
-1. L_cls: Classification + Pseudo-labeling
-2. L_align: MMD domain alignment
-3. L_gate: Unified gate regularization (sparsity + consistency)
+Target: H-score 85+
 """
 
 import logging
@@ -35,10 +35,6 @@ logger = logging.getLogger(__name__)
 class GatingModule(nn.Module):
     """
     Channel Gating with Temperature Control.
-    
-    Temperature controls gate sharpness:
-    - High temp → gates ≈ 0.5 (soft)
-    - Low temp → gates → 0 or 1 (hard)
     """
     
     def __init__(self, feature_dim: int, hidden_dim: int = None):
@@ -66,14 +62,10 @@ class GatingModule(nn.Module):
 
 
 def compute_mmd(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """
-    Compute Maximum Mean Discrepancy with RBF kernel.
-    Uses median heuristic for bandwidth selection.
-    """
+    """Compute MMD with RBF kernel."""
     if source.size(0) == 0 or target.size(0) == 0:
         return torch.tensor(0.0, device=source.device)
     
-    # Median heuristic for bandwidth
     with torch.no_grad():
         all_data = torch.cat([source, target], dim=0)
         pairwise_dist = torch.cdist(all_data, all_data, p=2)
@@ -86,15 +78,15 @@ def compute_mmd(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return (k_ss.mean() + k_tt.mean() - 2 * k_st.mean()).clamp(min=0.0)
 
 
-@register_solver("tod")
-class TODSolver(BaseSolver):
+@register_solver("gad")
+class GADSolver(BaseSolver):
     """
-    TOD Solver with streamlined 3-loss architecture.
+    GAD Solver: Gated Adaptation Domain.
     
-    Losses:
-    - L_cls: Classification on source + pseudo-labels on target
-    - L_align: MMD on f_inv features
-    - L_gate: Sparsity + class consistency
+    Simplified but effective approach:
+    - Dual-path decomposition (f*gate, f*(1-gate))
+    - Gate regularization with sparsity + class consistency
+    - MMD alignment + strong pseudo-labeling
     """
 
     def build_model(self):
@@ -120,7 +112,7 @@ class TODSolver(BaseSolver):
         self.threshold = 0.5
         self.temperature = self.config.method.init_temperature
         
-        logger.info(f"Built model: backbone={self.config.method.backbone}, "
+        logger.info(f"Built GAD model: backbone={self.config.method.backbone}, "
                     f"feat_dim={self.feature_dim}, classes={self.num_classes}")
 
     def _get_trainable_params(self):
@@ -146,11 +138,7 @@ class TODSolver(BaseSolver):
         self.classifier.eval()
 
     def _decompose(self, x: torch.Tensor, temp: float = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Core decomposition: f_inv = f * gate, f_sp = f * (1-gate)
-        
-        Returns: (f_inv, f_sp, gate)
-        """
+        """Core decomposition: f_inv = f * gate, f_sp = f * (1-gate)"""
         temp = temp or self.temperature
         f = self.backbone(x)
         gate = self.gating(f, temp)
@@ -160,7 +148,7 @@ class TODSolver(BaseSolver):
         """
         Unified gate regularization:
         1. Sparsity: binary entropy pushes gates to 0/1
-        2. Consistency: same class → similar gates (if labels provided)
+        2. Consistency: same class → similar gates
         """
         eps = 1e-6
         # Binary entropy for sparsity
@@ -168,7 +156,7 @@ class TODSolver(BaseSolver):
         loss = entropy.mean()
         
         if labels is not None:
-            # Class consistency via prototype matching
+            # Class consistency
             centers = torch.zeros(self.num_src_classes, self.feature_dim, device=self.device)
             counts = torch.zeros(self.num_src_classes, device=self.device)
             centers.index_add_(0, labels, gates)
@@ -179,20 +167,20 @@ class TODSolver(BaseSolver):
         return loss
 
     def _get_temperature(self, epoch: int, total: int) -> float:
-        """Linear temperature decay from init to final."""
+        """Linear temperature decay."""
         cfg = self.config.method
         progress = epoch / max(total - 1, 1)
         return cfg.init_temperature + (cfg.final_temperature - cfg.init_temperature) * progress
 
     def train(self):
-        """Unified training loop with temperature scheduling."""
+        """Training loop."""
         self._build_optimizer()
         cfg = self.config.method
         warmup_epochs = cfg.pretrain_epochs
         adapt_epochs = cfg.adapt_epochs
         total_epochs = warmup_epochs + adapt_epochs
         
-        logger.info(f"Training: {warmup_epochs} warmup + {adapt_epochs} adapt epochs")
+        logger.info(f"Training GAD: {warmup_epochs} warmup + {adapt_epochs} adapt epochs")
         
         for epoch in range(total_epochs):
             is_warmup = epoch < warmup_epochs
@@ -201,7 +189,6 @@ class TODSolver(BaseSolver):
             
             metrics = self._train_epoch(epoch, is_warmup)
             
-            # Periodic evaluation
             if not is_warmup or epoch == warmup_epochs - 1:
                 self._compute_prototypes()
                 h_score = self.evaluate()
@@ -209,7 +196,6 @@ class TODSolver(BaseSolver):
             
             self._log_epoch(epoch, total_epochs, is_warmup, metrics)
         
-        # Final
         self._compute_prototypes()
         h_score = self.evaluate()
         logger.info(f"Training complete. Final H-score: {h_score:.2f}%")
@@ -263,7 +249,6 @@ class TODSolver(BaseSolver):
             loss.backward()
             self.optimizer.step()
             
-            # Update meters
             meters['loss'].update(loss.item())
             meters['cls'].update(loss_cls.item())
             meters['align'].update(loss_align.item())
@@ -275,7 +260,7 @@ class TODSolver(BaseSolver):
         return {k: m.avg for k, m in meters.items()}
 
     def _log_epoch(self, epoch: int, total: int, is_warmup: bool, metrics: dict):
-        """Unified epoch logging."""
+        """Epoch logging."""
         stage = "Warmup" if is_warmup else "Adapt"
         h_score_str = f", H-score={metrics['h_score']:.2f}%" if 'h_score' in metrics else ""
         logger.info(f"{stage} Epoch {epoch+1}/{total}: loss={metrics['loss']:.4f}, "
@@ -283,7 +268,7 @@ class TODSolver(BaseSolver):
                     f"gate_μ={metrics['gate_mean']:.3f}{h_score_str}")
 
     def _compute_prototypes(self):
-        """Compute class prototypes from source f_inv features."""
+        """Compute class prototypes and GMM threshold."""
         self._set_eval_mode()
         
         sums = torch.zeros(self.num_src_classes, self.feature_dim, device=self.device)
@@ -297,7 +282,6 @@ class TODSolver(BaseSolver):
         
         self.prototypes = sums / counts.clamp(min=1).unsqueeze(1)
         
-        # GMM threshold estimation on target
         dists = []
         with torch.no_grad():
             for imgs, _ in self.target_loader:
@@ -308,18 +292,21 @@ class TODSolver(BaseSolver):
         dists = torch.cat(dists).numpy().reshape(-1, 1)
         if len(dists) >= 10:
             try:
-                gmm = GaussianMixture(n_components=2, covariance_type='spherical', random_state=42)
+                gmm = GaussianMixture(n_components=2, covariance_type='spherical', 
+                                      reg_covar=1e-3, random_state=42)
                 gmm.fit(dists)
                 means, vars_ = gmm.means_.flatten(), gmm.covariances_.flatten()
+                
                 unk_idx = 0 if means[0] > means[1] else 1
                 knw_idx = 1 - unk_idx
+                
                 self.threshold = float((means[unk_idx] * vars_[knw_idx] + means[knw_idx] * vars_[unk_idx]) / 
                                        (vars_[unk_idx] + vars_[knw_idx]))
                 logger.info(f"GMM threshold: {self.threshold:.4f} "
                             f"(known_μ={means[knw_idx]:.4f}, unknown_μ={means[unk_idx]:.4f})")
             except Exception as e:
                 self.threshold = float(np.median(dists))
-                logger.warning(f"GMM failed, using median threshold: {self.threshold:.4f}")
+                logger.warning(f"GMM failed, using median: {self.threshold:.4f}")
         else:
             self.threshold = float(np.median(dists)) if len(dists) > 0 else 10.0
 
@@ -336,7 +323,6 @@ class TODSolver(BaseSolver):
                 f_inv, _, _ = self._decompose(imgs.to(self.device))
                 preds = self.classifier(f_inv).argmax(dim=1)
                 
-                # Distance-based rejection
                 dists = torch.cdist(f_inv, self.prototypes, p=2).min(dim=1)[0]
                 if self.unknown_label is not None:
                     preds[dists > self.threshold] = self.unknown_label
@@ -358,7 +344,7 @@ class TODSolver(BaseSolver):
 
     def save_checkpoint(self, path):
         torch.save({
-            "method": "tod",
+            "method": "gad",
             "backbone": self.backbone.state_dict(),
             "gating": self.gating.state_dict(),
             "classifier": self.classifier.state_dict(),

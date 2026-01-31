@@ -4,25 +4,22 @@ setting: osda  # Optimized for Open Set Domain Adaptation
 
 # Architecture
 backbone: resnet50
-gating_hidden_dim: 256
-semantic_hidden_dim: 256
+gating_hidden_dim: 512
+semantic_hidden_dim: 512
 
 # Training
-pretrain_epochs: 10   # Stage 1: Source Warmup (high temperature)
-adapt_epochs: 20      # Stage 2: Adaptation (temperature decreasing)
+pretrain_epochs: 10   # Warmup with high temperature
+adapt_epochs: 20      # Adaptation with temperature decay
 lr: 1e-3
 
 # Gate Temperature Scheduling
-init_temperature: 10.0   # High temp → gates ≈ 1 → f_inv ≈ f
-final_temperature: 1.0   # Normal sigmoid
+init_temperature: 10.0   # High temp → soft gates
+final_temperature: 1.0   # Low temp → hard gates
 
-# Loss Weights
-lambda_struct: 0.1    # Structure consistency (gate patterns per class)
-lambda_sparse: 0.01   # Gate sparsity (encourage binary gates)
-lambda_orth: 0.1      # Orthogonality (f_inv ⊥ f_sp)
-lambda_mmd: 0.5       # Domain alignment via MMD
+# Simplified Loss Weights (3-loss architecture)
+lambda_align: 0.5     # MMD domain alignment
+lambda_gate: 0.1      # Unified gate regularization (sparsity + consistency)
 lambda_pseudo: 1.0    # Pseudo-label weight
 
 # Hyperparameters
 pseudo_threshold: 0.9   # Confidence threshold for pseudo-labeling
-rejection_quantile: 0.95  # Fallback for quantile-based threshold

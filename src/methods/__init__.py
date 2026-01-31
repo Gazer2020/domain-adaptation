@@ -14,6 +14,8 @@ from methods.mic import MICSolver
 from methods.cad import CADSolver
 from methods.tod import TODSolver
 from methods.oid_gda import OIDGDASolver
+from methods.gad import GADSolver
+from methods.dga import DGASolver
 
 __all__ = [
     # Registry
@@ -27,4 +29,7 @@ __all__ = [
     "CADSolver",
     "TODSolver",
     "OIDGDASolver",
+    "GADSolver",
+    "DGASolver",
 ]
+

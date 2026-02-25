@@ -18,6 +18,7 @@ from methods.gad import GADSolver
 from methods.dga import DGASolver
 from methods.mic_simsiam import MICSimSiamSolver
 from methods.mic_gmm import MICGMMSolver
+from methods.cosda import COSDASolver
 
 __all__ = [
     # Registry
@@ -35,6 +36,7 @@ __all__ = [
     "DGASolver",
     "MICSimSiamSolver",
     "MICGMMSolver",
+    "COSDASolver",
 ]
 
 

@@ -1,0 +1,42 @@
+# @package _global_
+
+method:
+  name: cosda
+  setting: osda
+  
+  # Method specific hyperparameters matches COSDA
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 0.001
+  epochs: 60
+  batch_size: 16
+  
+  embed_feat_dim: 256
+  bn_type: 0
+  
+  # MLP intervener parameters
+  mlp_width: 128
+  mlp_depth: 3
+  mlp_dropout: 0.0
+  
+  # Loss weights & hyperparameters
+  lambda_beta_e: 0.2
+  lambda_beta_d: 1.0
+  lambda_sta: 0.001
+  lambda_int: 0.0001
+  lambda_kl: 0.1
+  lambda_exo: 1.0
+  int_epsilon: 0.1
+  
+  warm_up_epoch: 30
+  
+  # Pseudo-labeling / Clustering
+  pl_method: "Topk3_distance"
+  K_times: 3.0
+  V_times: 1.4
+  confidence_th: 0.7
+  
+  smooth: 0.1
+  adaptation_type: "smooth"
+  
+  lll: 1000 # Memory bank max size

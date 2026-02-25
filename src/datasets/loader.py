@@ -211,6 +211,40 @@ def get_dataloader(config):
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
+    
+    # Strong Augmentation for DGA-Revamp
+    strong_aug_enabled = getattr(config.method, "strong_aug", False)
+    target_transform = train_transform
+    
+    if strong_aug_enabled:
+        class WeakStrongAugment:
+            def __init__(self, weak, strong):
+                self.weak = weak
+                self.strong = strong
+            
+            def __call__(self, x):
+                return self.weak(x), self.strong(x)
+        
+        # Standard Weak
+        weak_aug = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.RandomCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+        
+        # Strong (RandAugment)
+        strong_aug = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.RandomCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandAugment(num_ops=2, magnitude=10),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+        
+        target_transform = WeakStrongAugment(weak_aug, strong_aug)
 
     # Datasets with proper class mappings
     src_path = root_dir / source_domain
@@ -219,9 +253,12 @@ def get_dataloader(config):
     source_dataset = DomainDataset(
         src_path, src_classes, transform=train_transform, class_mapping=src_mapping
     )
+    
+    # Target dataset uses special transform if enabled 
     target_dataset = DomainDataset(
-        tgt_path, tgt_classes, transform=train_transform, class_mapping=tgt_mapping
+        tgt_path, tgt_classes, transform=target_transform, class_mapping=tgt_mapping
     )
+    
     target_test_dataset = DomainDataset(
         tgt_path, tgt_classes, transform=test_transform, class_mapping=tgt_mapping
     )

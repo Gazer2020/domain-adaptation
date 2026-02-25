@@ -15,6 +15,7 @@ adapt_epochs: 35          # Self-training adaptation
 # Optimizer
 lr_backbone: 5e-5         # Very low for pretrained
 lr_head: 1e-3             # Standard for new modules
+scheduler: warmup_cosine  # New scheduler
 
 # Gate Temperature
 init_temperature: 3.0     # Start soft
@@ -28,8 +29,9 @@ lambda_gate_target: 0.5   # Target gate regularization
 lambda_entropy: 0.1       # Entropy minimization
 
 # Pseudo-labeling
-pseudo_threshold_start: 0.95  # High threshold initially
-pseudo_threshold_end: 0.7     # Lower threshold later
+percentile: 0.8           # Top K% per class
+strong_aug: True          # Enable FixMatch style
+momentum_unknown: 0.99    # Momentum for unknown prototype
 
 # Contrastive
 contrastive_temperature: 0.1

@@ -22,7 +22,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
+import math
 from tqdm import tqdm
 from sklearn.mixture import GaussianMixture
 import numpy as np
@@ -153,8 +154,18 @@ class DGASolver(BaseSolver):
             nesterov=True
         )
         
+        # Linear Warmup + Cosine Annealing
         total_epochs = cfg.warmup_epochs + cfg.adapt_epochs
-        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_epochs, eta_min=1e-6)
+        warmup_epochs = cfg.warmup_epochs
+        
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return float(epoch + 1) / warmup_epochs
+            else:
+                progress = float(epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+                return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda)
 
     def _set_train_mode(self):
         self.backbone.train()
@@ -272,54 +283,28 @@ class DGASolver(BaseSolver):
         
         return loss / (valid_count + 1e-8)
 
-    def _get_pseudo_labels(self, logits: torch.Tensor, f_inv: torch.Tensor, 
-                           gates: torch.Tensor, epoch: int, cfg) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _get_pseudo_labels(self, logits_weak: torch.Tensor, epoch: int, cfg) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Generate pseudo-labels with multi-cue confidence estimation.
-        
-        Uses:
-        1. Softmax confidence
-        2. Distance to prototypes
-        3. Gate consistency with class prototypes
+        Generate pseudo-labels with percentile-based thresholding.
         """
-        probs = F.softmax(logits, dim=1)
+        probs = F.softmax(logits_weak, dim=1)
         confidence, predictions = probs.max(dim=1)
         
-        # Only consider known classes
-        valid_class = predictions < self.num_src_classes
+        mask = torch.zeros_like(confidence, dtype=torch.bool)
         
-        # Progressive threshold: starts high, decreases over time
-        progress = min(1.0, epoch / cfg.adapt_epochs)
-        base_threshold = cfg.pseudo_threshold_start - (cfg.pseudo_threshold_start - cfg.pseudo_threshold_end) * progress
-        
-        # Multi-cue filtering
-        mask = (confidence >= base_threshold) & valid_class
-        
-        # Additional filter: distance to prototype
-        if self.prototypes.abs().sum() > 0:
-            with torch.no_grad():
-                f_inv_norm = F.normalize(f_inv, p=2, dim=1)
-                proto_norm = F.normalize(self.prototypes, p=2, dim=1)
-                
-                # Cosine similarity to predicted class prototype
-                pred_protos = proto_norm[predictions.clamp(0, self.num_src_classes - 1)]
-                cosine_sim = (f_inv_norm * pred_protos).sum(dim=1)
-                
-                # Require reasonable similarity
-                mask = mask & (cosine_sim >= 0.5)
-        
-        # Additional filter: gate consistency
-        if self.gate_prototypes.abs().sum() > 0:
-            with torch.no_grad():
-                gate_norm = F.normalize(gates, p=2, dim=1)
-                gate_proto_norm = F.normalize(self.gate_prototypes, p=2, dim=1)
-                
-                pred_gate_protos = gate_proto_norm[predictions.clamp(0, self.num_src_classes - 1)]
-                gate_sim = (gate_norm * pred_gate_protos).sum(dim=1)
-                
-                # Require gate pattern consistency
-                mask = mask & (gate_sim >= 0.3)
-        
+        # Percentile thresholding per class
+        for c in range(self.num_src_classes):
+             class_mask = predictions == c
+             if class_mask.sum() == 0:
+                 continue
+                 
+             scores = confidence[class_mask]
+             # Dynamic threshold based on percentile
+             k = max(1, int(len(scores) * cfg.percentile))
+             threshold = torch.kthvalue(scores, len(scores) - k + 1).values
+             
+             mask |= (class_mask & (confidence >= threshold))
+             
         return predictions, mask
 
     def _update_prototypes(self, f_inv: torch.Tensor, gates: torch.Tensor, 
@@ -437,7 +422,7 @@ class DGASolver(BaseSolver):
         
         tgt_iter = None if is_warmup else cycle(self.target_loader)
         
-        pbar = tqdm(self.source_loader, desc=f"Epoch {epoch + 1}", leave=False)
+        pbar = tqdm(self.source_loader, desc=f"Epoch {epoch + 1}", leave=False, ncols=80, ascii=True, mininterval=5.0)
         for src_imgs, src_labels in pbar:
             src_imgs = src_imgs.to(self.device)
             src_labels = src_labels.to(self.device)
@@ -468,50 +453,61 @@ class DGASolver(BaseSolver):
             
             if not is_warmup and tgt_iter is not None:
                 # Target forward
-                tgt_imgs, _ = next(tgt_iter)
-                tgt_imgs = tgt_imgs.to(self.device)
-                logits_t, f_inv_t, f_sp_t, gate_t, gate_t2 = self._forward(tgt_imgs)
+                tgt_data = next(tgt_iter)
+                if isinstance(tgt_data[0], (list, tuple)):
+                     # FixMatch mode: (weak, strong)
+                     (tgt_weak, tgt_strong), _ = tgt_data
+                     tgt_weak = tgt_weak.to(self.device)
+                     tgt_strong = tgt_strong.to(self.device)
+                else:
+                     # Fallback
+                     tgt_weak, _ = tgt_data
+                     tgt_weak = tgt_weak.to(self.device)
+                     tgt_strong = tgt_weak # No strong aug available
                 
-                # Target Gate Consistency
-                loss_cons += F.mse_loss(gate_t, gate_t2)
+                # Weak View -> Pseudo-labels
+                with torch.no_grad():
+                     logits_w, f_inv_w, _, gate_w, _ = self._forward(tgt_weak)
+                     pseudo_labels, pseudo_mask = self._get_pseudo_labels(
+                         logits_w, epoch - cfg.warmup_epochs, cfg
+                     )
                 
-                # Update Unknown Prototype
-                probs_t = F.softmax(logits_t, dim=1)
-                entropy_t = -(probs_t * torch.log(probs_t + 1e-8)).sum(dim=1)
-                self._update_unknown_prototype(f_inv_t.detach(), entropy_t)
+                # Strong View -> Training
+                logits_s, f_inv_s, _, gate_s_target, gate_s2_target = self._forward(tgt_strong)
+                
+                # Consistency on strong view gates
+                loss_cons += F.mse_loss(gate_s_target, gate_s2_target)
+                
+                # Update Unknown Prototype (using Weak view entropy)
+                probs_w = F.softmax(logits_w, dim=1)
+                entropy_w = -(probs_w * torch.log(probs_w + 1e-8)).sum(dim=1)
+                self._update_unknown_prototype(f_inv_w.detach(), entropy_w, momentum=getattr(cfg, 'momentum_unknown', 0.99))
                 
                 # Target gate regularization
-                loss_gate = loss_gate + cfg.lambda_gate_target * self._compute_gate_loss(gate_t)
+                loss_gate = loss_gate + cfg.lambda_gate_target * self._compute_gate_loss(gate_s_target)
 
-                # Entropy minimization (Standard OSDA practice)
-                loss_ent = entropy_t.mean()
-                
-                # Pseudo-labeling
-                pseudo_labels, pseudo_mask = self._get_pseudo_labels(
-                    logits_t, f_inv_t, gate_t, epoch - cfg.warmup_epochs, cfg
-                )
+                # Entropy minimization (on weak view is usually safer, but strong is fine too)
+                loss_ent = entropy_w.mean()
                 
                 if pseudo_mask.sum() > 0:
-                    # Pseudo-label classification loss
+                    # Pseudo-label classification loss (on Strong View)
                     loss_cls = loss_cls + cfg.lambda_pseudo * self.criterion(
-                        logits_t[pseudo_mask], pseudo_labels[pseudo_mask]
+                        logits_s[pseudo_mask], pseudo_labels[pseudo_mask]
                     )
                     
-                    # Contrastive with pseudo-labels
+                    # Contrastive with pseudo-labels (on Strong View features)
                     if pseudo_mask.sum() >= 4:
                         loss_contrast = loss_contrast + cfg.lambda_pseudo * self._compute_contrastive_loss(
-                            f_inv_t[pseudo_mask], pseudo_labels[pseudo_mask]
+                            f_inv_s[pseudo_mask], pseudo_labels[pseudo_mask]
                         )
                     
-                    # Update prototypes with high-confidence pseudo-labels
-                    high_conf = pseudo_mask & (F.softmax(logits_t, dim=1).max(dim=1)[0] >= 0.95)
-                    if high_conf.sum() > 0:
-                        self._update_prototypes(
-                            f_inv_t[high_conf].detach(),
-                            gate_t[high_conf].detach(),
-                            pseudo_labels[high_conf],
-                            momentum=0.9  # Faster update for pseudo-labels (was 0.999)
-                        )
+                    # Update prototypes
+                    self._update_prototypes(
+                        f_inv_s[pseudo_mask].detach(),
+                        gate_s_target[pseudo_mask].detach(),
+                        pseudo_labels[pseudo_mask],
+                        momentum=0.9
+                    )
                 
                 pseudo_ratio = pseudo_mask.float().mean().item()
             
@@ -594,7 +590,12 @@ class DGASolver(BaseSolver):
         all_features = []
         
         with torch.no_grad():
-            for imgs, _ in self.target_loader:
+            for imgs_data, _ in self.target_loader:
+                if isinstance(imgs_data, (list, tuple)):
+                    imgs = imgs_data[0]
+                else:
+                    imgs = imgs_data
+                    
                 logits, f_inv, _, _, _ = self._forward(imgs.to(self.device))
                 probs = F.softmax(logits, dim=1)
                 entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1)

@@ -1,219 +1,348 @@
+"""
+Domain-Conditioned Feature Modulation (DCFM) solver.
+
+Core idea: Instead of forcing domain-invariant features (like DANN), DCFM
+*embraces* domain information. A domain classifier explicitly identifies which
+domain the input belongs to, and its internal representation conditions a FiLM
+modulation layer that adapts feature extraction per-domain.
+
+Architecture:
+    1. Shared backbone → base features h
+    2. Domain classifier (NO gradient reversal) → domain logits + z_domain
+    3. FiLM modulation: h' = (1 + γ(z_domain)) * BN(h) + β(z_domain)
+    4. Task classifier → class predictions from h'
+
+Training strategy:
+    Stage 1 (Warmup): Source task loss + domain classification loss
+    Stage 2 (Joint):  + Information Maximization on target predictions
+"""
+
+import logging
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import logging
+import torch.optim as optim
+from tqdm import tqdm
 
 from methods.base_solver import BaseSolver
 from methods.registry import register_solver
 from models.backbones import get_backbone
+from utils import AverageMeter, cycle
 
 logger = logging.getLogger(__name__)
 
-class GradientReversal(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.alpha = alpha
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.alpha, None
-
-def grad_reverse(x, alpha=1.0):
-    return GradientReversal.apply(x, alpha)
 
 class DomainClassifier(nn.Module):
-    def __init__(self, in_features, hidden_dim=512):
+    """
+    Domain classifier that directly (non-adversarially) predicts source vs target.
+    Returns both the domain logits and an intermediate representation z_domain
+    used by the FiLM modulation module.
+    """
+
+    def __init__(self, in_features: int, hidden_dim: int = 256):
         super().__init__()
         self.fc1 = nn.Linear(in_features, hidden_dim)
-        self.relu = nn.ReLU(inplace=True)
-        self.fc2 = nn.Linear(hidden_dim, 1)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 2)
 
-    def forward(self, x):
-        features = self.fc1(x)
-        z_domain = self.relu(features)
-        logits = self.fc2(z_domain)
-        return logits, z_domain
+    def forward(self, x: torch.Tensor):
+        z_domain = F.relu(self.bn1(self.fc1(x)))
+        domain_logits = self.fc2(z_domain)
+        return domain_logits, z_domain
 
-class DomainModulation(nn.Module):
-    def __init__(self, in_features, domain_dim=512):
+
+class FiLMModulation(nn.Module):
+    """
+    Feature-wise Linear Modulation (FiLM).
+
+    Generates per-sample scale (γ) and shift (β) from a domain representation,
+    then applies: h' = (1 + γ) * h + β.
+
+    Initialized to identity (γ=0, β=0) so modulation has no effect at the start.
+    """
+
+    def __init__(self, feat_dim: int, domain_dim: int = 256):
         super().__init__()
-        self.fc_gamma = nn.Linear(domain_dim, in_features)
-        self.fc_beta = nn.Linear(domain_dim, in_features)
+        self.gamma_net = nn.Sequential(
+            nn.Linear(domain_dim, feat_dim),
+            nn.Tanh(),  # bound γ to [-1, 1] for stability
+        )
+        self.beta_net = nn.Linear(domain_dim, feat_dim)
 
-        # Initialize to identity modulation: gamma=0, beta=0
-        nn.init.zeros_(self.fc_gamma.weight)
-        nn.init.zeros_(self.fc_gamma.bias)
-        nn.init.zeros_(self.fc_beta.weight)
-        nn.init.zeros_(self.fc_beta.bias)
+        # Initialize to identity modulation
+        nn.init.zeros_(self.gamma_net[0].weight)
+        nn.init.zeros_(self.gamma_net[0].bias)
+        nn.init.zeros_(self.beta_net.weight)
+        nn.init.zeros_(self.beta_net.bias)
 
-    def forward(self, x, z_domain):
-        # We add 1.0 to gamma so that when it's 0, modulation is identity
-        gamma = self.fc_gamma(z_domain)
-        beta = self.fc_beta(z_domain)
-        # Residual connection style modulation
-        return x * (1.0 + gamma) + beta
+    def forward(self, h: torch.Tensor, z_domain: torch.Tensor):
+        gamma = self.gamma_net(z_domain)
+        beta = self.beta_net(z_domain)
+        return (1.0 + gamma) * h + beta
 
 
 class DCFMNetwork(nn.Module):
-    def __init__(self, backbone_name, num_classes):
+    """
+    Full DCFM network combining backbone, domain classifier, FiLM modulation,
+    and task classifier.
+    """
+
+    def __init__(self, backbone_name: str, num_classes: int, domain_hidden_dim: int = 256):
         super().__init__()
         self.backbone = get_backbone(backbone_name)
-        
+
         if hasattr(self.backbone, 'fc'):
             self.feat_dim = self.backbone.fc.in_features
             self.backbone.fc = nn.Identity()
         else:
-            raise NotImplementedError("Backbone representation feature dimension not found.")
-            
-        self.domain_classifier = DomainClassifier(self.feat_dim)
-        self.modulator = DomainModulation(self.feat_dim)
-        self.classifier = nn.Linear(self.feat_dim, num_classes)
+            raise NotImplementedError("Backbone feature dimension not found.")
 
-    def forward(self, x, alpha=1.0):
-        features = self.backbone(x)
-        # GradientReversal forces the backbone to be domain-invariant, acting like DANN.
-        # Meanwhile, z_domain captures the remaining unaligned domain specific signals for modulation.
-        rev_features = grad_reverse(features, alpha)
-        domain_logits, z_domain = self.domain_classifier(rev_features)
-        mod_features = self.modulator(features, z_domain)
-        task_logits = self.classifier(mod_features)
-        return task_logits, domain_logits, mod_features
+        self.feat_bn = nn.BatchNorm1d(self.feat_dim)
+        self.domain_classifier = DomainClassifier(self.feat_dim, domain_hidden_dim)
+        self.modulator = FiLMModulation(self.feat_dim, domain_hidden_dim)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(self.feat_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor):
+        h = self.backbone(x)
+
+        # Domain classifier on detached features —
+        # domain loss shapes domain_classifier only, not the backbone.
+        # Backbone gradient comes from task loss through modulated features.
+        domain_logits, z_domain = self.domain_classifier(h.detach())
+
+        # FiLM modulation conditioned on domain representation
+        h_normed = self.feat_bn(h)
+        h_mod = self.modulator(h_normed, z_domain)
+
+        task_logits = self.classifier(h_mod)
+        return task_logits, domain_logits
+
+
+def information_maximization_loss(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Information Maximization (IM) loss for unsupervised target adaptation.
+
+    Combines two complementary objectives:
+    1. Entropy minimization: Encourage confident individual predictions
+    2. Diversity maximization: Prevent collapse to a single class by
+       maximizing entropy of the mean prediction across the batch
+
+    L_IM = mean_i[H(p_i)] - H(mean_i[p_i])
+         = (individual entropy) - (batch diversity)
+
+    Minimizing this encourages each sample to be confident while
+    ensuring diversity across the batch.
+    """
+    probs = F.softmax(logits, dim=1)
+
+    # Individual entropy: encourage each prediction to be confident
+    ent_individual = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
+
+    # Diversity: maximize entropy of mean prediction (prevent collapse)
+    mean_probs = probs.mean(dim=0)
+    ent_diversity = -(mean_probs * torch.log(mean_probs + 1e-8)).sum()
+
+    # Minimize individual entropy, maximize diversity
+    return ent_individual - ent_diversity
 
 
 @register_solver("dcfm")
 class DCFMSolver(BaseSolver):
     """
     Domain-Conditioned Feature Modulation (DCFM) solver.
+
+    Two-stage training:
+        Stage 1 (Warmup): Train on source with task + domain losses.
+        Stage 2 (Joint):  Add Information Maximization on target predictions.
     """
+
     def build_model(self):
         backbone_name = self.config.method.get("backbone", "resnet50")
-        self.net = DCFMNetwork(backbone_name, self.num_classes).to(self.device)
+        domain_hidden_dim = self.config.method.get("domain_hidden_dim", 256)
 
+        self.net = DCFMNetwork(backbone_name, self.num_classes, domain_hidden_dim).to(self.device)
+
+        # Hyperparameters
         self.lambda_domain = self.config.method.get("lambda_domain", 1.0)
-        self.lambda_target = self.config.method.get("lambda_target", 1.0)
-        self.confidence_threshold = self.config.method.get("confidence_threshold", 0.9)
+        self.lambda_im = self.config.method.get("lambda_im", 0.3)
+        self.label_smoothing = self.config.method.get("label_smoothing", 0.1)
 
-        self.criterion_task = nn.CrossEntropyLoss()
-        self.criterion_domain = nn.BCEWithLogitsLoss()
+        # Loss functions
+        self.criterion_task = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
+        self.criterion_domain = nn.CrossEntropyLoss()
 
     def forward_for_eval(self, imgs):
-        task_logits, _, _ = self.net(imgs)
+        task_logits, _ = self.net(imgs)
         return task_logits
 
+    # ------------------------------------------------------------------ #
+    #  Training
+    # ------------------------------------------------------------------ #
+
     def train(self):
-        import torch.optim as optim
-        from tqdm import tqdm
-        from utils import AverageMeter
-        
+        warmup_epochs = self.config.method.get("warmup_epochs", 5)
         max_epochs = self.config.method.epochs
         lr = self.config.method.lr
-        
-        import math
+
+        # Optimizer with differential LR
         optimizer = optim.SGD([
             {'params': self.net.backbone.parameters(), 'lr': lr * 0.1},
+            {'params': self.net.feat_bn.parameters(), 'lr': lr},
             {'params': self.net.domain_classifier.parameters(), 'lr': lr},
             {'params': self.net.modulator.parameters(), 'lr': lr},
-            {'params': self.net.classifier.parameters(), 'lr': lr}
-        ], momentum=0.9, weight_decay=5e-4)
-        
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs * len(self.source_loader))
+            {'params': self.net.classifier.parameters(), 'lr': lr},
+        ], momentum=0.9, weight_decay=5e-4, nesterov=True)
 
-        logger.info(f"Start training DCFM for {max_epochs} epochs...")
+        total_iters = (warmup_epochs + max_epochs) * len(self.source_loader)
 
+        # Linear warmup + cosine annealing
+        warmup_iters = warmup_epochs * len(self.source_loader)
+
+        def lr_lambda(step):
+            if step < warmup_iters:
+                return float(step) / max(1, warmup_iters)
+            progress = (step - warmup_iters) / max(1, total_iters - warmup_iters)
+            return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+        logger.info(f"DCFM Training: {warmup_epochs} warmup + {max_epochs} joint epochs")
         best_acc = 0.0
-        
-        for epoch in range(max_epochs):
+
+        # ===================== Stage 1: Warmup ===================== #
+        logger.info("=== Stage 1: Source Warmup ===")
+        for epoch in range(warmup_epochs):
             self.net.train()
-            loss_task_meter = AverageMeter()
-            loss_domain_meter = AverageMeter()
-            loss_target_meter = AverageMeter()
-            loss_total_meter = AverageMeter()
+            meters = {k: AverageMeter() for k in ['task', 'domain', 'total']}
+            tgt_iter = cycle(self.target_loader)
 
-            # Iterate over batches from both source and target domains
-            target_iter = iter(self.target_loader)
-            
-            pbar = tqdm(self.source_loader, desc=f"Epoch {epoch+1}/{max_epochs}")
-            for step, (src_imgs, src_labels) in enumerate(pbar):
-                try:
-                    tgt_imgs, _ = next(target_iter)
-                except StopIteration:
-                    target_iter = iter(self.target_loader)
-                    tgt_imgs, _ = next(target_iter)
-
-                src_imgs = src_imgs.to(self.device)
-                src_labels = src_labels.to(self.device)
+            pbar = tqdm(self.source_loader, desc=f"Warmup {epoch+1}/{warmup_epochs}")
+            for src_imgs, src_labels in pbar:
+                tgt_imgs, _ = next(tgt_iter)
+                src_imgs, src_labels = src_imgs.to(self.device), src_labels.to(self.device)
                 tgt_imgs = tgt_imgs.to(self.device)
+                bs_src, bs_tgt = src_imgs.size(0), tgt_imgs.size(0)
 
-                batch_size_src = src_imgs.size(0)
-                batch_size_tgt = tgt_imgs.size(0)
-
-                # Concatenate source and target images
                 all_imgs = torch.cat([src_imgs, tgt_imgs], dim=0)
 
-                # Alpha for Gradient Reversal Layer (standard DANN schedule)
-                p_alpha = float(epoch * len(self.source_loader) + step) / (max_epochs * len(self.source_loader))
-                alpha = 2. / (1. + math.exp(-10 * p_alpha)) - 1
-                
-                # Forward pass
                 optimizer.zero_grad()
-                task_logits, domain_logits, _ = self.net(all_imgs, alpha=alpha)
+                task_logits, domain_logits = self.net(all_imgs)
 
-                # Separate source and target logits
-                task_logits_src = task_logits[:batch_size_src]
-                task_logits_tgt = task_logits[batch_size_src:]
-                domain_logits_src = domain_logits[:batch_size_src]
-                domain_logits_tgt = domain_logits[batch_size_src:]
+                # Task loss (source only)
+                loss_task = self.criterion_task(task_logits[:bs_src], src_labels)
 
-                # 1. Task Loss (Source only)
-                loss_task = self.criterion_task(task_logits_src, src_labels)
+                # Domain loss (source=0, target=1)
+                domain_labels = torch.cat([
+                    torch.zeros(bs_src, dtype=torch.long, device=self.device),
+                    torch.ones(bs_tgt, dtype=torch.long, device=self.device),
+                ])
+                loss_domain = self.criterion_domain(domain_logits, domain_labels)
 
-                # 2. Domain Loss (Source and Target)
-                # target label for source=0, target=1
-                domain_labels_src = torch.zeros(batch_size_src, 1).to(self.device)
-                domain_labels_tgt = torch.ones(batch_size_tgt, 1).to(self.device)
-                
-                loss_domain_src = self.criterion_domain(domain_logits_src, domain_labels_src)
-                loss_domain_tgt = self.criterion_domain(domain_logits_tgt, domain_labels_tgt)
-                loss_domain = (loss_domain_src + loss_domain_tgt) / 2.0
-
-                # 3. Target Pseudo-label Loss
-                probs_tgt = torch.softmax(task_logits_tgt.detach(), dim=1)
-                max_probs, pseudo_labels = torch.max(probs_tgt, dim=1)
-                
-                mask = max_probs >= self.confidence_threshold
-                if mask.sum() > 0:
-                    loss_target = self.criterion_task(task_logits_tgt[mask], pseudo_labels[mask])
-                else:
-                    loss_target = torch.tensor(0.0).to(self.device)
-
-                # Warmup for target loss to prevent early noisy pseudo-labels from destroying training
-                p = float(epoch * len(self.source_loader) + step) / (max_epochs * len(self.source_loader))
-                current_lambda_target = self.lambda_target * (2. / (1. + math.exp(-10 * p)) - 1)
-
-                # Total Loss
-                loss_total = loss_task + (self.lambda_domain * loss_domain) + (current_lambda_target * loss_target)
-
-                loss_total.backward()
+                loss = loss_task + self.lambda_domain * loss_domain
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
                 optimizer.step()
                 scheduler.step()
-                
-                loss_task_meter.update(loss_task.item())
-                loss_domain_meter.update(loss_domain.item())
-                loss_target_meter.update(loss_target.item())
-                loss_total_meter.update(loss_total.item())
 
-                pbar.set_postfix({
-                    "task": f"{loss_task_meter.avg:.3f}",
-                    "dom": f"{loss_domain_meter.avg:.3f}",
-                    "tgt": f"{loss_target_meter.avg:.3f}",
-                    "tot": f"{loss_total_meter.avg:.3f}"
-                })
-            
+                meters['task'].update(loss_task.item())
+                meters['domain'].update(loss_domain.item())
+                meters['total'].update(loss.item())
+                pbar.set_postfix({k: f"{v.avg:.3f}" for k, v in meters.items()})
+
             acc = self.evaluate()
-            logger.info(f"Epoch {epoch+1} finished. Total Loss: {loss_total_meter.avg:.4f}, Acc: {acc:.2f}%")
-            
-            if acc > best_acc:
-                best_acc = acc
-                
+            best_acc = max(best_acc, acc)
+            logger.info(
+                f"Warmup {epoch+1} | task={meters['task'].avg:.4f} "
+                f"dom={meters['domain'].avg:.4f} | Acc={acc:.2f}% (best={best_acc:.2f}%)"
+            )
+
+        # ===================== Stage 2: Joint ===================== #
+        logger.info("=== Stage 2: Joint Training with Information Maximization ===")
+        for epoch in range(max_epochs):
+            self.net.train()
+            meters = {k: AverageMeter() for k in ['task', 'domain', 'im', 'total']}
+            tgt_iter = cycle(self.target_loader)
+
+            # Gradually ramp up IM loss to prevent early disruption
+            ramp = min(1.0, (epoch + 1) / max(1, max_epochs * 0.3))
+
+            pbar = tqdm(self.source_loader, desc=f"Joint {epoch+1}/{max_epochs}")
+            for src_imgs, src_labels in pbar:
+                tgt_imgs, _ = next(tgt_iter)
+                src_imgs, src_labels = src_imgs.to(self.device), src_labels.to(self.device)
+                tgt_imgs = tgt_imgs.to(self.device)
+                bs_src, bs_tgt = src_imgs.size(0), tgt_imgs.size(0)
+
+                all_imgs = torch.cat([src_imgs, tgt_imgs], dim=0)
+
+                optimizer.zero_grad()
+                task_logits, domain_logits = self.net(all_imgs)
+
+                task_logits_src = task_logits[:bs_src]
+                task_logits_tgt = task_logits[bs_src:]
+
+                # 1) Source task loss
+                loss_task = self.criterion_task(task_logits_src, src_labels)
+
+                # 2) Domain classification loss
+                domain_labels = torch.cat([
+                    torch.zeros(bs_src, dtype=torch.long, device=self.device),
+                    torch.ones(bs_tgt, dtype=torch.long, device=self.device),
+                ])
+                loss_domain = self.criterion_domain(domain_logits, domain_labels)
+
+                # 3) Information Maximization on target
+                loss_im = information_maximization_loss(task_logits_tgt)
+
+                loss = (loss_task
+                        + self.lambda_domain * loss_domain
+                        + self.lambda_im * ramp * loss_im)
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
+                optimizer.step()
+                scheduler.step()
+
+                meters['task'].update(loss_task.item())
+                meters['domain'].update(loss_domain.item())
+                meters['im'].update(loss_im.item())
+                meters['total'].update(loss.item())
+                pbar.set_postfix({
+                    'tsk': f"{meters['task'].avg:.3f}",
+                    'dom': f"{meters['domain'].avg:.3f}",
+                    'im': f"{meters['im'].avg:.3f}",
+                })
+
+            acc = self.evaluate()
+            best_acc = max(best_acc, acc)
+            logger.info(
+                f"Joint {epoch+1} | task={meters['task'].avg:.4f} "
+                f"dom={meters['domain'].avg:.4f} im={meters['im'].avg:.4f} "
+                f"ramp={ramp:.2f} | Acc={acc:.2f}% (best={best_acc:.2f}%)"
+            )
+
         logger.info(f"Training finished. Best Acc: {best_acc:.2f}%")
+
+    def save_checkpoint(self, path):
+        torch.save({
+            "method": "dcfm",
+            "model": self.net.state_dict(),
+        }, path)
+        logger.info(f"Model saved to {path}")
+
+    def load_checkpoint(self, path):
+        checkpoint = torch.load(path, map_location=self.device)
+        if "model" in checkpoint:
+            self.net.load_state_dict(checkpoint["model"])
+        else:
+            self.net.load_state_dict(checkpoint)
+        logger.info(f"Model loaded from {path}")

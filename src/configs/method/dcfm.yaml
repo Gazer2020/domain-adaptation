@@ -1,11 +1,15 @@
 name: dcfm
-lr: 0.01
-epochs: 30
+lr: 0.005
+epochs: 25
+warmup_epochs: 5
 backbone: resnet50
 
-# DCFM specific parameters
-lambda_domain: 0.1
-lambda_target: 1.0
-confidence_threshold: 0.9
+# Domain modulation
+lambda_domain: 1.0
+lambda_im: 0.3
+domain_hidden_dim: 256
+
+# Training
+label_smoothing: 0.1
 
 setting: csda

@@ -1,0 +1,17 @@
+# @package _global_
+
+method:
+  name: rtda
+  setting: osda
+  
+  # RTDA hyperparameters
+  lr: 0.00005
+  momentum: 0.9
+  weight_decay: 0.0005
+  
+  epochs: 70
+  batch_size: 64
+  
+  warm_up_epoch: 3
+  
+  K_cluster: 20

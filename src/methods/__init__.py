@@ -12,13 +12,10 @@ from methods.base_solver import BaseSolver
 from methods.ros import RotationSolver
 from methods.mic import MICSolver
 from methods.cad import CADSolver
-from methods.tod import TODSolver
-from methods.oid_gda import OIDGDASolver
-from methods.gad import GADSolver
-from methods.dga import DGASolver
-from methods.mic_simsiam import MICSimSiamSolver
-from methods.mic_gmm import MICGMMSolver
+
 from methods.cosda import COSDASolver
+from methods.rtda import RTDASolver
+from methods.dcfm import DCFMSolver
 
 __all__ = [
     # Registry
@@ -30,13 +27,10 @@ __all__ = [
     "RotationSolver",
     "MICSolver",
     "CADSolver",
-    "TODSolver",
-    "OIDGDASolver",
-    "GADSolver",
-    "DGASolver",
-    "MICSimSiamSolver",
-    "MICGMMSolver",
+
     "COSDASolver",
+    "RTDASolver",
+    "DCFMSolver",
 ]
 
 

@@ -1,0 +1,11 @@
+name: dcfm
+lr: 0.01
+epochs: 30
+backbone: resnet50
+
+# DCFM specific parameters
+lambda_domain: 0.1
+lambda_target: 1.0
+confidence_threshold: 0.9
+
+setting: csda

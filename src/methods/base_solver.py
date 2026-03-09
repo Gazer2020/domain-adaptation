@@ -325,7 +325,6 @@ class SourceOnlySolver(BaseSolver):
     def train(self):
         """Train on source domain only."""
         import torch.optim as optim
-        from tqdm import tqdm
         from utils import AverageMeter
         
         max_epochs = self.config.method.epochs
@@ -344,8 +343,7 @@ class SourceOnlySolver(BaseSolver):
             self.net.train()
             loss_meter = AverageMeter()
             
-            pbar = tqdm(self.source_loader, desc=f"Epoch {epoch+1}/{max_epochs}")
-            for src_imgs, src_labels in pbar:
+            for src_imgs, src_labels in self.source_loader:
                 src_imgs = src_imgs.to(self.device)
                 src_labels = src_labels.to(self.device)
                 
@@ -356,7 +354,6 @@ class SourceOnlySolver(BaseSolver):
                 optimizer.step()
                 
                 loss_meter.update(loss.item())
-                pbar.set_postfix({"loss": loss_meter.avg})
             
             acc = self.evaluate()
             logger.info(f"Epoch {epoch+1} finished. Loss: {loss_meter.avg:.4f}, Acc: {acc:.2f}%")

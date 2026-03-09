@@ -10,7 +10,6 @@ import logging
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from tqdm import tqdm
 
 from methods.registry import register_solver
 from methods.base_solver import BaseSolver
@@ -133,8 +132,7 @@ class RotationSolver(BaseSolver):
             loss_meter = AverageMeter()
             target_iter = cycle(self.target_loader)
             
-            pbar = tqdm(self.source_loader, desc=f"Rotation {epoch+1}/{max_epochs}")
-            for src_imgs, _ in pbar:
+            for src_imgs, _ in self.source_loader:
                 self.rot_optimizer.zero_grad()
 
                 tgt_imgs, _ = next(target_iter)
@@ -151,7 +149,6 @@ class RotationSolver(BaseSolver):
                 self.rot_optimizer.step()
 
                 loss_meter.update(loss.item())
-                pbar.set_postfix({"rot_loss": loss_meter.avg})
 
             acc = self.evaluate()
             logger.info(f"Rotation Epoch {epoch+1} finished. Target Acc: {acc:.2f}%")
@@ -175,8 +172,7 @@ class RotationSolver(BaseSolver):
 
             loss_meter = AverageMeter()
             
-            pbar = tqdm(self.source_loader, desc=f"Semantic {epoch+1}/{max_epochs}")
-            for src_imgs, src_labels in pbar:
+            for src_imgs, src_labels in self.source_loader:
                 self.sem_optimizer.zero_grad()
 
                 src_imgs = src_imgs.to(self.device)
@@ -190,7 +186,6 @@ class RotationSolver(BaseSolver):
                 self.sem_optimizer.step()
 
                 loss_meter.update(loss.item())
-                pbar.set_postfix({"sem_loss": loss_meter.avg})
 
             acc = self.evaluate()
             logger.info(f"Semantic Epoch {epoch+1} finished. Target Acc: {acc:.2f}%")

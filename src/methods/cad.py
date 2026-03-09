@@ -17,7 +17,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from tqdm import tqdm
 from sklearn.mixture import GaussianMixture
 import numpy as np
 
@@ -248,8 +247,7 @@ class CADSolver(BaseSolver):
             self._set_train_mode()
             loss_meter = AverageMeter()
             
-            pbar = tqdm(self.source_loader, desc=f"Pretrain {epoch+1}/{max_epochs}")
-            for src_imgs, src_labels in pbar:
+            for src_imgs, src_labels in self.source_loader:
                 src_imgs = src_imgs.to(self.device)
                 src_labels = src_labels.to(self.device)
                 
@@ -265,7 +263,6 @@ class CADSolver(BaseSolver):
                 self.optimizer.step()
                 
                 loss_meter.update(loss.item())
-                pbar.set_postfix({"loss": loss_meter.avg})
             
             # Evaluate known accuracy only during pretrain
             known_acc = self._evaluate_known_accuracy()
@@ -318,8 +315,7 @@ class CADSolver(BaseSolver):
             struct_loss_meter = AverageMeter()
             anomaly_loss_meter = AverageMeter()
             
-            pbar = tqdm(self.source_loader, desc=f"Adapt {epoch+1}/{max_epochs}")
-            for src_imgs, src_labels in pbar:
+            for src_imgs, src_labels in self.source_loader:
                 tgt_imgs, _ = next(tgt_iter)
                 
                 src_imgs = src_imgs.to(self.device)
@@ -336,12 +332,6 @@ class CADSolver(BaseSolver):
                 cls_loss_meter.update(loss_dict["cls"])
                 struct_loss_meter.update(loss_dict["struct"])
                 anomaly_loss_meter.update(loss_dict["anom"])
-                
-                pbar.set_postfix({
-                    "cls": cls_loss_meter.avg,
-                    "struct": struct_loss_meter.avg,
-                    "anom": anomaly_loss_meter.avg
-                })
             
             hos = self.evaluate()
             logger.info(f"Adapt Epoch {epoch+1}: Cls={cls_loss_meter.avg:.4f}, "
@@ -400,7 +390,7 @@ class CADSolver(BaseSolver):
         class_counts = torch.zeros(self.num_src_classes, device=self.device)
         
         with torch.no_grad():
-            for imgs, labels in tqdm(self.source_loader, desc="Computing prototypes"):
+            for imgs, labels in self.source_loader:
                 imgs = imgs.to(self.device)
                 labels = labels.to(self.device)
                 
@@ -422,7 +412,7 @@ class CADSolver(BaseSolver):
         target_similarities = []
         
         with torch.no_grad():
-            for imgs, _ in tqdm(self.target_loader, desc="Collecting target similarities"):
+            for imgs, _ in self.target_loader:
                 imgs = imgs.to(self.device)
                 
                 # Get gating vectors

@@ -9,7 +9,6 @@ import logging
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from tqdm import tqdm
 
 from methods.registry import register_solver
 from methods.base_solver import BaseSolver
@@ -88,8 +87,7 @@ class MICSolver(BaseSolver):
             mic_loss_meter = AverageMeter()
             tot_loss_meter = AverageMeter()
 
-            pbar = tqdm(self.source_loader, desc=f"Epoch {epoch+1}/{max_epochs}")
-            for src_imgs, src_labels in pbar:
+            for src_imgs, src_labels in self.source_loader:
                 tgt_imgs, _ = next(tgt_iter)
 
                 src_imgs = src_imgs.to(self.device)
@@ -117,12 +115,6 @@ class MICSolver(BaseSolver):
                 sem_loss_meter.update(sem_loss.item())
                 mic_loss_meter.update(mic_loss.item())
                 tot_loss_meter.update(loss.item())
-                
-                pbar.set_postfix({
-                    "sem": sem_loss_meter.avg,
-                    "mic": mic_loss_meter.avg,
-                    "tot": tot_loss_meter.avg
-                })
 
             acc = self.evaluate()
             logger.info(

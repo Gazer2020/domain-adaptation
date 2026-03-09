@@ -8,7 +8,6 @@ import numpy as np
 import faiss
 faiss.omp_set_num_threads(1)
 import torch
-from tqdm import tqdm
 import torch.nn as nn
 import torch.optim as optim
 from torch.autograd.variable import *
@@ -415,8 +414,7 @@ class RTDASolver(BaseSolver):
             loss_meter = AverageMeter()
             
             with Accumulator(['pred_s', 'pred_t', 'label_s', 'kl', 'fss', 'ftt']) as ProbRecorder:
-                pbar = tqdm(range(max_len), desc=f"Epoch {epoch+1}/{max_epochs}")
-                for i in pbar:
+                for i in range(max_len):
                     im_source, label_source = next(src_iter)
                     im_target, _ = next(tgt_iter)
 
@@ -499,7 +497,6 @@ class RTDASolver(BaseSolver):
                         loss.backward()
                         
                     loss_meter.update(loss.item())
-                    pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
 
             # Evaluate at the end of epoch
             acc = self.evaluate()

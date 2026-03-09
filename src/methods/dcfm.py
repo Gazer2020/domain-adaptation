@@ -24,7 +24,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from tqdm import tqdm
 
 from methods.base_solver import BaseSolver
 from methods.registry import register_solver
@@ -225,8 +224,7 @@ class DCFMSolver(BaseSolver):
             meters = {k: AverageMeter() for k in ['task', 'domain', 'total']}
             tgt_iter = cycle(self.target_loader)
 
-            pbar = tqdm(self.source_loader, desc=f"Warmup {epoch+1}/{warmup_epochs}")
-            for src_imgs, src_labels in pbar:
+            for src_imgs, src_labels in self.source_loader:
                 tgt_imgs, _ = next(tgt_iter)
                 src_imgs, src_labels = src_imgs.to(self.device), src_labels.to(self.device)
                 tgt_imgs = tgt_imgs.to(self.device)
@@ -256,7 +254,6 @@ class DCFMSolver(BaseSolver):
                 meters['task'].update(loss_task.item())
                 meters['domain'].update(loss_domain.item())
                 meters['total'].update(loss.item())
-                pbar.set_postfix({k: f"{v.avg:.3f}" for k, v in meters.items()})
 
             acc = self.evaluate()
             best_acc = max(best_acc, acc)
@@ -275,8 +272,7 @@ class DCFMSolver(BaseSolver):
             # Gradually ramp up IM loss to prevent early disruption
             ramp = min(1.0, (epoch + 1) / max(1, max_epochs * 0.3))
 
-            pbar = tqdm(self.source_loader, desc=f"Joint {epoch+1}/{max_epochs}")
-            for src_imgs, src_labels in pbar:
+            for src_imgs, src_labels in self.source_loader:
                 tgt_imgs, _ = next(tgt_iter)
                 src_imgs, src_labels = src_imgs.to(self.device), src_labels.to(self.device)
                 tgt_imgs = tgt_imgs.to(self.device)
@@ -316,11 +312,6 @@ class DCFMSolver(BaseSolver):
                 meters['domain'].update(loss_domain.item())
                 meters['im'].update(loss_im.item())
                 meters['total'].update(loss.item())
-                pbar.set_postfix({
-                    'tsk': f"{meters['task'].avg:.3f}",
-                    'dom': f"{meters['domain'].avg:.3f}",
-                    'im': f"{meters['im'].avg:.3f}",
-                })
 
             acc = self.evaluate()
             best_acc = max(best_acc, acc)

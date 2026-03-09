@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions.normal import Normal
-from tqdm import tqdm
 
 from methods.registry import register_solver
 from methods.base_solver import BaseSolver
@@ -310,7 +309,7 @@ class COSDASolver(BaseSolver):
         
         begin_index = 0
         self.net.eval()
-        for imgs_train, imgs_label in tqdm(self.source_loader, desc="Init Memory"):
+        for imgs_train, imgs_label in self.source_loader:
             images = imgs_train.to(self.device)
             label = imgs_label.to(self.device)
             bs = images.shape[0]
@@ -466,11 +465,7 @@ class COSDASolver(BaseSolver):
             src_iter = cycle(self.source_loader)
             tgt_iter = cycle(self.target_loader)
             
-            pbar = tqdm(range(max_len), desc=f"Epoch {epoch+1}/{max_epochs}")
-            
-            total_loss_meter = AverageMeter()
-            
-            for batch_idx in pbar:
+            for batch_idx in range(max_len):
                 train_s, target_s = next(src_iter)
                 train_t, target_t = next(tgt_iter)
                 
@@ -536,7 +531,6 @@ class COSDASolver(BaseSolver):
                 optimizer.step()
                 
                 total_loss_meter.update(loss_all.item())
-                pbar.set_postfix({"loss": total_loss_meter.avg})
                 
             acc = self.evaluate()
             logger.info(f"Epoch {epoch+1} finished. Loss: {total_loss_meter.avg:.4f}, Target H-Score/Acc: {acc:.2f}%")

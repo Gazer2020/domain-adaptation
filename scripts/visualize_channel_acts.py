@@ -24,7 +24,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
 from sklearn.manifold import TSNE
-from tqdm import tqdm
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -76,7 +75,7 @@ class ChannelActivationExtractor:
         all_activations = []
         all_labels = []
         
-        for imgs, labels in tqdm(dataloader, desc="Extracting activations"):
+        for imgs, labels in dataloader:
             imgs = imgs.to(device)
             _ = self.model(imgs)  # Forward pass triggers the hook
             

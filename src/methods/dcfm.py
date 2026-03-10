@@ -11,10 +11,11 @@ Architecture:
     2. Domain classifier (NO gradient reversal) → domain logits + z_domain
     3. FiLM modulation: h' = (1 + γ(z_domain)) * BN(h) + β(z_domain)
     4. Task classifier → class predictions from h'
+    5. Cross-domain Feature Hallucination: apply target style to source content.
 
 Training strategy:
     Stage 1 (Warmup): Source task loss + domain classification loss
-    Stage 2 (Joint):  + Information Maximization on target predictions
+    Stage 2 (Joint):  + Information Maximization + Cross-Domain Feature Hallucination
 """
 
 import logging
@@ -110,19 +111,28 @@ class DCFMNetwork(nn.Module):
             nn.Linear(512, num_classes),
         )
 
-    def forward(self, x: torch.Tensor):
+    def extract_features(self, x: torch.Tensor):
+        """Extract base features from the backbone."""
         h = self.backbone(x)
+        return h
 
-        # Domain classifier on detached features —
-        # domain loss shapes domain_classifier only, not the backbone.
-        # Backbone gradient comes from task loss through modulated features.
+    def get_domain_repr(self, h: torch.Tensor):
+        """Get domain logits and representation from detached backone features."""
+        # Domain classifier on detached features
         domain_logits, z_domain = self.domain_classifier(h.detach())
+        return domain_logits, z_domain
 
-        # FiLM modulation conditioned on domain representation
+    def forward_modulated(self, h: torch.Tensor, z_domain: torch.Tensor):
+        """Apply FiLM modulation and task classification."""
         h_normed = self.feat_bn(h)
         h_mod = self.modulator(h_normed, z_domain)
-
         task_logits = self.classifier(h_mod)
+        return task_logits
+
+    def forward(self, x: torch.Tensor):
+        h = self.extract_features(x)
+        domain_logits, z_domain = self.get_domain_repr(h)
+        task_logits = self.forward_modulated(h, z_domain)
         return task_logits, domain_logits
 
 
@@ -173,6 +183,7 @@ class DCFMSolver(BaseSolver):
         # Hyperparameters
         self.lambda_domain = self.config.method.get("lambda_domain", 1.0)
         self.lambda_im = self.config.method.get("lambda_im", 0.3)
+        self.lambda_cf = self.config.method.get("lambda_cf", 1.0)
         self.label_smoothing = self.config.method.get("label_smoothing", 0.1)
 
         # Loss functions
@@ -263,13 +274,13 @@ class DCFMSolver(BaseSolver):
             )
 
         # ===================== Stage 2: Joint ===================== #
-        logger.info("=== Stage 2: Joint Training with Information Maximization ===")
+        logger.info("=== Stage 2: Joint Training with Feature Hallucination & IM ===")
         for epoch in range(max_epochs):
             self.net.train()
-            meters = {k: AverageMeter() for k in ['task', 'domain', 'im', 'total']}
+            meters = {k: AverageMeter() for k in ['task', 'domain', 'im', 'cf', 'total']}
             tgt_iter = cycle(self.target_loader)
 
-            # Gradually ramp up IM loss to prevent early disruption
+            # Gradually ramp up IM and CF loss to prevent early disruption
             ramp = min(1.0, (epoch + 1) / max(1, max_epochs * 0.3))
 
             for src_imgs, src_labels in self.source_loader:
@@ -278,18 +289,23 @@ class DCFMSolver(BaseSolver):
                 tgt_imgs = tgt_imgs.to(self.device)
                 bs_src, bs_tgt = src_imgs.size(0), tgt_imgs.size(0)
 
-                all_imgs = torch.cat([src_imgs, tgt_imgs], dim=0)
-
                 optimizer.zero_grad()
-                task_logits, domain_logits = self.net(all_imgs)
-
-                task_logits_src = task_logits[:bs_src]
-                task_logits_tgt = task_logits[bs_src:]
+                
+                # --- Decoupled Forward Pass ---
+                h_src = self.net.extract_features(src_imgs)
+                h_tgt = self.net.extract_features(tgt_imgs)
+                
+                domain_logits_src, z_src = self.net.get_domain_repr(h_src)
+                domain_logits_tgt, z_tgt = self.net.get_domain_repr(h_tgt)
+                
+                task_logits_src = self.net.forward_modulated(h_src, z_src)
+                task_logits_tgt = self.net.forward_modulated(h_tgt, z_tgt)
 
                 # 1) Source task loss
                 loss_task = self.criterion_task(task_logits_src, src_labels)
 
                 # 2) Domain classification loss
+                domain_logits = torch.cat([domain_logits_src, domain_logits_tgt], dim=0)
                 domain_labels = torch.cat([
                     torch.zeros(bs_src, dtype=torch.long, device=self.device),
                     torch.ones(bs_tgt, dtype=torch.long, device=self.device),
@@ -299,9 +315,23 @@ class DCFMSolver(BaseSolver):
                 # 3) Information Maximization on target
                 loss_im = information_maximization_loss(task_logits_tgt)
 
+                # 4) Cross-Domain Feature Hallucination (CF)
+                # Shuffle target domain representations to break local semantic correlations
+                shuffle_idx = torch.randperm(bs_tgt, device=self.device)
+                z_tgt_shuffled = z_tgt[shuffle_idx]
+                
+                # Modulate SOURCE content with SHUFFLED TARGET style (detached)
+                # Crucial: detach z_tgt to prevent L_cf from corrupting the domain classifier
+                task_logits_cf = self.net.forward_modulated(h_src, z_tgt_shuffled.detach()[:bs_src])
+                
+                # Hallucination loss: force backbone to extract robust features despite target style
+                loss_cf = self.criterion_task(task_logits_cf, src_labels)
+
+                # Total Loss with ramp-ups
                 loss = (loss_task
                         + self.lambda_domain * loss_domain
-                        + self.lambda_im * ramp * loss_im)
+                        + self.lambda_im * ramp * loss_im
+                        + self.lambda_cf * ramp * loss_cf)
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
@@ -311,14 +341,15 @@ class DCFMSolver(BaseSolver):
                 meters['task'].update(loss_task.item())
                 meters['domain'].update(loss_domain.item())
                 meters['im'].update(loss_im.item())
+                meters['cf'].update(loss_cf.item())
                 meters['total'].update(loss.item())
 
             acc = self.evaluate()
             best_acc = max(best_acc, acc)
             logger.info(
-                f"Joint {epoch+1} | task={meters['task'].avg:.4f} "
-                f"dom={meters['domain'].avg:.4f} im={meters['im'].avg:.4f} "
-                f"ramp={ramp:.2f} | Acc={acc:.2f}% (best={best_acc:.2f}%)"
+                f"Joint {epoch+1:02d} | ts={meters['task'].avg:.3f} "
+                f"dm={meters['domain'].avg:.3f} im={meters['im'].avg:.3f} "
+                f"cf={meters['cf'].avg:.3f} | rmp={ramp:.2f} | Acc={acc:.2f}% (best={best_acc:.2f}%)"
             )
 
         logger.info(f"Training finished. Best Acc: {best_acc:.2f}%")

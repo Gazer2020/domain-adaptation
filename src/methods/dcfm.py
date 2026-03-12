@@ -20,6 +20,7 @@ Training strategy:
 
 import logging
 import math
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -44,11 +45,11 @@ class DomainClassifier(nn.Module):
     def __init__(self, in_features: int, hidden_dim: int = 256):
         super().__init__()
         self.fc1 = nn.Linear(in_features, hidden_dim)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, 2)
 
     def forward(self, x: torch.Tensor):
-        z_domain = F.relu(self.bn1(self.fc1(x)))
+        z_domain = F.relu(self.ln1(self.fc1(x)))
         domain_logits = self.fc2(z_domain)
         return domain_logits, z_domain
 
@@ -63,24 +64,30 @@ class FiLMModulation(nn.Module):
     Initialized to identity (γ=0, β=0) so modulation has no effect at the start.
     """
 
-    def __init__(self, feat_dim: int, domain_dim: int = 256):
+    def __init__(self, feat_dim: int, domain_dim: int = 256, scale_factor: float = 4.0):
         super().__init__()
+        self.scale_factor = scale_factor
         self.gamma_net = nn.Sequential(
             nn.Linear(domain_dim, feat_dim),
-            nn.Tanh(),  # bound γ to [-1, 1] for stability
+            nn.Sigmoid(),  # bounded γ ∈ [0, scale_factor]
         )
         self.beta_net = nn.Linear(domain_dim, feat_dim)
 
-        # Initialize to identity modulation
+        # Initialize to identity modulation:
+        # Sigmoid(0) = 0.5, so scale = 0.5 * scale_factor.
+        # We want initial scale ≈ 1.0, so bias = sigmoid_inv(1/scale_factor).
+        # For scale_factor=4, we want Sigmoid output = 0.25 → bias ≈ -1.1
+        # Simpler: just zero-init weights and set bias so Sigmoid → 1/scale_factor
         nn.init.zeros_(self.gamma_net[0].weight)
-        nn.init.zeros_(self.gamma_net[0].bias)
+        init_bias = -math.log(scale_factor - 1.0)  # sigmoid(init_bias) = 1/scale_factor
+        nn.init.constant_(self.gamma_net[0].bias, init_bias)
         nn.init.zeros_(self.beta_net.weight)
         nn.init.zeros_(self.beta_net.bias)
 
     def forward(self, h: torch.Tensor, z_domain: torch.Tensor):
-        gamma = self.gamma_net(z_domain)
+        gamma = self.gamma_net(z_domain) * self.scale_factor  # γ ∈ [0, scale_factor]
         beta = self.beta_net(z_domain)
-        return (1.0 + gamma) * h + beta
+        return gamma * h + beta
 
 
 class DCFMNetwork(nn.Module):
@@ -89,7 +96,9 @@ class DCFMNetwork(nn.Module):
     and task classifier.
     """
 
-    def __init__(self, backbone_name: str, num_classes: int, domain_hidden_dim: int = 256):
+    def __init__(self, backbone_name: str, num_classes: int,
+                 domain_hidden_dim: int = 256, bottleneck_dim: int = 0,
+                 film_scale: float = 4.0):
         super().__init__()
         self.backbone = get_backbone(backbone_name)
 
@@ -101,26 +110,34 @@ class DCFMNetwork(nn.Module):
 
         self.feat_bn = nn.BatchNorm1d(self.feat_dim)
         self.domain_classifier = DomainClassifier(self.feat_dim, domain_hidden_dim)
-        self.modulator = FiLMModulation(self.feat_dim, domain_hidden_dim)
+        self.modulator = FiLMModulation(self.feat_dim, domain_hidden_dim, film_scale)
 
-        self.classifier = nn.Sequential(
-            nn.Linear(self.feat_dim, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(512, num_classes),
-        )
+        # Configurable classifier head
+        if bottleneck_dim > 0:
+            self.classifier = nn.Sequential(
+                nn.Linear(self.feat_dim, bottleneck_dim),
+                nn.BatchNorm1d(bottleneck_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.3),
+                nn.Linear(bottleneck_dim, num_classes),
+            )
+        else:
+            self.classifier = nn.Linear(self.feat_dim, num_classes)
 
     def extract_features(self, x: torch.Tensor):
         """Extract base features from the backbone."""
         h = self.backbone(x)
         return h
 
-    def get_domain_repr(self, h: torch.Tensor):
-        """Get domain logits and representation from detached backone features."""
-        # Domain classifier on detached features
-        domain_logits, z_domain = self.domain_classifier(h.detach())
-        return domain_logits, z_domain
+    def get_domain_logits(self, h: torch.Tensor):
+        """Get domain logits from DETACHED features (for domain loss only)."""
+        domain_logits, _ = self.domain_classifier(h.detach())
+        return domain_logits
+
+    def get_domain_z(self, h: torch.Tensor):
+        """Get domain representation z_domain WITH gradients (for FiLM modulation)."""
+        _, z_domain = self.domain_classifier(h)
+        return z_domain
 
     def forward_modulated(self, h: torch.Tensor, z_domain: torch.Tensor):
         """Apply FiLM modulation and task classification."""
@@ -131,12 +148,14 @@ class DCFMNetwork(nn.Module):
 
     def forward(self, x: torch.Tensor):
         h = self.extract_features(x)
-        domain_logits, z_domain = self.get_domain_repr(h)
+        domain_logits = self.get_domain_logits(h)
+        z_domain = self.get_domain_z(h)
         task_logits = self.forward_modulated(h, z_domain)
         return task_logits, domain_logits
 
 
-def information_maximization_loss(logits: torch.Tensor) -> torch.Tensor:
+def information_maximization_loss(logits: torch.Tensor,
+                                  diversity_weight: float = 2.0) -> torch.Tensor:
     """
     Information Maximization (IM) loss for unsupervised target adaptation.
 
@@ -145,8 +164,7 @@ def information_maximization_loss(logits: torch.Tensor) -> torch.Tensor:
     2. Diversity maximization: Prevent collapse to a single class by
        maximizing entropy of the mean prediction across the batch
 
-    L_IM = mean_i[H(p_i)] - H(mean_i[p_i])
-         = (individual entropy) - (batch diversity)
+    L_IM = mean_i[H(p_i)] - diversity_weight * H(mean_i[p_i])
 
     Minimizing this encourages each sample to be confident while
     ensuring diversity across the batch.
@@ -161,7 +179,7 @@ def information_maximization_loss(logits: torch.Tensor) -> torch.Tensor:
     ent_diversity = -(mean_probs * torch.log(mean_probs + 1e-8)).sum()
 
     # Minimize individual entropy, maximize diversity
-    return ent_individual - ent_diversity
+    return ent_individual - diversity_weight * ent_diversity
 
 
 @register_solver("dcfm")
@@ -177,13 +195,19 @@ class DCFMSolver(BaseSolver):
     def build_model(self):
         backbone_name = self.config.method.get("backbone", "resnet50")
         domain_hidden_dim = self.config.method.get("domain_hidden_dim", 256)
+        bottleneck_dim = self.config.method.get("bottleneck_dim", 0)
+        film_scale = self.config.method.get("film_scale", 4.0)
 
-        self.net = DCFMNetwork(backbone_name, self.num_classes, domain_hidden_dim).to(self.device)
+        self.net = DCFMNetwork(
+            backbone_name, self.num_classes, domain_hidden_dim,
+            bottleneck_dim, film_scale,
+        ).to(self.device)
 
         # Hyperparameters
         self.lambda_domain = self.config.method.get("lambda_domain", 1.0)
         self.lambda_im = self.config.method.get("lambda_im", 0.3)
         self.lambda_cf = self.config.method.get("lambda_cf", 1.0)
+        self.lambda_div = self.config.method.get("lambda_div", 2.0)
         self.label_smoothing = self.config.method.get("label_smoothing", 0.1)
 
         # Loss functions
@@ -225,8 +249,18 @@ class DCFMSolver(BaseSolver):
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-        logger.info(f"DCFM Training: {warmup_epochs} warmup + {max_epochs} joint epochs")
+        # Beta distribution for mixup (PyTorch-based for reproducibility)
+        beta_dist = torch.distributions.Beta(
+            torch.tensor(2.0), torch.tensor(2.0),
+        )
+
+        # Best model tracking
         best_acc = 0.0
+        save_dir = Path("checkpoints")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        best_path = save_dir / "best.pth"
+
+        logger.info(f"DCFM Training: {warmup_epochs} warmup + {max_epochs} joint epochs")
 
         # ===================== Stage 1: Warmup ===================== #
         logger.info("=== Stage 1: Source Warmup ===")
@@ -241,15 +275,25 @@ class DCFMSolver(BaseSolver):
                 tgt_imgs = tgt_imgs.to(self.device)
                 bs_src, bs_tgt = src_imgs.size(0), tgt_imgs.size(0)
 
-                all_imgs = torch.cat([src_imgs, tgt_imgs], dim=0)
-
                 optimizer.zero_grad()
-                task_logits, domain_logits = self.net(all_imgs)
+
+                # --- Decoupled Forward (consistent with Stage 2) ---
+                h_src = self.net.extract_features(src_imgs)
+                h_tgt = self.net.extract_features(tgt_imgs)
+
+                # Domain logits (detached) for domain loss
+                domain_logits_src = self.net.get_domain_logits(h_src)
+                domain_logits_tgt = self.net.get_domain_logits(h_tgt)
+
+                # z_domain (with gradients) for FiLM modulation
+                z_src = self.net.get_domain_z(h_src)
 
                 # Task loss (source only)
-                loss_task = self.criterion_task(task_logits[:bs_src], src_labels)
+                task_logits_src = self.net.forward_modulated(h_src, z_src)
+                loss_task = self.criterion_task(task_logits_src, src_labels)
 
                 # Domain loss (source=0, target=1)
+                domain_logits = torch.cat([domain_logits_src, domain_logits_tgt], dim=0)
                 domain_labels = torch.cat([
                     torch.zeros(bs_src, dtype=torch.long, device=self.device),
                     torch.ones(bs_tgt, dtype=torch.long, device=self.device),
@@ -267,7 +311,9 @@ class DCFMSolver(BaseSolver):
                 meters['total'].update(loss.item())
 
             acc = self.evaluate()
-            best_acc = max(best_acc, acc)
+            if acc > best_acc:
+                best_acc = acc
+                self.save_checkpoint(best_path)
             logger.info(
                 f"Warmup {epoch+1} | task={meters['task'].avg:.4f} "
                 f"dom={meters['domain'].avg:.4f} | Acc={acc:.2f}% (best={best_acc:.2f}%)"
@@ -290,14 +336,19 @@ class DCFMSolver(BaseSolver):
                 bs_src, bs_tgt = src_imgs.size(0), tgt_imgs.size(0)
 
                 optimizer.zero_grad()
-                
+
                 # --- Decoupled Forward Pass ---
                 h_src = self.net.extract_features(src_imgs)
                 h_tgt = self.net.extract_features(tgt_imgs)
-                
-                domain_logits_src, z_src = self.net.get_domain_repr(h_src)
-                domain_logits_tgt, z_tgt = self.net.get_domain_repr(h_tgt)
-                
+
+                # Domain logits (detached) for domain loss
+                domain_logits_src = self.net.get_domain_logits(h_src)
+                domain_logits_tgt = self.net.get_domain_logits(h_tgt)
+
+                # z_domain (with gradients) for FiLM modulation
+                z_src = self.net.get_domain_z(h_src)
+                z_tgt = self.net.get_domain_z(h_tgt)
+
                 task_logits_src = self.net.forward_modulated(h_src, z_src)
                 task_logits_tgt = self.net.forward_modulated(h_tgt, z_tgt)
 
@@ -313,19 +364,38 @@ class DCFMSolver(BaseSolver):
                 loss_domain = self.criterion_domain(domain_logits, domain_labels)
 
                 # 3) Information Maximization on target
-                loss_im = information_maximization_loss(task_logits_tgt)
+                loss_im = information_maximization_loss(
+                    task_logits_tgt, diversity_weight=self.lambda_div,
+                )
 
-                # 4) Cross-Domain Feature Hallucination (CF)
-                # Shuffle target domain representations to break local semantic correlations
-                shuffle_idx = torch.randperm(bs_tgt, device=self.device)
-                z_tgt_shuffled = z_tgt[shuffle_idx]
-                
-                # Modulate SOURCE content with SHUFFLED TARGET style (detached)
-                # Crucial: detach z_tgt to prevent L_cf from corrupting the domain classifier
-                task_logits_cf = self.net.forward_modulated(h_src, z_tgt_shuffled.detach()[:bs_src])
-                
-                # Hallucination loss: force backbone to extract robust features despite target style
-                loss_cf = self.criterion_task(task_logits_cf, src_labels)
+                # 4) Cross-Domain Joint Manifold Mixup
+                min_bs = min(bs_src, bs_tgt)
+
+                # Shuffle target to pair randomly with source
+                shuffle_idx = torch.randperm(min_bs, device=self.device)
+                h_tgt_shuffled = h_tgt[:min_bs][shuffle_idx]
+                z_tgt_shuffled = z_tgt[:min_bs][shuffle_idx]
+
+                # Sample lambda from Beta(2,2), ensure source dominance
+                lam = beta_dist.sample().item()
+                lam = max(lam, 1.0 - lam)  # source-dominant for label reliability
+
+                # Joint Manifold Interpolation
+                h_cross = lam * h_src[:min_bs] + (1 - lam) * h_tgt_shuffled
+                z_cross = lam * z_src[:min_bs].detach() + (1 - lam) * z_tgt_shuffled.detach()
+
+                # Modulate and Classify
+                task_logits_cross = self.net.classifier(
+                    self.net.modulator(self.net.feat_bn(h_cross), z_cross)
+                )
+
+                # Mixed Labels Loss
+                prob_tgt = F.softmax(task_logits_tgt[:min_bs][shuffle_idx].detach(), dim=1)
+                loss_src_part = lam * F.cross_entropy(task_logits_cross, src_labels[:min_bs])
+                log_prob_cross = F.log_softmax(task_logits_cross, dim=1)
+                loss_tgt_part = (1 - lam) * torch.sum(-prob_tgt * log_prob_cross, dim=1).mean()
+
+                loss_cf = loss_src_part + loss_tgt_part
 
                 # Total Loss with ramp-ups
                 loss = (loss_task
@@ -345,12 +415,19 @@ class DCFMSolver(BaseSolver):
                 meters['total'].update(loss.item())
 
             acc = self.evaluate()
-            best_acc = max(best_acc, acc)
+            if acc > best_acc:
+                best_acc = acc
+                self.save_checkpoint(best_path)
             logger.info(
                 f"Joint {epoch+1:02d} | ts={meters['task'].avg:.3f} "
                 f"dm={meters['domain'].avg:.3f} im={meters['im'].avg:.3f} "
                 f"cf={meters['cf'].avg:.3f} | rmp={ramp:.2f} | Acc={acc:.2f}% (best={best_acc:.2f}%)"
             )
+
+        # Load best model weights at the end of training
+        if best_path.exists():
+            self.load_checkpoint(best_path)
+            logger.info(f"Loaded best model (Acc={best_acc:.2f}%) from {best_path}")
 
         logger.info(f"Training finished. Best Acc: {best_acc:.2f}%")
 

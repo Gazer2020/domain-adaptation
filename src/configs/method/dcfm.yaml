@@ -8,7 +8,13 @@ backbone: resnet50
 lambda_domain: 1.0
 lambda_im: 0.3
 lambda_cf: 1.0
+lambda_div: 1.5
 domain_hidden_dim: 256
+film_scale: 4.0
+
+# Classifier head (0 = single linear, >0 = MLP with bottleneck)
+# 512 for large dataset
+bottleneck_dim: 512
 
 # Training
 label_smoothing: 0.1

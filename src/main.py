@@ -8,12 +8,15 @@ method file with @register_solver decorator and a config file.
 
 import logging
 import random
+import os
 from pathlib import Path
 
 import hydra
 import torch
 import numpy as np
 from omegaconf import OmegaConf, DictConfig
+
+OmegaConf.register_new_resolver("src_dir", lambda: os.path.dirname(os.path.abspath(__file__)))
 
 from datasets.loader import get_dataloader
 from methods import get_solver, list_solvers

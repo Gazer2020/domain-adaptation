@@ -1,0 +1,29 @@
+name: odcfm
+lr: 0.005
+epochs: 30
+warmup_epochs: 10
+backbone: resnet50
+
+# Domain modulation
+lambda_domain: 1.0
+lambda_sk: 0.8
+lambda_cf: 1.0
+lambda_ent: 0.2
+lambda_unk: 0.5
+domain_hidden_dim: 256
+film_scale: 4.0
+
+# OSDA Hyperparameters
+energy_T: 1.0
+unk_T: 0.05
+margin_k: 1.2
+ema_decay: 0.99
+
+# Classifier head (0 = single linear, >0 = MLP with bottleneck)
+# 512 for large dataset
+bottleneck_dim: 512
+
+# Training
+label_smoothing: 0.1
+
+setting: osda

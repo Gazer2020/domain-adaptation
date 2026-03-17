@@ -132,6 +132,80 @@ class DomainDataset(Dataset):
         return len(self.samples)
 
 
+class MultiSourceDomainDataset(Dataset):
+    """
+    Wrap multiple DomainDataset objects and return (img, label, domain_id).
+
+    This dataset is meant for MSDA training where each source domain has an
+    explicit domain id in [0..S-1].
+    """
+
+    def __init__(self, datasets: List[DomainDataset]):
+        if not datasets:
+            raise ValueError("datasets must be a non-empty list")
+        self.datasets = datasets
+        self._lengths = [len(d) for d in datasets]
+        self._offsets = [0]
+        for n in self._lengths[:-1]:
+            self._offsets.append(self._offsets[-1] + n)
+        self._total = sum(self._lengths)
+
+    def __len__(self):
+        return self._total
+
+    def __getitem__(self, index):
+        if index < 0:
+            index = self._total + index
+        if index < 0 or index >= self._total:
+            raise IndexError("index out of range")
+        # Find which dataset this index falls into
+        # (linear scan is fine for small S; S is typically <= 4)
+        for dom_id, (off, n) in enumerate(zip(self._offsets, self._lengths)):
+            if off <= index < off + n:
+                img, label = self.datasets[dom_id][index - off]
+                return img, label, dom_id
+        raise RuntimeError("Failed to map index to a dataset")
+
+
+class _UniformDomainBatchSampler(torch.utils.data.Sampler[List[int]]):
+    """
+    Batch sampler that yields batches with uniform domain contribution in expectation.
+
+    Each batch picks a domain uniformly at random and then samples indices from that
+    domain with replacement.
+    """
+
+    def __init__(self, domain_sizes: List[int], batch_size: int, steps_per_epoch: int, drop_last: bool = True):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        if steps_per_epoch <= 0:
+            raise ValueError("steps_per_epoch must be > 0")
+        if any(n <= 0 for n in domain_sizes):
+            raise ValueError("All domains must have at least 1 sample")
+        self.domain_sizes = domain_sizes
+        self.batch_size = int(batch_size)
+        self.steps_per_epoch = int(steps_per_epoch)
+        self.drop_last = bool(drop_last)
+
+        # Precompute offsets into the concatenated MultiSourceDomainDataset index space
+        self.offsets = [0]
+        for n in domain_sizes[:-1]:
+            self.offsets.append(self.offsets[-1] + n)
+
+    def __iter__(self):
+        g = torch.Generator()
+        # Generator seed will be set by global torch.manual_seed in main.py
+        for _ in range(self.steps_per_epoch):
+            dom = int(torch.randint(low=0, high=len(self.domain_sizes), size=(1,), generator=g).item())
+            n = self.domain_sizes[dom]
+            off = self.offsets[dom]
+            idx_in_dom = torch.randint(low=0, high=n, size=(self.batch_size,), generator=g).tolist()
+            yield [off + i for i in idx_in_dom]
+
+    def __len__(self):
+        return self.steps_per_epoch
+
+
 def get_dataloader(config):
     """
     Create data loaders for domain adaptation.
@@ -163,18 +237,45 @@ def get_dataloader(config):
             f"Please check your config file and ensure the data is downloaded."
         )
 
-    source_domain = config.dataset.source
+    setting = config.method.setting
+
+    source_domain = getattr(config.dataset, "source", None)
+    source_domains = getattr(config.dataset, "sources", None)
     target_domain = config.dataset.target
+
+    if setting == "msda":
+        if source_domains is None:
+            raise ValueError("For setting=msda, config.dataset.sources must be a non-empty list of source domains")
+        try:
+            source_domains = list(source_domains)
+        except Exception as e:
+            raise ValueError(f"For setting=msda, dataset.sources must be list-like; got: {type(source_domains)}") from e
+        if len(source_domains) == 0:
+            raise ValueError("For setting=msda, config.dataset.sources must be a non-empty list of source domains")
+        if len(set(source_domains)) != len(source_domains):
+            raise ValueError(f"Duplicate entries found in dataset.sources: {source_domains}")
+    else:
+        if source_domain is None:
+            raise ValueError("Config must contain dataset.source for non-msda settings")
     
     # Validate domain directories exist
-    src_path = root_dir / source_domain
     tgt_path = root_dir / target_domain
     
-    if not src_path.exists():
-        raise FileNotFoundError(
-            f"Source domain directory not found: {src_path}\n"
-            f"Available domains: {[d.name for d in root_dir.iterdir() if d.is_dir()]}"
-        )
+    if setting == "msda":
+        src_paths = [root_dir / d for d in source_domains]
+        for p in src_paths:
+            if not p.exists():
+                raise FileNotFoundError(
+                    f"Source domain directory not found: {p}\n"
+                    f"Available domains: {[d.name for d in root_dir.iterdir() if d.is_dir()]}"
+                )
+    else:
+        src_path = root_dir / source_domain
+        if not src_path.exists():
+            raise FileNotFoundError(
+                f"Source domain directory not found: {src_path}\n"
+                f"Available domains: {[d.name for d in root_dir.iterdir() if d.is_dir()]}"
+            )
     if not tgt_path.exists():
         raise FileNotFoundError(
             f"Target domain directory not found: {tgt_path}\n"
@@ -186,7 +287,6 @@ def get_dataloader(config):
 
     # Determine classes
     src_classes, tgt_classes, shared_classes = get_class_splits(config)
-    setting = config.method.setting
     
     # Build class mappings for proper label handling
     src_mapping, tgt_mapping, unknown_label = build_class_mapping(
@@ -247,12 +347,18 @@ def get_dataloader(config):
         target_transform = WeakStrongAugment(weak_aug, strong_aug)
 
     # Datasets with proper class mappings
-    src_path = root_dir / source_domain
     tgt_path = root_dir / target_domain
 
-    source_dataset = DomainDataset(
-        src_path, src_classes, transform=train_transform, class_mapping=src_mapping
-    )
+    if setting == "msda":
+        source_datasets = [
+            DomainDataset(p, src_classes, transform=train_transform, class_mapping=src_mapping) for p in src_paths
+        ]
+        source_dataset = MultiSourceDomainDataset(source_datasets)
+    else:
+        src_path = root_dir / source_domain
+        source_dataset = DomainDataset(
+            src_path, src_classes, transform=train_transform, class_mapping=src_mapping
+        )
     
     # Target dataset uses special transform if enabled 
     target_dataset = DomainDataset(
@@ -264,13 +370,31 @@ def get_dataloader(config):
     )
 
     # DataLoaders
-    source_loader = DataLoader(
-        source_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        drop_last=True,
-    )
+    if setting == "msda":
+        domain_sizes = [len(d) for d in source_datasets]
+        # Keep epoch length comparable to the single-source baseline:
+        # use the max-domain size to determine steps, then sample domains uniformly.
+        steps_per_epoch = max(domain_sizes) // batch_size
+        steps_per_epoch = max(1, int(steps_per_epoch))
+        batch_sampler = _UniformDomainBatchSampler(
+            domain_sizes=domain_sizes,
+            batch_size=batch_size,
+            steps_per_epoch=steps_per_epoch,
+            drop_last=True,
+        )
+        source_loader = DataLoader(
+            source_dataset,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+        )
+    else:
+        source_loader = DataLoader(
+            source_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            drop_last=True,
+        )
     target_loader = DataLoader(
         target_dataset,
         batch_size=batch_size,

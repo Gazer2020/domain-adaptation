@@ -20,3 +20,4 @@ bottleneck_dim: 512
 label_smoothing: 0.1
 
 setting: csda
+supported_settings: [csda]

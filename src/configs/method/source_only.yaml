@@ -4,3 +4,4 @@ epochs: 1
 backbone: resnet18
 
 setting: csda
+supported_settings: [csda]

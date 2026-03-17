@@ -3,6 +3,7 @@
 method:
   name: rtda
   setting: osda
+  supported_settings: [osda]
   
   # RTDA hyperparameters
   lr: 0.00005

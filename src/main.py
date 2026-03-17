@@ -52,9 +52,10 @@ def main(cfg: DictConfig):
     source_loader, target_loader, target_test_loader, class_info = get_dataloader(cfg)
     loaders = (source_loader, target_loader, target_test_loader)
 
-    logger.info(
-        f"Data loaded. Source: {cfg.dataset.source}, Target: {cfg.dataset.target}"
-    )
+    if class_info["setting"] == "msda":
+        logger.info(f"Data loaded. Sources: {list(cfg.dataset.sources)}, Target: {cfg.dataset.target}")
+    else:
+        logger.info(f"Data loaded. Source: {cfg.dataset.source}, Target: {cfg.dataset.target}")
     logger.info(
         f"Setting: {class_info['setting']}, "
         f"Num classes: {class_info['num_classes']}, "
@@ -64,6 +65,13 @@ def main(cfg: DictConfig):
 
     # 4. Initialize Solver via registry
     method_name = cfg.method.name.lower()
+    supported_settings = getattr(cfg.method, "supported_settings", None)
+    if supported_settings is not None and class_info["setting"] not in list(supported_settings):
+        logger.error(
+            f"Method '{method_name}' does not support setting='{class_info['setting']}'. "
+            f"supported_settings={list(supported_settings)}"
+        )
+        raise ValueError(f"Unsupported setting for method '{method_name}'")
     try:
         solver_cls = get_solver(method_name)
     except KeyError as e:

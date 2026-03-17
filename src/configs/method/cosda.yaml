@@ -3,6 +3,7 @@
 method:
   name: cosda
   setting: osda
+  supported_settings: [osda]
   
   # Method specific hyperparameters matches COSDA
   lr: 0.01

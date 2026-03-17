@@ -4,12 +4,17 @@ root: data/Office-31
 
 # Default domains
 source: amazon
+sources: []
 target: webcam
 
 # Office-31 has 31 classes (Index 0-30)
 num_classes: 31
 splits:
   csda:
+    source: ${range:"0-30"}
+    target: ${range:"0-30"}
+
+  msda:
     source: ${range:"0-30"}
     target: ${range:"0-30"}
     

@@ -6,3 +6,4 @@ momentum: 0.999
 backbone: resnet50
 
 setting: csda
+supported_settings: [csda]

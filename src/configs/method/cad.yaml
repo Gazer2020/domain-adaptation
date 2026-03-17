@@ -2,6 +2,7 @@ name: cad
 lr: 0.001
 # CAD-specific parameters
 setting: osda
+supported_settings: [osda]
 # Backbone is usually defined in base, but can be here too
 backbone: resnet50
 

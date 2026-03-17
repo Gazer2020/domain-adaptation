@@ -5,3 +5,4 @@ backbone: resnet18
 semantic_hidden_dim: 256
 
 setting: csda
+supported_settings: [csda]

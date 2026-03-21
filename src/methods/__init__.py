@@ -18,6 +18,7 @@ from methods.rtda import RTDASolver
 from methods.dcfm import DCFMSolver
 from methods.odcfm import ODCFMSolver
 from methods.mdcfm import MDCFMSolver
+from methods.rvtc import RVTCSolver
 
 __all__ = [
     # Registry
@@ -35,6 +36,7 @@ __all__ = [
     "DCFMSolver",
     "ODCFMSolver",
     "MDCFMSolver",
+    "RVTCSolver",
 ]
 
 

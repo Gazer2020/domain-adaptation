@@ -1,0 +1,34 @@
+name: rvtc
+
+lr: 0.001
+epochs: 30
+optimizer: adam
+weight_decay: 0.0001
+
+# KinematicHeadV2: layer3 (1024) -> layer4 (2048) MLP hidden width
+kin_hidden: 512
+
+# Orthodox ResNet: train full backbone; earlier blocks at backbone_lr_mult * lr
+freeze_backbone: false
+backbone_lr_mult: 0.1
+
+# Required for V2: source trains head on detached backbone features; target pulls backbone via kin
+kin_on_source: true
+
+# Target: kinematic (略降，减轻与 CE/熵的后期拉扯)
+lambda_kin: 0.35
+
+# Target: entropy minimization（略降，减轻错误聚类/决策边界过拟合）
+lambda_ent: 0.05
+
+# Ramp：熵比动力学更晚加满，先学好分类与动力学再加强聚类
+kin_ramp_denom: 12.0
+ent_ramp_denom: 18.0
+
+# 轻微平滑，稳定源域 CE
+label_smoothing: 0.05
+
+pretrained: true
+
+setting: csda
+supported_settings: [csda, msda]

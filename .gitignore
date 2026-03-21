@@ -16,6 +16,7 @@ wheels/
 .vscode
 .agent
 .cursor
+.ipynb_checkpoints
 
 checkpoints
 data

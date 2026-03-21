@@ -11,6 +11,7 @@ Data contract (only for setting=msda):
 - target_loader yields (tgt_imgs, _); solver creates tgt_domain_id = S
 """
 
+import copy
 import logging
 import math
 from pathlib import Path
@@ -26,6 +27,56 @@ from models.backbones import get_backbone
 from utils import AverageMeter, cycle
 
 logger = logging.getLogger(__name__)
+
+
+class MixStyle(nn.Module):
+    """
+    MixStyle (Zhou et al., ICLR 2021): randomly mixes feature statistics (mean/std)
+    across samples within a batch to simulate novel visual styles and reduce
+    style sensitivity. Applied at intermediate backbone layers during training only.
+    """
+
+    def __init__(self, p: float = 0.5, alpha: float = 0.3):
+        super().__init__()
+        self.p = p
+        self.beta = torch.distributions.Beta(alpha, alpha)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or torch.rand(1).item() > self.p:
+            return x
+        B = x.size(0)
+        mu = x.mean(dim=[2, 3], keepdim=True)
+        sig = (x.var(dim=[2, 3], keepdim=True) + 1e-6).sqrt()
+        x_normed = (x - mu) / sig
+
+        perm = torch.randperm(B)
+        lam = self.beta.sample((B, 1, 1, 1)).to(x.device)
+        mu_mix = lam * mu + (1.0 - lam) * mu[perm]
+        sig_mix = lam * sig + (1.0 - lam) * sig[perm]
+        return x_normed * sig_mix + mu_mix
+
+
+class DomainSpecificBN(nn.Module):
+    """
+    Domain-Specific Batch Normalization: maintains separate BN statistics for each
+    domain. During training, each sample is routed to its domain's BN layer.
+    A target_domain_id is used for inference.
+    """
+
+    def __init__(self, feat_dim: int, num_domains: int, target_domain_id: int):
+        super().__init__()
+        self.bns = nn.ModuleList([nn.BatchNorm1d(feat_dim) for _ in range(num_domains)])
+        self.target_domain_id = target_domain_id
+
+    def forward(self, x: torch.Tensor, domain_ids: torch.Tensor = None) -> torch.Tensor:
+        if not self.training or domain_ids is None:
+            return self.bns[self.target_domain_id](x)
+        output = torch.zeros_like(x)
+        for d, bn in enumerate(self.bns):
+            mask = domain_ids == d
+            if mask.any():
+                output[mask] = bn(x[mask])
+        return output
 
 
 class DomainClassifier(nn.Module):
@@ -77,6 +128,11 @@ class MDCFMNetwork(nn.Module):
         domain_hidden_dim: int = 256,
         bottleneck_dim: int = 0,
         film_scale: float = 4.0,
+        mixstyle: bool = False,
+        mixstyle_p: float = 0.5,
+        mixstyle_alpha: float = 0.3,
+        dsbn: bool = False,
+        target_domain_id: int = 0,
     ):
         super().__init__()
         self.backbone = get_backbone(backbone_name)
@@ -86,7 +142,18 @@ class MDCFMNetwork(nn.Module):
         else:
             raise NotImplementedError("Backbone feature dimension not found.")
 
-        self.feat_bn = nn.BatchNorm1d(self.feat_dim)
+        if mixstyle:
+            ms1 = MixStyle(p=mixstyle_p, alpha=mixstyle_alpha)
+            ms2 = MixStyle(p=mixstyle_p, alpha=mixstyle_alpha)
+            self.backbone.layer1 = nn.Sequential(self.backbone.layer1, ms1)
+            self.backbone.layer2 = nn.Sequential(self.backbone.layer2, ms2)
+
+        self.use_dsbn = dsbn
+        if dsbn:
+            self.feat_bn = DomainSpecificBN(self.feat_dim, num_domains, target_domain_id)
+        else:
+            self.feat_bn = nn.BatchNorm1d(self.feat_dim)
+
         self.domain_classifier = DomainClassifier(self.feat_dim, num_domains=num_domains, hidden_dim=domain_hidden_dim)
         self.modulator = FiLMModulation(self.feat_dim, domain_hidden_dim, film_scale)
 
@@ -112,16 +179,19 @@ class MDCFMNetwork(nn.Module):
         _, z_domain = self.domain_classifier(h)
         return z_domain
 
-    def forward_modulated(self, h: torch.Tensor, z_domain: torch.Tensor):
-        h_normed = self.feat_bn(h)
+    def forward_modulated(self, h: torch.Tensor, z_domain: torch.Tensor, domain_ids: torch.Tensor = None):
+        if self.use_dsbn:
+            h_normed = self.feat_bn(h, domain_ids)
+        else:
+            h_normed = self.feat_bn(h)
         h_mod = self.modulator(h_normed, z_domain)
         return self.classifier(h_mod)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, domain_ids: torch.Tensor = None):
         h = self.extract_features(x)
         domain_logits = self.get_domain_logits(h)
         z_domain = self.get_domain_z(h)
-        task_logits = self.forward_modulated(h, z_domain)
+        task_logits = self.forward_modulated(h, z_domain, domain_ids)
         return task_logits, domain_logits
 
 
@@ -152,6 +222,11 @@ class MDCFMSolver(BaseSolver):
         self.target_domain_id = self.num_source_domains
         self.num_domains = self.num_source_domains + 1
 
+        use_mixstyle = bool(self.config.method.get("mixstyle", False))
+        mixstyle_p = float(self.config.method.get("mixstyle_p", 0.5))
+        mixstyle_alpha = float(self.config.method.get("mixstyle_alpha", 0.3))
+        use_dsbn = bool(self.config.method.get("dsbn", False))
+
         self.net = MDCFMNetwork(
             backbone_name=backbone_name,
             num_classes=self.num_classes,
@@ -159,11 +234,23 @@ class MDCFMSolver(BaseSolver):
             domain_hidden_dim=domain_hidden_dim,
             bottleneck_dim=bottleneck_dim,
             film_scale=film_scale,
+            mixstyle=use_mixstyle,
+            mixstyle_p=mixstyle_p,
+            mixstyle_alpha=mixstyle_alpha,
+            dsbn=use_dsbn,
+            target_domain_id=self.num_source_domains,
         ).to(self.device)
+
+        self.ema_net = copy.deepcopy(self.net)
+        for p in self.ema_net.parameters():
+            p.requires_grad_(False)
+        self.ema_decay_start = float(self.config.method.get("ema_decay_start", 0.996))
+        self.ema_decay_end = float(self.config.method.get("ema_decay_end", 0.9995))
 
         self.lambda_domain = float(self.config.method.get("lambda_domain", 1.0))
         self.lambda_im = float(self.config.method.get("lambda_im", 0.3))
         self.lambda_cf = float(self.config.method.get("lambda_cf", 1.0))
+        self.lambda_ss = float(self.config.method.get("lambda_ss", 0.5))
         self.lambda_div = float(self.config.method.get("lambda_div", 2.0))
         self.label_smoothing = float(self.config.method.get("label_smoothing", 0.1))
 
@@ -173,6 +260,22 @@ class MDCFMSolver(BaseSolver):
     def forward_for_eval(self, imgs):
         logits, _ = self.net(imgs)
         return logits
+
+    @torch.no_grad()
+    def _update_ema(self, decay: float):
+        for p_ema, p_student in zip(self.ema_net.parameters(), self.net.parameters()):
+            p_ema.data.mul_(decay).add_(p_student.data, alpha=1.0 - decay)
+
+    def _ema_decay_at(self, step: int, total_steps: int) -> float:
+        progress = min(1.0, step / max(1, total_steps))
+        return self.ema_decay_start + (self.ema_decay_end - self.ema_decay_start) * progress
+
+    def _modulate_and_classify(self, h: torch.Tensor, z: torch.Tensor, domain_ids: torch.Tensor = None) -> torch.Tensor:
+        if self.net.use_dsbn:
+            h_normed = self.net.feat_bn(h, domain_ids)
+        else:
+            h_normed = self.net.feat_bn(h)
+        return self.net.classifier(self.net.modulator(h_normed, z))
 
     def train(self):
         warmup_epochs = int(self.config.method.get("warmup_epochs", 5))
@@ -210,7 +313,12 @@ class MDCFMSolver(BaseSolver):
         save_dir.mkdir(parents=True, exist_ok=True)
         best_path = save_dir / "best.pth"
 
-        logger.info(f"MDCFM Training (MSDA): {warmup_epochs} warmup + {max_epochs} joint epochs | S={self.num_source_domains}")
+        rd = self.config.method.get("ramp_denom")
+        ramp_denom = max(1e-8, float(rd) if rd is not None else float(max_epochs) * 0.3)
+        global_step = 0
+        logger.info(
+            f"MDCFM Training (MSDA): {warmup_epochs} warmup + {max_epochs} joint epochs | S={self.num_source_domains}"
+        )
 
         # ===================== Stage 1: Warmup ===================== #
         logger.info("=== Stage 1: Source Warmup ===")
@@ -237,7 +345,7 @@ class MDCFMSolver(BaseSolver):
 
                 z_src = self.net.get_domain_z(h_src)
 
-                task_logits_src = self.net.forward_modulated(h_src, z_src)
+                task_logits_src = self.net.forward_modulated(h_src, z_src, src_dom)
                 loss_task = self.criterion_task(task_logits_src, src_labels)
 
                 tgt_dom = torch.full((bs_tgt,), self.target_domain_id, dtype=torch.long, device=self.device)
@@ -250,6 +358,10 @@ class MDCFMSolver(BaseSolver):
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
                 optimizer.step()
                 scheduler.step()
+
+                ema_decay = self._ema_decay_at(global_step, total_iters)
+                self._update_ema(ema_decay)
+                global_step += 1
 
                 meters["task"].update(loss_task.item())
                 meters["domain"].update(loss_domain.item())
@@ -268,9 +380,9 @@ class MDCFMSolver(BaseSolver):
         logger.info("=== Stage 2: Joint Training with Feature Hallucination & IM ===")
         for epoch in range(max_epochs):
             self.net.train()
-            meters = {k: AverageMeter() for k in ["task", "domain", "im", "cf", "total"]}
+            meters = {k: AverageMeter() for k in ["task", "domain", "im", "cf", "ss", "total"]}
             tgt_iter = cycle(self.target_loader)
-            ramp = min(1.0, (epoch + 1) / max(1, max_epochs * 0.3))
+            ramp = min(1.0, (epoch + 1) / ramp_denom)
 
             for src_imgs, src_labels, src_dom in self.source_loader:
                 tgt_imgs, _ = next(tgt_iter)
@@ -291,42 +403,70 @@ class MDCFMSolver(BaseSolver):
                 z_src = self.net.get_domain_z(h_src)
                 z_tgt = self.net.get_domain_z(h_tgt)
 
-                task_logits_src = self.net.forward_modulated(h_src, z_src)
-                task_logits_tgt = self.net.forward_modulated(h_tgt, z_tgt)
+                tgt_dom = torch.full((bs_tgt,), self.target_domain_id, dtype=torch.long, device=self.device)
+
+                task_logits_src = self.net.forward_modulated(h_src, z_src, src_dom)
+                task_logits_tgt = self.net.forward_modulated(h_tgt, z_tgt, tgt_dom)
 
                 loss_task = self.criterion_task(task_logits_src, src_labels)
-
-                tgt_dom = torch.full((bs_tgt,), self.target_domain_id, dtype=torch.long, device=self.device)
                 domain_logits = torch.cat([domain_logits_src, domain_logits_tgt], dim=0)
                 domain_labels = torch.cat([src_dom.long(), tgt_dom], dim=0)
                 loss_domain = self.criterion_domain(domain_logits, domain_labels)
 
                 loss_im = information_maximization_loss(task_logits_tgt, diversity_weight=self.lambda_div)
 
+                # --- Source-Target Cross-Domain Hallucination (per-sample lambda + EMA pseudo-labels) ---
                 min_bs = min(bs_src, bs_tgt)
                 shuffle_idx = torch.randperm(min_bs, device=self.device)
                 h_tgt_shuffled = h_tgt[:min_bs][shuffle_idx]
                 z_tgt_shuffled = z_tgt[:min_bs][shuffle_idx]
 
-                lam = beta_dist.sample().item()
-                lam = max(lam, 1.0 - lam)
+                lam_st = beta_dist.sample((min_bs,)).to(self.device)
+                lam_st = torch.max(lam_st, 1.0 - lam_st).unsqueeze(1)
 
-                h_cross = lam * h_src[:min_bs] + (1 - lam) * h_tgt_shuffled
-                z_cross = lam * z_src[:min_bs].detach() + (1 - lam) * z_tgt_shuffled.detach()
+                h_cross = lam_st * h_src[:min_bs] + (1.0 - lam_st) * h_tgt_shuffled
+                z_cross = lam_st * z_src[:min_bs].detach() + (1.0 - lam_st) * z_tgt_shuffled.detach()
 
-                task_logits_cross = self.net.classifier(self.net.modulator(self.net.feat_bn(h_cross), z_cross))
+                logits_cross = self._modulate_and_classify(h_cross, z_cross, domain_ids=None)
 
-                prob_tgt = F.softmax(task_logits_tgt[:min_bs][shuffle_idx].detach(), dim=1)
-                loss_src_part = lam * F.cross_entropy(task_logits_cross, src_labels[:min_bs])
-                log_prob_cross = F.log_softmax(task_logits_cross, dim=1)
-                loss_tgt_part = (1 - lam) * torch.sum(-prob_tgt * log_prob_cross, dim=1).mean()
-                loss_cf = loss_src_part + loss_tgt_part
+                with torch.no_grad():
+                    self.ema_net.eval()
+                    ema_h_tgt = self.ema_net.extract_features(tgt_imgs)
+                    ema_z_tgt = self.ema_net.get_domain_z(ema_h_tgt)
+                    ema_logits_tgt = self.ema_net.forward_modulated(ema_h_tgt, ema_z_tgt)
+                    ema_prob_tgt = F.softmax(ema_logits_tgt[:min_bs][shuffle_idx], dim=1)
+
+                lam_st_1d = lam_st.squeeze(1)
+                loss_src_part = F.cross_entropy(logits_cross, src_labels[:min_bs], reduction="none")
+                log_prob_cross = F.log_softmax(logits_cross, dim=1)
+                loss_tgt_part = torch.sum(-ema_prob_tgt * log_prob_cross, dim=1)
+                loss_cf = (lam_st_1d * loss_src_part + (1.0 - lam_st_1d) * loss_tgt_part).mean()
+
+                # --- Inter-Source Cross-Domain Hallucination ---
+                src_shuffle = torch.randperm(bs_src, device=self.device)
+                h_src_b = h_src[src_shuffle]
+                z_src_b = z_src[src_shuffle]
+                labels_b = src_labels[src_shuffle]
+
+                lam_ss = beta_dist.sample((bs_src,)).to(self.device)
+                lam_ss = torch.max(lam_ss, 1.0 - lam_ss).unsqueeze(1)
+
+                h_ss = lam_ss * h_src + (1.0 - lam_ss) * h_src_b
+                z_ss = lam_ss * z_src.detach() + (1.0 - lam_ss) * z_src_b.detach()
+
+                logits_ss = self._modulate_and_classify(h_ss, z_ss, domain_ids=src_dom)
+
+                lam_ss_1d = lam_ss.squeeze(1)
+                loss_ss_a = F.cross_entropy(logits_ss, src_labels, reduction="none")
+                loss_ss_b = F.cross_entropy(logits_ss, labels_b, reduction="none")
+                loss_ss = (lam_ss_1d * loss_ss_a + (1.0 - lam_ss_1d) * loss_ss_b).mean()
 
                 loss = (
                     loss_task
                     + self.lambda_domain * loss_domain
                     + self.lambda_im * ramp * loss_im
                     + self.lambda_cf * ramp * loss_cf
+                    + self.lambda_ss * ramp * loss_ss
                 )
 
                 loss.backward()
@@ -334,10 +474,15 @@ class MDCFMSolver(BaseSolver):
                 optimizer.step()
                 scheduler.step()
 
+                ema_decay = self._ema_decay_at(global_step, total_iters)
+                self._update_ema(ema_decay)
+                global_step += 1
+
                 meters["task"].update(loss_task.item())
                 meters["domain"].update(loss_domain.item())
                 meters["im"].update(loss_im.item())
                 meters["cf"].update(loss_cf.item())
+                meters["ss"].update(loss_ss.item())
                 meters["total"].update(loss.item())
 
             acc = self.evaluate()
@@ -346,8 +491,8 @@ class MDCFMSolver(BaseSolver):
                 self.save_checkpoint(best_path)
             logger.info(
                 f"Joint {epoch+1:02d} | ts={meters['task'].avg:.3f} dm={meters['domain'].avg:.3f} "
-                f"im={meters['im'].avg:.3f} cf={meters['cf'].avg:.3f} | rmp={ramp:.2f} | "
-                f"Acc={acc:.2f}% (best={best_acc:.2f}%)"
+                f"im={meters['im'].avg:.3f} cf={meters['cf'].avg:.3f} ss={meters['ss'].avg:.3f} "
+                f"| rmp={ramp:.2f} | Acc={acc:.2f}% (best={best_acc:.2f}%)"
             )
 
         if best_path.exists():

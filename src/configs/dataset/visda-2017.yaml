@@ -1,0 +1,38 @@
+name: VisDA-2017
+# 请将此路径更新为您的数据集存放位置（通常包含 train, validation, test 文件夹）
+root: data/visda-2017
+
+# 默认域设置：Source 通常是 Synthetic (合成图), Target 通常是 Real (真实图/Validation)
+source: train
+target: validation
+
+# VisDA-2017 共有 12 个类别 (Index 0-11)
+num_classes: 12
+
+splits:
+  # Closed-Set DA (CSDA): 标准的无监督领域自适应，源域和目标域类别完全一致
+  csda:
+    source: ${range:0-11}
+    target: ${range:0-11}
+    
+  # Open-Set DA (OSDA): 
+  # - Source 是前 6 类 (已知类)
+  # - Target 包含全部 12 类 (其中 6-11 为未知类 "Unknown")
+  osda:
+    source: ${range:0-5}
+    target: ${range:0-11}
+    
+  # Partial DA (PDA): 
+  # - Source 包含全部 12 类
+  # - Target 仅包含前 6 类 (目标域是源域的子集)
+  pda:
+    source: ${range:0-11}
+    target: ${range:0-5}
+    
+  # Universal DA (UniDA): 
+  # - Shared (共享): 3 类 (0-2)
+  # - Source Private (源域私有): 3 类 (3-5) -> Source total: 0-5
+  # - Target Private (目标域私有): 6 类 (6-11) -> Target total: 0-2 + 6-11
+  unida:
+    source: ${range:0-5}
+    target: ${range:0-2,6-11}

@@ -1,0 +1,35 @@
+name: ImageCLEF
+# Update this root path to match the directory from your terminal
+root: /root/autodl-tmp/image_CLEF
+
+# Default domains (Options: b, c, i, p)
+# b: Bing, c: Caltech, i: ImageNet, p: Pascal
+source: i
+target: p
+
+# ImageCLEF-DA has 12 classes (Index 0-11)
+num_classes: 12
+
+splits:
+  # Closed-Set DA: 所有类别共享 (12类)
+  csda:
+    source: ${range:0-11}
+    target: ${range:0-11}
+    
+  # Open-Set DA: Source是前6类，Target包含全部12类 (其中6-11为未知类)
+  osda:
+    source: ${range:0-5}
+    target: ${range:0-11}
+    
+  # Partial DA: Source包含全部12类，Target只包含前6类
+  pda:
+    source: ${range:0-11}
+    target: ${range:0-5}
+    
+  # Universal DA: 
+  # - Shared (共享): 6类 (0-5)
+  # - Source Private (源域私有): 3类 (6-8) -> Source total: 0-8
+  # - Target Private (目标域私有): 3类 (9-11) -> Target total: 0-5 + 9-11
+  unida:
+    source: ${range:0-8}
+    target: ${range:0-5,9-11}

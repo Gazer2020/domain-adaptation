@@ -55,7 +55,7 @@ def build_class_mapping(src_classes: List[int], tgt_classes: List[int],
         tgt_mapping: Dict mapping original target class -> new label (or unknown)
         unknown_label: Label for unknown classes (None for CSDA)
     """
-    if setting == "csda":
+    if setting in ("csda", "msda"):
         # CSDA: all classes are shared, use original indices
         mapping = {c: i for i, c in enumerate(sorted(src_classes))}
         return mapping, mapping, None
@@ -169,10 +169,12 @@ class MultiSourceDomainDataset(Dataset):
 
 class _UniformDomainBatchSampler(torch.utils.data.Sampler[List[int]]):
     """
-    Batch sampler that yields batches with uniform domain contribution in expectation.
+    Batch sampler that yields batches with uniform domain contribution.
 
-    Each batch picks a domain uniformly at random and then samples indices from that
-    domain with replacement.
+    Implementation detail:
+    - Domains are visited in a shuffled round-robin order (uniform over steps).
+    - Within each domain, indices are sampled without replacement via a random permutation,
+      and when exhausted, the domain reshuffles and continues.
     """
 
     def __init__(self, domain_sizes: List[int], batch_size: int, steps_per_epoch: int, drop_last: bool = True):
@@ -194,13 +196,81 @@ class _UniformDomainBatchSampler(torch.utils.data.Sampler[List[int]]):
 
     def __iter__(self):
         g = torch.Generator()
-        # Generator seed will be set by global torch.manual_seed in main.py
-        for _ in range(self.steps_per_epoch):
-            dom = int(torch.randint(low=0, high=len(self.domain_sizes), size=(1,), generator=g).item())
+        num_domains = len(self.domain_sizes)
+        # Per-domain cursors into a shuffled permutation
+        perms = [torch.randperm(n, generator=g).tolist() for n in self.domain_sizes]
+        cursors = [0 for _ in range(num_domains)]
+
+        domain_order = torch.randperm(num_domains, generator=g).tolist()
+        for step in range(self.steps_per_epoch):
+            dom = domain_order[step % num_domains]
             n = self.domain_sizes[dom]
             off = self.offsets[dom]
-            idx_in_dom = torch.randint(low=0, high=n, size=(self.batch_size,), generator=g).tolist()
-            yield [off + i for i in idx_in_dom]
+            cur = cursors[dom]
+
+            # Refill permutation if not enough for a full batch
+            if cur + self.batch_size > n:
+                perms[dom] = torch.randperm(n, generator=g).tolist()
+                cur = 0
+
+            batch_local = perms[dom][cur : cur + self.batch_size]
+            cursors[dom] = cur + self.batch_size
+            yield [off + i for i in batch_local]
+
+    def __len__(self):
+        return self.steps_per_epoch
+
+
+class _StratifiedDomainBatchSampler(torch.utils.data.Sampler[List[int]]):
+    """
+    Batch sampler that mixes samples from ALL source domains in every batch.
+
+    Each batch allocates batch_size // num_domains samples per domain (with
+    remainder distributed to the first domains). This gives the model exposure
+    to all domains in every gradient step and enables cross-source interactions.
+    """
+
+    def __init__(self, domain_sizes: List[int], batch_size: int, steps_per_epoch: int, drop_last: bool = True):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        if steps_per_epoch <= 0:
+            raise ValueError("steps_per_epoch must be > 0")
+        if any(n <= 0 for n in domain_sizes):
+            raise ValueError("All domains must have at least 1 sample")
+        self.domain_sizes = domain_sizes
+        self.num_domains = len(domain_sizes)
+        self.batch_size = int(batch_size)
+        self.steps_per_epoch = int(steps_per_epoch)
+        self.drop_last = bool(drop_last)
+
+        self.offsets = [0]
+        for n in domain_sizes[:-1]:
+            self.offsets.append(self.offsets[-1] + n)
+
+        per_dom = self.batch_size // self.num_domains
+        remainder = self.batch_size % self.num_domains
+        self.per_domain_counts = [per_dom + (1 if d < remainder else 0) for d in range(self.num_domains)]
+
+    def __iter__(self):
+        g = torch.Generator()
+        perms = [torch.randperm(n, generator=g).tolist() for n in self.domain_sizes]
+        cursors = [0] * self.num_domains
+
+        for _ in range(self.steps_per_epoch):
+            batch = []
+            for dom in range(self.num_domains):
+                need = self.per_domain_counts[dom]
+                n = self.domain_sizes[dom]
+                off = self.offsets[dom]
+                cur = cursors[dom]
+
+                if cur + need > n:
+                    perms[dom] = torch.randperm(n, generator=g).tolist()
+                    cur = 0
+
+                batch.extend(off + perms[dom][j] for j in range(cur, cur + need))
+                cursors[dom] = cur + need
+            yield batch
 
     def __len__(self):
         return self.steps_per_epoch
@@ -294,15 +364,30 @@ def get_dataloader(config):
     )
 
     # Transforms
-    train_transform = transforms.Compose(
-        [
-            transforms.Resize((256, 256)),
-            transforms.RandomCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ]
-    )
+    strong_train_aug = getattr(config.method, "strong_train_aug", False)
+    if strong_train_aug:
+        train_transform = transforms.Compose(
+            [
+                transforms.Resize((256, 256)),
+                transforms.RandomCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+                transforms.RandomGrayscale(p=0.1),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                transforms.RandomErasing(p=0.25),
+            ]
+        )
+    else:
+        train_transform = transforms.Compose(
+            [
+                transforms.Resize((256, 256)),
+                transforms.RandomCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
 
     test_transform = transforms.Compose(
         [
@@ -372,11 +457,11 @@ def get_dataloader(config):
     # DataLoaders
     if setting == "msda":
         domain_sizes = [len(d) for d in source_datasets]
-        # Keep epoch length comparable to the single-source baseline:
-        # use the max-domain size to determine steps, then sample domains uniformly.
-        steps_per_epoch = max(domain_sizes) // batch_size
+        steps_per_epoch = sum(domain_sizes) // batch_size
         steps_per_epoch = max(1, int(steps_per_epoch))
-        batch_sampler = _UniformDomainBatchSampler(
+        stratified = getattr(config.method, "stratified_batch", False)
+        sampler_cls = _StratifiedDomainBatchSampler if stratified else _UniformDomainBatchSampler
+        batch_sampler = sampler_cls(
             domain_sizes=domain_sizes,
             batch_size=batch_size,
             steps_per_epoch=steps_per_epoch,

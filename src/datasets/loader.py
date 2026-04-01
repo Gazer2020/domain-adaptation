@@ -5,6 +5,108 @@ import torch
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
+import numpy as np
+from utils import get_device
+
+
+def _is_truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _resolve_auto_bool(value, auto_value: bool) -> bool:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "auto":
+            return auto_value
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def _class_sort_key(name: str):
+    """
+    Sort class folder names with numeric awareness.
+
+    Example:
+      "0","1","2",...,"10" -> numeric order instead of lexicographic order.
+    """
+    s = str(name)
+    if s.isdigit():
+        return (0, int(s))
+    return (1, s.lower())
+
+
+class ColorSpaceToTensorStack:
+    """
+    Convert an input PIL RGB image into multiple target color spaces, producing
+    a stacked tensor suitable for multi-view inference/training.
+
+    Output shape: [K, 3, H, W] where K=len(spaces)
+    """
+
+    def __init__(
+        self,
+        spaces: List[str],
+        mean: List[float],
+        std: List[float],
+        random_erasing_p: float = 0.0,
+    ):
+        if not spaces:
+            raise ValueError("spaces must be a non-empty list")
+
+        self.spaces = [str(s).lower() for s in spaces]
+        self.to_tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(mean, std)
+        self.random_erasing = (
+            transforms.RandomErasing(p=float(random_erasing_p)) if random_erasing_p > 0 else None
+        )
+
+    def _convert(self, img: Image.Image, space: str) -> Image.Image:
+        # PIL color modes: LAB, HSV, YCbCr, YUV are supported as 8-bit images.
+        space = space.lower()
+        if space == "rgb":
+            return img.convert("RGB")
+        if space == "lab":
+            return img.convert("LAB")
+        if space == "hsv":
+            return img.convert("HSV")
+        if space == "ycbcr":
+            return img.convert("YCbCr")
+        if space == "yuv":
+            # PIL may not support "YUV" conversion mode reliably across versions.
+            # Convert RGB->YUV manually (BT.601-like), then keep 3 channels as RGB mode.
+            rgb = np.asarray(img.convert("RGB"), dtype=np.float32)
+            r = rgb[:, :, 0]
+            g = rgb[:, :, 1]
+            b = rgb[:, :, 2]
+            y = 0.299 * r + 0.587 * g + 0.114 * b
+            u = -0.14713 * r - 0.28886 * g + 0.436 * b + 128.0
+            v = 0.615 * r - 0.51499 * g - 0.10001 * b + 128.0
+            yuv = np.stack([y, u, v], axis=-1)
+            yuv = np.clip(yuv, 0.0, 255.0).astype(np.uint8)
+            return Image.fromarray(yuv, mode="RGB")
+        if space == "gray":
+            # Keep 3 channels so downstream code always sees [3,H,W].
+            return img.convert("L").convert("RGB")
+        raise ValueError(f"Unsupported color space: {space}")
+
+    def __call__(self, img: Image.Image) -> torch.Tensor:
+        views: List[torch.Tensor] = []
+        for s in self.spaces:
+            img_cs = self._convert(img, s)
+            x = self.to_tensor(img_cs)  # [3,H,W], float in [0,1]
+            x = self.normalize(x)
+            if self.random_erasing is not None:
+                # RandomErasing operates on [C,H,W] tensors.
+                x = self.random_erasing(x)
+            views.append(x)
+        return torch.stack(views, dim=0)
 
 
 def get_class_splits(config):
@@ -100,7 +202,7 @@ class DomainDataset(Dataset):
         self.class_mapping = class_mapping
         self.class_names = []
         
-        all_classes = sorted([p.name for p in root.iterdir() if p.is_dir()])
+        all_classes = sorted([p.name for p in root.iterdir() if p.is_dir()], key=_class_sort_key)
         for c in classes:
             self.class_names.append(all_classes[c])
 
@@ -130,6 +232,48 @@ class DomainDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+
+class TightCropByWhiteThreshold:
+    """Crop an image to its non-white foreground bounding box."""
+
+    def __init__(self, white_threshold: int = 245, padding: int = 2, min_foreground_pixels: int = 10):
+        self.white_threshold = int(white_threshold)
+        self.padding = int(padding)
+        self.min_foreground_pixels = int(min_foreground_pixels)
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        rgb = image.convert("RGB")
+        arr = np.asarray(rgb)
+        foreground = np.any(arr < self.white_threshold, axis=2)
+
+        ys, xs = np.where(foreground)
+        if len(xs) < self.min_foreground_pixels:
+            return rgb
+
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+
+        if self.padding > 0:
+            x0 = max(0, x0 - self.padding)
+            y0 = max(0, y0 - self.padding)
+            x1 = min(arr.shape[1] - 1, x1 + self.padding)
+            y1 = min(arr.shape[0] - 1, y1 + self.padding)
+
+        return rgb.crop((x0, y0, x1 + 1, y1 + 1))
+
+
+class RandomApplyTransform:
+    """Apply a transform with probability p."""
+
+    def __init__(self, transform, p: float = 0.5):
+        self.transform = transform
+        self.p = float(p)
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        if self.p >= 1.0 or torch.rand(1).item() < self.p:
+            return self.transform(image)
+        return image
 
 
 class MultiSourceDomainDataset(Dataset):
@@ -196,6 +340,9 @@ class _UniformDomainBatchSampler(torch.utils.data.Sampler[List[int]]):
 
     def __iter__(self):
         g = torch.Generator()
+        # Ensure different per-epoch shuffles. Without this, a fresh Generator()
+        # can repeat identical permutations every epoch.
+        g.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
         num_domains = len(self.domain_sizes)
         # Per-domain cursors into a shuffled permutation
         perms = [torch.randperm(n, generator=g).tolist() for n in self.domain_sizes]
@@ -253,6 +400,9 @@ class _StratifiedDomainBatchSampler(torch.utils.data.Sampler[List[int]]):
 
     def __iter__(self):
         g = torch.Generator()
+        # Ensure different per-epoch shuffles. Without this, a fresh Generator()
+        # can repeat identical permutations every epoch.
+        g.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
         perms = [torch.randperm(n, generator=g).tolist() for n in self.domain_sizes]
         cursors = [0] * self.num_domains
 
@@ -312,6 +462,8 @@ def get_dataloader(config):
     source_domain = getattr(config.dataset, "source", None)
     source_domains = getattr(config.dataset, "sources", None)
     target_domain = config.dataset.target
+    dataset_name_lower = str(dataset_name).strip().lower()
+    target_domain_lower = str(target_domain).strip().lower().replace("_", " ")
 
     if setting == "msda":
         if source_domains is None:
@@ -354,6 +506,9 @@ def get_dataloader(config):
 
     batch_size = config.batch_size
     num_workers = config.num_workers
+    # Only pin memory when CUDA is actually the selected device.
+    device_str = getattr(config, "device", "auto")
+    pin_memory = get_device(device_str) == "cuda"
 
     # Determine classes
     src_classes, tgt_classes, shared_classes = get_class_splits(config)
@@ -365,37 +520,123 @@ def get_dataloader(config):
 
     # Transforms
     strong_train_aug = getattr(config.method, "strong_train_aug", False)
-    if strong_train_aug:
-        train_transform = transforms.Compose(
-            [
-                transforms.Resize((256, 256)),
-                transforms.RandomCrop(224),
-                transforms.RandomHorizontalFlip(),
-                transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
-                transforms.RandomGrayscale(p=0.1),
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                transforms.RandomErasing(p=0.25),
+    source_aug_cfg = getattr(config.method, "source_aug", None)
+    target_aug_cfg = getattr(config.method, "target_aug", None)
+    clipart_focus_cfg = getattr(config.method, "clipart_focus", None)
+    is_officehome_clipart_target = dataset_name_lower == "office-home" and target_domain_lower == "clipart"
+
+    clipart_train_pre = []
+    clipart_eval_pre = []
+    if clipart_focus_cfg is not None:
+        auto_enable = bool(is_officehome_clipart_target)
+        clipart_focus_enabled = _resolve_auto_bool(getattr(clipart_focus_cfg, "enabled", False), auto_enable)
+        if clipart_focus_enabled and is_officehome_clipart_target:
+            cropper = TightCropByWhiteThreshold(
+                white_threshold=int(getattr(clipart_focus_cfg, "white_threshold", 245)),
+                padding=int(getattr(clipart_focus_cfg, "bbox_padding", 2)),
+                min_foreground_pixels=int(getattr(clipart_focus_cfg, "min_foreground_pixels", 10)),
+            )
+            if _is_truthy(getattr(clipart_focus_cfg, "apply_on_train", True)):
+                train_prob = float(getattr(clipart_focus_cfg, "train_prob", 0.8))
+                clipart_train_pre.append(RandomApplyTransform(cropper, p=train_prob))
+            if _is_truthy(getattr(clipart_focus_cfg, "apply_on_eval", True)):
+                clipart_eval_pre.append(cropper)
+
+    # Optional color-space stacking (used by `dcfm_cs`).
+    color_space_cfg = getattr(config.method, "color_space", None)
+    use_color_space = color_space_cfg is not None and bool(getattr(color_space_cfg, "enabled", False))
+
+    if use_color_space:
+        mode = str(getattr(color_space_cfg, "mode", "multi")).lower()
+        if mode == "single":
+            spaces = [str(getattr(color_space_cfg, "single", "rgb")).lower()]
+        else:
+            spaces = [
+                str(s).lower()
+                for s in list(
+                    getattr(
+                        color_space_cfg,
+                        "spaces",
+                        ["rgb", "lab", "hsv", "ycbcr", "yuv"],
+                    )
+                )
             ]
+
+        mean = list(getattr(color_space_cfg, "mean", [0.485, 0.456, 0.406]))
+        std = list(getattr(color_space_cfg, "std", [0.229, 0.224, 0.225]))
+
+    if strong_train_aug:
+        jitter_brightness = float(getattr(source_aug_cfg, "brightness", 0.4)) if source_aug_cfg is not None else 0.4
+        jitter_contrast = float(getattr(source_aug_cfg, "contrast", 0.4)) if source_aug_cfg is not None else 0.4
+        jitter_saturation = float(getattr(source_aug_cfg, "saturation", 0.4)) if source_aug_cfg is not None else 0.4
+        jitter_hue = float(getattr(source_aug_cfg, "hue", 0.1)) if source_aug_cfg is not None else 0.1
+        grayscale_p = float(getattr(source_aug_cfg, "random_grayscale_p", 0.1)) if source_aug_cfg is not None else 0.1
+        geom_train = [
+            transforms.Resize((256, 256)),
+            transforms.RandomCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(
+                brightness=jitter_brightness,
+                contrast=jitter_contrast,
+                saturation=jitter_saturation,
+                hue=jitter_hue,
+            ),
+            transforms.RandomGrayscale(p=grayscale_p),
+        ]
+        random_erasing_p = (
+            float(getattr(source_aug_cfg, "random_erasing_p", 0.25))
+            if source_aug_cfg is not None
+            else 0.25
         )
     else:
-        train_transform = transforms.Compose(
-            [
-                transforms.Resize((256, 256)),
-                transforms.RandomCrop(224),
-                transforms.RandomHorizontalFlip(),
+        geom_train = [
+            transforms.Resize((256, 256)),
+            transforms.RandomCrop(224),
+            transforms.RandomHorizontalFlip(),
+        ]
+        random_erasing_p = 0.0
+
+    if use_color_space:
+        train_color_stack = ColorSpaceToTensorStack(
+            spaces=spaces,
+            mean=mean,
+            std=std,
+            random_erasing_p=random_erasing_p,
+        )
+        train_transform = transforms.Compose(geom_train + [train_color_stack])
+    else:
+        if strong_train_aug:
+            train_transform = transforms.Compose(
+                geom_train
+                + [
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                    transforms.RandomErasing(p=0.25),
+                ]
+            )
+        else:
+            train_transform = transforms.Compose(
+                geom_train
+                + [
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                ]
+            )
+
+    geom_test = clipart_eval_pre + [transforms.Resize((224, 224))]
+    if use_color_space:
+        test_color_stack = ColorSpaceToTensorStack(
+            spaces=spaces, mean=mean, std=std, random_erasing_p=0.0
+        )
+        test_transform = transforms.Compose(geom_test + [test_color_stack])
+    else:
+        test_transform = transforms.Compose(
+            geom_test
+            + [
                 transforms.ToTensor(),
                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
         )
-
-    test_transform = transforms.Compose(
-        [
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ]
-    )
     
     # Strong Augmentation for DGA-Revamp
     strong_aug_enabled = getattr(config.method, "strong_aug", False)
@@ -411,25 +652,110 @@ def get_dataloader(config):
                 return self.weak(x), self.strong(x)
         
         # Standard Weak
-        weak_aug = transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.RandomCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
+        if use_color_space:
+            weak_aug = transforms.Compose(
+                clipart_train_pre
+                + [
+                    transforms.Resize((256, 256)),
+                    transforms.RandomCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    ColorSpaceToTensorStack(
+                        spaces=spaces, mean=mean, std=std, random_erasing_p=0.0
+                    ),
+                ]
+            )
+        else:
+            weak_aug = transforms.Compose(
+                clipart_train_pre
+                + [
+                    transforms.Resize((256, 256)),
+                    transforms.RandomCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize(
+                        [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+                    ),
+                ]
+            )
         
         # Strong (RandAugment)
-        strong_aug = transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.RandomCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandAugment(num_ops=2, magnitude=10),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
+        if use_color_space:
+            target_randaugment_ops = (
+                int(getattr(target_aug_cfg, "randaugment_num_ops", 2))
+                if target_aug_cfg is not None
+                else 2
+            )
+            target_randaugment_mag = (
+                int(getattr(target_aug_cfg, "randaugment_magnitude", 10))
+                if target_aug_cfg is not None
+                else 10
+            )
+            strong_aug = transforms.Compose(
+                clipart_train_pre
+                + [
+                    transforms.Resize((256, 256)),
+                    transforms.RandomCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandAugment(
+                        num_ops=target_randaugment_ops,
+                        magnitude=target_randaugment_mag,
+                    ),
+                    ColorSpaceToTensorStack(
+                        spaces=spaces, mean=mean, std=std, random_erasing_p=0.0
+                    ),
+                ]
+            )
+        else:
+            target_randaugment_ops = (
+                int(getattr(target_aug_cfg, "randaugment_num_ops", 2))
+                if target_aug_cfg is not None
+                else 2
+            )
+            target_randaugment_mag = (
+                int(getattr(target_aug_cfg, "randaugment_magnitude", 10))
+                if target_aug_cfg is not None
+                else 10
+            )
+            strong_aug = transforms.Compose(
+                clipart_train_pre
+                + [
+                    transforms.Resize((256, 256)),
+                    transforms.RandomCrop(224),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandAugment(
+                        num_ops=target_randaugment_ops,
+                        magnitude=target_randaugment_mag,
+                    ),
+                    transforms.ToTensor(),
+                    transforms.Normalize(
+                        [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+                    ),
+                ]
+            )
         
         target_transform = WeakStrongAugment(weak_aug, strong_aug)
+    elif clipart_train_pre:
+        if use_color_space:
+            target_transform = transforms.Compose(
+                clipart_train_pre
+                + geom_train
+                + [
+                    ColorSpaceToTensorStack(
+                        spaces=spaces,
+                        mean=mean,
+                        std=std,
+                        random_erasing_p=random_erasing_p,
+                    )
+                ]
+            )
+        else:
+            target_tail = [
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+            if strong_train_aug:
+                target_tail.append(transforms.RandomErasing(p=0.25))
+            target_transform = transforms.Compose(clipart_train_pre + geom_train + target_tail)
 
     # Datasets with proper class mappings
     tgt_path = root_dir / target_domain
@@ -471,6 +797,7 @@ def get_dataloader(config):
             source_dataset,
             batch_sampler=batch_sampler,
             num_workers=num_workers,
+            pin_memory=pin_memory,
         )
     else:
         source_loader = DataLoader(
@@ -479,6 +806,7 @@ def get_dataloader(config):
             shuffle=True,
             num_workers=num_workers,
             drop_last=True,
+            pin_memory=pin_memory,
         )
     target_loader = DataLoader(
         target_dataset,
@@ -486,12 +814,14 @@ def get_dataloader(config):
         shuffle=True,
         num_workers=num_workers,
         drop_last=True,
+        pin_memory=pin_memory,
     )
     target_test_loader = DataLoader(
         target_test_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
+        pin_memory=pin_memory,
     )
     
     # Class info for evaluation

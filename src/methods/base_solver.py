@@ -343,7 +343,11 @@ class SourceOnlySolver(BaseSolver):
             self.net.train()
             loss_meter = AverageMeter()
             
-            for src_imgs, src_labels in self.source_loader:
+            for batch in self.source_loader:
+                if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+                    src_imgs, src_labels = batch[0], batch[1]
+                else:
+                    raise ValueError("Source-only solver expects source batches to provide at least images and labels")
                 src_imgs = src_imgs.to(self.device)
                 src_labels = src_labels.to(self.device)
                 

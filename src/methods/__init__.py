@@ -16,9 +16,16 @@ from methods.cad import CADSolver
 from methods.cosda import COSDASolver
 from methods.rtda import RTDASolver
 from methods.dcfm import DCFMSolver
+from methods.dcfm_cs import DCFMColorSpaceSolver
 from methods.odcfm import ODCFMSolver
 from methods.mdcfm import MDCFMSolver
+from methods.dare import DARESolver
 from methods.rvtc import RVTCSolver
+from methods.trajuda import TrajUDASolver
+from methods.fact_da import FactDASolver
+from methods.clipfilm import CLIPFiLMSolver
+from methods.clipfilm_domain import CLIPFiLMDomainSolver
+from methods.embraceda_lite import EmbraceDALiteSolver
 
 __all__ = [
     # Registry
@@ -34,9 +41,15 @@ __all__ = [
     "COSDASolver",
     "RTDASolver",
     "DCFMSolver",
+    "DCFMColorSpaceSolver",
     "ODCFMSolver",
     "MDCFMSolver",
+    "DARESolver",
     "RVTCSolver",
+    "TrajUDASolver",
+    "FactDASolver",
+    "CLIPFiLMSolver",
+    "CLIPFiLMDomainSolver",
+    "EmbraceDALiteSolver",
 ]
-
 

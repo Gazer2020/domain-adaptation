@@ -89,6 +89,7 @@ def main(cfg: DictConfig):
     save_dir = Path("checkpoints")
     save_dir.mkdir(parents=True, exist_ok=True)
     save_path = save_dir / f"{cfg.exp_name}.pth"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
     solver.save_checkpoint(save_path)
 
     logger.info(f"Model saved to: {save_path.absolute()}")

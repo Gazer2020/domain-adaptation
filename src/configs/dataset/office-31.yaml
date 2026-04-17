@@ -1,6 +1,6 @@
 name: Office-31
 # Update this root path to where your data is actually stored
-root: data/Office-31
+root: data/office-31
 
 # Default domains
 source: amazon
@@ -29,4 +29,3 @@ splits:
   unida:
     source: ${range:"0-19"}
     target: ${range:"0-9,20-30"}
-

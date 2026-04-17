@@ -18,7 +18,12 @@ wheels/
 .cursor
 .ipynb_checkpoints
 
-checkpoints
-data
-logs
-results
+# Keep directory structure only (track README.md, ignore all other contents)
+data/**
+!data/README.md
+
+results/**
+!results/README.md
+
+scripts/**
+!scripts/README.md

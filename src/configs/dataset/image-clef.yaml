@@ -1,16 +1,23 @@
 name: ImageCLEF
 # Update this root path to match the directory from your terminal
-root: /root/autodl-tmp/image_CLEF
+root: data/image-clef
 
 # Default domains (Options: b, c, i, p)
 # b: Bing, c: Caltech, i: ImageNet, p: Pascal
 source: i
+# MSDA sources (for methods such as DARE); overridden at runtime in sweep scripts
+sources: [b, c, i]
 target: p
 
 # ImageCLEF-DA has 12 classes (Index 0-11)
 num_classes: 12
 
 splits:
+  # MSDA: all classes are shared (same as CSDA) with multiple source domains
+  msda:
+    source: ${range:0-11}
+    target: ${range:0-11}
+
   # Closed-Set DA: 所有类别共享 (12类)
   csda:
     source: ${range:0-11}

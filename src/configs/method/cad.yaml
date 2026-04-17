@@ -1,5 +1,5 @@
 name: cad
-lr: 0.001
+lr: 0.01
 # CAD-specific parameters
 setting: osda
 supported_settings: [osda]
@@ -8,14 +8,14 @@ backbone: resnet50
 
 # Training stages
 pretrain_epochs: 10
-adapt_epochs: 10
+adapt_epochs: 15
 
 # Hyperparameters
-semantic_hidden_dim: 256
+semantic_hidden_dim: 512
 gating_hidden_dim: null
 lambda_structure: 1.0
 lambda_anomaly: 0.1
-unknown_threshold: 0.5
+unknown_threshold: 0.7
 
 # Prototype-based rejection
 prototype_similarity_threshold: 0.7

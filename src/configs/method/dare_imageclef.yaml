@@ -1,0 +1,57 @@
+name: dare
+
+# ImageCLEF-focused DARE defaults (MSDA):
+# - smaller batch + longer schedule
+# - earlier but softer target self-training
+# - stronger source relation supervision
+lr: 0.005
+epochs: 60
+ramp_denom: 6.0
+backbone: resnet50
+
+bottleneck_dim: 256
+relation_hidden_dim: 256
+relation_temperature: 0.05
+film_scale: 0.5
+prototype_momentum: 0.9
+refresh_source_prototypes_each_epoch: true
+enable_relation_forward: true
+enable_source_relation_loss: true
+enable_ema_pseudo: true
+enable_proto_loss: true
+
+lambda_pseudo: 0.05
+lambda_source_relation: 0.40
+lambda_proto_align: 0.10
+relation_label_smoothing: 0.05
+enable_confidence_weighting: true
+pseudo_conf_power: 1.5
+pseudo_start_epoch: 4
+
+T_sem: 1.0
+ema_decay_start: 0.995
+ema_decay_end: 0.9992
+
+grad_clip: 5.0
+label_smoothing: 0.02
+save_ckpt_after_epoch: 5
+epoch_steps_mode: max
+
+strong_aug: true
+stratified_batch: true
+strong_train_aug: true
+
+source_aug:
+  brightness: 0.2
+  contrast: 0.2
+  saturation: 0.2
+  hue: 0.05
+  random_grayscale_p: 0.05
+  random_erasing_p: 0.10
+
+target_aug:
+  randaugment_num_ops: 1
+  randaugment_magnitude: 7
+
+setting: msda
+supported_settings: [msda]

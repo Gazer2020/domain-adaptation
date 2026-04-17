@@ -56,23 +56,32 @@ class SemanticHead(nn.Module):
     Simple MLP classifier for semantic (class) predictions.
     """
     
-    def __init__(self, in_features: int, num_classes: int, hidden_dim: int = 256):
+    def __init__(
+        self,
+        in_features: int,
+        num_classes: int,
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
+    ):
         """
         Args:
             in_features: Number of input features
             num_classes: Number of semantic classes
             hidden_dim: Hidden layer dimension (default: 256)
+            dropout: Dropout probability for MLP blocks (default: 0.1)
         """
         super().__init__()
         self.num_classes = num_classes
 
-        self.classifier = nn.Sequential(
-            nn.Linear(in_features, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, self.num_classes),
+        self.pre_norm = nn.LayerNorm(in_features)
+        self.fc1 = nn.Linear(in_features, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(p=dropout)
+        self.shortcut = (
+            nn.Identity() if in_features == hidden_dim else nn.Linear(in_features, hidden_dim, bias=False)
         )
+        self.classifier = nn.Linear(hidden_dim, self.num_classes)
 
     def forward(self, feat: torch.Tensor) -> torch.Tensor:
         """
@@ -84,45 +93,12 @@ class SemanticHead(nn.Module):
         Returns:
             Class logits
         """
-        return self.classifier(feat)
-
-
-class DomainHead(nn.Module):
-    """
-    Domain discriminator head for adversarial domain adaptation.
-    
-    Used in methods like DANN, CDAN, etc.
-    """
-    
-    def __init__(self, in_features: int, hidden_dim: int = 256):
-        """
-        Args:
-            in_features: Number of input features
-            hidden_dim: Hidden layer dimension
-        """
-        super().__init__()
-        
-        self.discriminator = nn.Sequential(
-            nn.Linear(in_features, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, feat: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass.
-        
-        Args:
-            feat: Input features
-            
-        Returns:
-            Domain prediction logits
-        """
-        return self.discriminator(feat)
+        x = self.pre_norm(feat)
+        residual = self.shortcut(x)
+        x = self.drop(self.act(self.fc1(x)))
+        x = self.drop(self.act(self.fc2(x)))
+        x = x + residual
+        return self.classifier(x)
 
 
 class ChannelGatingModule(nn.Module):

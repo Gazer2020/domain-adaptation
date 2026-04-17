@@ -8,12 +8,12 @@ import logging
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from methods.registry import register_solver
 from methods.base_solver import BaseSolver
 from models.backbones import get_backbone
-from plugins import MICPlugin
 from utils import AverageMeter, cycle
 
 
@@ -50,11 +50,52 @@ class MICSolver(BaseSolver):
         if hasattr(torch, 'compile') and self.device.type != 'mps':
             self.stu_model = torch.compile(self.stu_model)
             self.tea_model = torch.compile(self.tea_model)
-        
-        # MIC plugin for masked consistency training
-        mask_ratio = self.config.method.get("mask_ratio", 0.5)
-        patch_size = self.config.method.get("patch_size", 32)
-        self.mic_plugin = MICPlugin(mask_ratio=mask_ratio, patch_size=patch_size).to(self.device)
+
+        # MIC masking config
+        self.mask_ratio = float(self.config.method.get("mask_ratio", 0.5))
+        self.patch_size = int(self.config.method.get("patch_size", 32))
+        self.apply_same_mask_to_batch = bool(self.config.method.get("apply_to_batch", True))
+
+    def _generate_mask(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Generate a patch-wise binary mask resized to image resolution.
+
+        Returns mask with shape [B, 1, H, W], where 0=masked and 1=kept.
+        """
+        bsz, _, height, width = images.shape
+        h_patches = max(height // self.patch_size, 1)
+        w_patches = max(width // self.patch_size, 1)
+        num_patches = h_patches * w_patches
+
+        num_keep = int(num_patches * (1.0 - self.mask_ratio))
+        num_keep = max(0, min(num_keep, num_patches))
+
+        if self.apply_same_mask_to_batch:
+            noise = torch.rand(1, num_patches, device=images.device).repeat(bsz, 1)
+        else:
+            noise = torch.rand(bsz, num_patches, device=images.device)
+
+        ids_shuffle = torch.argsort(noise, dim=1)
+        mask = torch.zeros((bsz, num_patches), device=images.device)
+        mask.scatter_(1, ids_shuffle[:, :num_keep], 1.0)
+        mask = mask.view(bsz, 1, h_patches, w_patches)
+        mask = F.interpolate(mask, size=(height, width), mode="nearest")
+        return mask
+
+    def _compute_mic_loss(self, target_images: torch.Tensor) -> torch.Tensor:
+        """
+        MIC consistency loss:
+        teacher predicts pseudo labels on full images,
+        student predicts on masked images.
+        """
+        with torch.no_grad():
+            teacher_logits = self.tea_model(target_images)
+            pseudo_labels = torch.argmax(torch.softmax(teacher_logits, dim=1), dim=1)
+
+        mask = self._generate_mask(target_images)
+        masked_images = target_images * mask
+        student_logits = self.stu_model(masked_images)
+        return F.cross_entropy(student_logits, pseudo_labels)
 
     def _get_trainable_params(self):
         """Return student model parameters for optimizer."""
@@ -101,7 +142,7 @@ class MICSolver(BaseSolver):
                 sem_loss = self.criterion(src_pred, src_labels)
 
                 # MIC consistency loss on target
-                mic_loss = self.mic_plugin(self.stu_model, self.tea_model, tgt_imgs)
+                mic_loss = self._compute_mic_loss(tgt_imgs)
 
                 # Combined loss
                 loss = sem_loss + lambda_mic * mic_loss

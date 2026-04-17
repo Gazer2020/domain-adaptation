@@ -10,11 +10,27 @@ batch_size: 64
 num_workers: 8
 device: auto  # auto, cuda, mps, cpu
 seed: 42
-exp_name: "test_run"
+exp_name: "perf_shared"
+
+# Performance defaults (P0)
+performance:
+  deterministic: false
+  benchmark: true
+  allow_tf32: true
+  matmul_precision: high  # highest, high, medium
+  channels_last: false
+  non_blocking_transfer: true
+  zero_grad_set_to_none: true
+  amp:
+    enabled: auto  # auto, true, false
+    dtype: bf16    # bf16, fp16
+  dataloader:
+    persistent_workers: true
+    prefetch_factor: 4
 
 hydra:
   run:
-    dir: ${src_dir:}/../results/${exp_name}/${now:%Y-%m-%d_%H-%M-%S}
+    dir: ${src_dir:}/../results/${exp_name}
 
   job:
     chdir: True

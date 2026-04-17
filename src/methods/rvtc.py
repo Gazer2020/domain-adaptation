@@ -204,40 +204,44 @@ class RVTCSolver(BaseSolver):
             for batch in self.source_loader:
                 src_imgs, src_labels = self._unpack_source_batch(batch)
                 tgt_imgs, _ = next(tgt_iter)
-                src_imgs = src_imgs.to(self.device)
-                src_labels = src_labels.to(self.device)
-                tgt_imgs = tgt_imgs.to(self.device)
+                src_imgs = self._to_device(src_imgs)
+                src_labels = self._to_device(src_labels)
+                tgt_imgs = self._to_device(tgt_imgs)
 
-                optimizer.zero_grad()
+                self._zero_grad(optimizer)
 
-                logits_s, kin_s = self.net(src_imgs, is_source=True, return_kinematic=True)
-                logits_t, kin_t = self.net(tgt_imgs, is_source=False, return_kinematic=True)
+                with self._auto_cast():
+                    logits_s, kin_s = self.net(src_imgs, is_source=True, return_kinematic=True)
+                    logits_t, kin_t = self.net(tgt_imgs, is_source=False, return_kinematic=True)
 
-                loss_task = self.criterion_task(logits_s, src_labels)
-                loss = loss_task
+                    loss_task = self.criterion_task(logits_s, src_labels)
+                    loss = loss_task
 
-                if w_kin > 0:
-                    loss = loss + w_kin * kin_t
-                    meters["kin_t"].update(kin_t.item())
-                    if self.kin_on_source:
-                        loss = loss + w_kin * kin_s
-                        meters["kin_s"].update(kin_s.item())
+                    if w_kin > 0:
+                        loss = loss + w_kin * kin_t
+                        meters["kin_t"].update(kin_t.item())
+                        if self.kin_on_source:
+                            loss = loss + w_kin * kin_s
+                            meters["kin_s"].update(kin_s.item())
+                        else:
+                            meters["kin_s"].update(0.0)
                     else:
+                        meters["kin_t"].update(0.0)
                         meters["kin_s"].update(0.0)
-                else:
-                    meters["kin_t"].update(0.0)
-                    meters["kin_s"].update(0.0)
 
-                if w_ent > 0:
-                    ent_t = _entropy_minimization(logits_t)
-                    loss = loss + w_ent * ent_t
-                    meters["ent"].update(ent_t.item())
-                else:
-                    meters["ent"].update(0.0)
+                    if w_ent > 0:
+                        ent_t = _entropy_minimization(logits_t)
+                        loss = loss + w_ent * ent_t
+                        meters["ent"].update(ent_t.item())
+                    else:
+                        meters["ent"].update(0.0)
 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self._trainable_parameters(), max_norm=5.0)
-                optimizer.step()
+                self._optimizer_step_with_optional_clip(
+                    loss,
+                    optimizer,
+                    clip_params=self._trainable_parameters(),
+                    clip_max_norm=5.0,
+                )
                 scheduler.step()
                 global_step += 1
 

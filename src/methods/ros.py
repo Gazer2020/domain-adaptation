@@ -133,20 +133,21 @@ class RotationSolver(BaseSolver):
             target_iter = cycle(self.target_loader)
             
             for src_imgs, _ in self.source_loader:
-                self.rot_optimizer.zero_grad()
+                self._zero_grad(self.rot_optimizer)
 
                 tgt_imgs, _ = next(target_iter)
-                all_imgs = torch.cat([src_imgs, tgt_imgs], dim=0).to(self.device)
+                all_imgs = torch.cat([src_imgs, tgt_imgs], dim=0)
+                all_imgs = self._to_device(all_imgs)
                 rot_imgs, rot_labels = self._apply_rotation(all_imgs)
 
                 # Forward pass
-                ori_feats = self.feature_extractor(all_imgs)
-                rot_feats = self.feature_extractor(rot_imgs)
-                rot_preds = self.rotation_head(ori_feats, rot_feats)
+                with self._auto_cast():
+                    ori_feats = self.feature_extractor(all_imgs)
+                    rot_feats = self.feature_extractor(rot_imgs)
+                    rot_preds = self.rotation_head(ori_feats, rot_feats)
 
-                loss = self.criterion(rot_preds, rot_labels)
-                loss.backward()
-                self.rot_optimizer.step()
+                    loss = self.criterion(rot_preds, rot_labels)
+                self._optimizer_step_with_optional_clip(loss, self.rot_optimizer)
 
                 loss_meter.update(loss.item())
 
@@ -173,17 +174,17 @@ class RotationSolver(BaseSolver):
             loss_meter = AverageMeter()
             
             for src_imgs, src_labels in self.source_loader:
-                self.sem_optimizer.zero_grad()
+                self._zero_grad(self.sem_optimizer)
 
-                src_imgs = src_imgs.to(self.device)
-                src_labels = src_labels.to(self.device)
+                src_imgs = self._to_device(src_imgs)
+                src_labels = self._to_device(src_labels)
 
-                src_feats = self.feature_extractor(src_imgs)
-                sem_preds = self.semantic_head(src_feats)
+                with self._auto_cast():
+                    src_feats = self.feature_extractor(src_imgs)
+                    sem_preds = self.semantic_head(src_feats)
 
-                loss = self.criterion(sem_preds, src_labels)
-                loss.backward()
-                self.sem_optimizer.step()
+                    loss = self.criterion(sem_preds, src_labels)
+                self._optimizer_step_with_optional_clip(loss, self.sem_optimizer)
 
                 loss_meter.update(loss.item())
 

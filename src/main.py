@@ -9,6 +9,7 @@ method file with @register_solver decorator and a config file.
 import logging
 import random
 import os
+from typing import Any
 from pathlib import Path
 
 import hydra
@@ -25,17 +26,47 @@ from methods import get_solver, list_solvers
 logger = logging.getLogger(__name__)
 
 
-def set_seed(seed: int):
-    """Set random seeds for reproducibility."""
+def _cfg_get(cfg: Any, key: str, default: Any):
+    """Safely get a possibly-nested config value with backward compatibility."""
+    value = cfg.get(key, default) if hasattr(cfg, "get") else default
+    return default if value is None else value
+
+
+def set_seed(seed: int, deterministic: bool = False, benchmark: bool = True):
+    """Set random seeds and deterministic/benchmark behavior."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    logger.info(f"Random seed set to {seed}")
+        torch.backends.cudnn.deterministic = bool(deterministic)
+        torch.backends.cudnn.benchmark = bool(benchmark) and (not bool(deterministic))
+    torch.use_deterministic_algorithms(bool(deterministic), warn_only=True)
+    logger.info(
+        "Random seed set to %s | deterministic=%s benchmark=%s",
+        seed,
+        bool(deterministic),
+        bool(benchmark) and (not bool(deterministic)),
+    )
+
+
+def configure_runtime(cfg: DictConfig):
+    """Configure Torch runtime for performance-related defaults."""
+    perf = _cfg_get(cfg, "performance", {})
+    allow_tf32 = bool(_cfg_get(perf, "allow_tf32", True))
+    matmul_precision = str(_cfg_get(perf, "matmul_precision", "high")).lower()
+
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision(matmul_precision)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+    logger.info(
+        "Runtime configured | allow_tf32=%s matmul_precision=%s",
+        allow_tf32,
+        matmul_precision,
+    )
 
 
 @hydra.main(version_base="1.3", config_path="configs", config_name="config")
@@ -45,8 +76,12 @@ def main(cfg: DictConfig):
     logger.debug(OmegaConf.to_yaml(cfg))
     logger.info(f"Available solvers: {list_solvers()}")
 
-    # 2. Set seed
-    set_seed(cfg.get("seed", 42))
+    # 2. Configure runtime and seeds
+    perf = _cfg_get(cfg, "performance", {})
+    deterministic = bool(_cfg_get(perf, "deterministic", False))
+    benchmark = bool(_cfg_get(perf, "benchmark", True))
+    configure_runtime(cfg)
+    set_seed(cfg.get("seed", 42), deterministic=deterministic, benchmark=benchmark)
 
     # 3. Get dataLoaders
     source_loader, target_loader, target_test_loader, class_info = get_dataloader(cfg)

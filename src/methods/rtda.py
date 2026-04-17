@@ -109,7 +109,7 @@ class OptimWithSheduler:
             g['initial_lr'] = g['lr']
 
     def zero_grad(self):
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
     def step(self):
         for g in self.optimizer.param_groups:
@@ -323,8 +323,8 @@ class RTDASolver(BaseSolver):
         with torch.no_grad():
             with Accumulator(['fs', 'ft', 'ls']) as ProbRecorder:
                 for src, tgt in zip(source_loader, target_loader):
-                    im_source, label_source = src[0].to(self.device), src[1].to(self.device)
-                    im_target, _ = tgt[0].to(self.device), tgt[1].to(self.device)
+                    im_source, label_source = self._to_device(src[0]), self._to_device(src[1])
+                    im_target, _ = self._to_device(tgt[0]), self._to_device(tgt[1])
 
                     _, feature_source, _, _ = self.net(im_source)
                     _, feature_target, _, _ = self.net(im_target)
@@ -418,13 +418,13 @@ class RTDASolver(BaseSolver):
                     im_source, label_source = next(src_iter)
                     im_target, _ = next(tgt_iter)
 
-                    im_source = im_source.to(self.device)
-                    label_source = label_source.to(self.device)
+                    im_source = self._to_device(im_source)
+                    label_source = self._to_device(label_source)
                     # Create one-hot label since original RTDA logic expects it
-                    label_s_one_hot = torch.zeros(label_source.shape[0], self.all_classes).to(self.device)
+                    label_s_one_hot = torch.zeros(label_source.shape[0], self.all_classes, device=self.device)
                     label_s_one_hot.scatter_(1, label_source.unsqueeze(1), 1)
 
-                    im_target = im_target.to(self.device)
+                    im_target = self._to_device(im_target)
                     
                     _, feature_source, fc_source, predict_prob_source = self.net(im_source)
                     ft1, feature_target, fc_target, predict_prob_target = self.net(im_target)
@@ -451,20 +451,21 @@ class RTDASolver(BaseSolver):
                     ]
                     ProbRecorder.updateData({'pred_s':pred_s, 'pred_t':pred_t, 'label_s':label_s, 'kl':kl, 'fss':fss, 'ftt':ftt})
 
-                    weight = gmm.predict_proba(to_np(kltarget)[:, None])[:, known_cluster]
-                    weight = torch.tensor(weight).to(self.device).detach()
+                    weight_np = gmm.predict_proba(to_np(kltarget)[:, None])[:, known_cluster]
+                    weight = torch.as_tensor(weight_np, device=self.device, dtype=kltarget.dtype).detach()
+                    gmm_index_t = torch.as_tensor(gmm_index, device=self.device)
                     
                     if epoch <= 10:
-                        weight = torch.where(weight > 0.8, torch.tensor([1]).float().to(self.device), torch.tensor([0]).float().to(self.device)).detach()               
-                        r = torch.nonzero(torch.tensor(gmm_index != known_cluster).to(self.device)).unsqueeze(-1)
+                        weight = (weight > 0.8).to(weight.dtype).detach()
+                        r = torch.nonzero(gmm_index_t != known_cluster).unsqueeze(-1)
                         topk = 16
                         if r.size()[0] > topk:
                             # Re-sort to pick topk indices
                             _, indices = torch.sort(kltarget.detach(), dim=0)
                             r = indices[-1 * topk:].unsqueeze(-1)
                     else:             
-                        weight = torch.where(torch.tensor(gmm_index == known_cluster).to(self.device), torch.tensor([1]).float().to(self.device), torch.tensor([0]).float().to(self.device)).detach()               
-                        r = torch.nonzero(torch.tensor(gmm_index == unknown_cluster).to(self.device)).unsqueeze(-1)
+                        weight = (gmm_index_t == known_cluster).to(weight.dtype).detach()
+                        r = torch.nonzero(gmm_index_t == unknown_cluster).unsqueeze(-1)
            
                     feature_otherep = torch.index_select(ft1, 0, r.view(-1))
                     
@@ -472,15 +473,15 @@ class RTDASolver(BaseSolver):
                         _, feature_otherep, logits_otherep, predict_prob_otherep = self.cls(feature_otherep)
                         _, pseudo_index = predict_prob_otherep[:, self.shared_classes:].max(1)
                         pseudo_index = pseudo_index + self.shared_classes
-                        pseudo_label = torch.zeros(r.size()[0], self.all_classes).to(self.device).scatter_(1, pseudo_index.unsqueeze(1), 1)
+                        pseudo_label = torch.zeros(r.size()[0], self.all_classes, device=self.device).scatter_(1, pseudo_index.unsqueeze(1), 1)
                         ce_ep = CrossEntropyLoss(pseudo_label, predict_prob_otherep)            
                     else:
-                        ce_ep = torch.tensor(0.0).to(self.device)
+                        ce_ep = torch.zeros((), device=self.device)
                        
                     ce = CrossEntropyLoss(label_s_one_hot, nn.Softmax(-1)(fc_source))
 
                     virtual_predict_prob_source = self.cls.virt_forward(self.nomatch, feature_source, fc_source, label_source)
-                    p = torch.zeros([label_s_one_hot.shape[0], self.nomatch.size(0)]).to(self.device)
+                    p = torch.zeros([label_s_one_hot.shape[0], self.nomatch.size(0)], device=self.device)
                     v_label_source = torch.cat((label_s_one_hot, p), 1)
                     virtual_ce = CrossEntropyLoss(v_label_source, virtual_predict_prob_source)
             

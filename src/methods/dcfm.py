@@ -271,39 +271,43 @@ class DCFMSolver(BaseSolver):
 
             for src_imgs, src_labels in self.source_loader:
                 tgt_imgs, _ = next(tgt_iter)
-                src_imgs, src_labels = src_imgs.to(self.device), src_labels.to(self.device)
-                tgt_imgs = tgt_imgs.to(self.device)
+                src_imgs, src_labels = self._to_device(src_imgs), self._to_device(src_labels)
+                tgt_imgs = self._to_device(tgt_imgs)
                 bs_src, bs_tgt = src_imgs.size(0), tgt_imgs.size(0)
 
-                optimizer.zero_grad()
+                self._zero_grad(optimizer)
 
-                # --- Decoupled Forward (consistent with Stage 2) ---
-                h_src = self.net.extract_features(src_imgs)
-                h_tgt = self.net.extract_features(tgt_imgs)
+                with self._auto_cast():
+                    # --- Decoupled Forward (consistent with Stage 2) ---
+                    h_src = self.net.extract_features(src_imgs)
+                    h_tgt = self.net.extract_features(tgt_imgs)
 
-                # Domain logits (detached) for domain loss
-                domain_logits_src = self.net.get_domain_logits(h_src)
-                domain_logits_tgt = self.net.get_domain_logits(h_tgt)
+                    # Domain logits (detached) for domain loss
+                    domain_logits_src = self.net.get_domain_logits(h_src)
+                    domain_logits_tgt = self.net.get_domain_logits(h_tgt)
 
-                # z_domain (with gradients) for FiLM modulation
-                z_src = self.net.get_domain_z(h_src)
+                    # z_domain (with gradients) for FiLM modulation
+                    z_src = self.net.get_domain_z(h_src)
 
-                # Task loss (source only)
-                task_logits_src = self.net.forward_modulated(h_src, z_src)
-                loss_task = self.criterion_task(task_logits_src, src_labels)
+                    # Task loss (source only)
+                    task_logits_src = self.net.forward_modulated(h_src, z_src)
+                    loss_task = self.criterion_task(task_logits_src, src_labels)
 
-                # Domain loss (source=0, target=1)
-                domain_logits = torch.cat([domain_logits_src, domain_logits_tgt], dim=0)
-                domain_labels = torch.cat([
-                    torch.zeros(bs_src, dtype=torch.long, device=self.device),
-                    torch.ones(bs_tgt, dtype=torch.long, device=self.device),
-                ])
-                loss_domain = self.criterion_domain(domain_logits, domain_labels)
+                    # Domain loss (source=0, target=1)
+                    domain_logits = torch.cat([domain_logits_src, domain_logits_tgt], dim=0)
+                    domain_labels = torch.cat([
+                        torch.zeros(bs_src, dtype=torch.long, device=self.device),
+                        torch.ones(bs_tgt, dtype=torch.long, device=self.device),
+                    ])
+                    loss_domain = self.criterion_domain(domain_logits, domain_labels)
 
-                loss = loss_task + self.lambda_domain * loss_domain
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
-                optimizer.step()
+                    loss = loss_task + self.lambda_domain * loss_domain
+                self._optimizer_step_with_optional_clip(
+                    loss,
+                    optimizer,
+                    clip_params=self.net.parameters(),
+                    clip_max_norm=5.0,
+                )
                 scheduler.step()
 
                 meters['task'].update(loss_task.item())
@@ -331,81 +335,85 @@ class DCFMSolver(BaseSolver):
 
             for src_imgs, src_labels in self.source_loader:
                 tgt_imgs, _ = next(tgt_iter)
-                src_imgs, src_labels = src_imgs.to(self.device), src_labels.to(self.device)
-                tgt_imgs = tgt_imgs.to(self.device)
+                src_imgs, src_labels = self._to_device(src_imgs), self._to_device(src_labels)
+                tgt_imgs = self._to_device(tgt_imgs)
                 bs_src, bs_tgt = src_imgs.size(0), tgt_imgs.size(0)
 
-                optimizer.zero_grad()
+                self._zero_grad(optimizer)
 
-                # --- Decoupled Forward Pass ---
-                h_src = self.net.extract_features(src_imgs)
-                h_tgt = self.net.extract_features(tgt_imgs)
+                with self._auto_cast():
+                    # --- Decoupled Forward Pass ---
+                    h_src = self.net.extract_features(src_imgs)
+                    h_tgt = self.net.extract_features(tgt_imgs)
 
-                # Domain logits (detached) for domain loss
-                domain_logits_src = self.net.get_domain_logits(h_src)
-                domain_logits_tgt = self.net.get_domain_logits(h_tgt)
+                    # Domain logits (detached) for domain loss
+                    domain_logits_src = self.net.get_domain_logits(h_src)
+                    domain_logits_tgt = self.net.get_domain_logits(h_tgt)
 
-                # z_domain (with gradients) for FiLM modulation
-                z_src = self.net.get_domain_z(h_src)
-                z_tgt = self.net.get_domain_z(h_tgt)
+                    # z_domain (with gradients) for FiLM modulation
+                    z_src = self.net.get_domain_z(h_src)
+                    z_tgt = self.net.get_domain_z(h_tgt)
 
-                task_logits_src = self.net.forward_modulated(h_src, z_src)
-                task_logits_tgt = self.net.forward_modulated(h_tgt, z_tgt)
+                    task_logits_src = self.net.forward_modulated(h_src, z_src)
+                    task_logits_tgt = self.net.forward_modulated(h_tgt, z_tgt)
 
-                # 1) Source task loss
-                loss_task = self.criterion_task(task_logits_src, src_labels)
+                    # 1) Source task loss
+                    loss_task = self.criterion_task(task_logits_src, src_labels)
 
-                # 2) Domain classification loss
-                domain_logits = torch.cat([domain_logits_src, domain_logits_tgt], dim=0)
-                domain_labels = torch.cat([
-                    torch.zeros(bs_src, dtype=torch.long, device=self.device),
-                    torch.ones(bs_tgt, dtype=torch.long, device=self.device),
-                ])
-                loss_domain = self.criterion_domain(domain_logits, domain_labels)
+                    # 2) Domain classification loss
+                    domain_logits = torch.cat([domain_logits_src, domain_logits_tgt], dim=0)
+                    domain_labels = torch.cat([
+                        torch.zeros(bs_src, dtype=torch.long, device=self.device),
+                        torch.ones(bs_tgt, dtype=torch.long, device=self.device),
+                    ])
+                    loss_domain = self.criterion_domain(domain_logits, domain_labels)
 
-                # 3) Information Maximization on target
-                loss_im = information_maximization_loss(
-                    task_logits_tgt, diversity_weight=self.lambda_div,
+                    # 3) Information Maximization on target
+                    loss_im = information_maximization_loss(
+                        task_logits_tgt, diversity_weight=self.lambda_div,
+                    )
+
+                    # 4) Cross-Domain Joint Manifold Mixup
+                    min_bs = min(bs_src, bs_tgt)
+
+                    # Shuffle target to pair randomly with source
+                    shuffle_idx = torch.randperm(min_bs, device=self.device)
+                    h_tgt_shuffled = h_tgt[:min_bs][shuffle_idx]
+                    z_tgt_shuffled = z_tgt[:min_bs][shuffle_idx]
+
+                    # Sample lambda from Beta(2,2), ensure source dominance
+                    lam = beta_dist.sample().item()
+                    lam = max(lam, 1.0 - lam)  # source-dominant for label reliability
+
+                    # Joint Manifold Interpolation
+                    h_cross = lam * h_src[:min_bs] + (1 - lam) * h_tgt_shuffled
+                    z_cross = lam * z_src[:min_bs].detach() + (1 - lam) * z_tgt_shuffled.detach()
+
+                    # Modulate and Classify
+                    task_logits_cross = self.net.classifier(
+                        self.net.modulator(self.net.feat_bn(h_cross), z_cross)
+                    )
+
+                    # Mixed Labels Loss
+                    prob_tgt = F.softmax(task_logits_tgt[:min_bs][shuffle_idx].detach(), dim=1)
+                    loss_src_part = lam * F.cross_entropy(task_logits_cross, src_labels[:min_bs])
+                    log_prob_cross = F.log_softmax(task_logits_cross, dim=1)
+                    loss_tgt_part = (1 - lam) * torch.sum(-prob_tgt * log_prob_cross, dim=1).mean()
+
+                    loss_cf = loss_src_part + loss_tgt_part
+
+                    # Total Loss with ramp-ups
+                    loss = (loss_task
+                            + self.lambda_domain * loss_domain
+                            + self.lambda_im * ramp * loss_im
+                            + self.lambda_cf * ramp * loss_cf)
+
+                self._optimizer_step_with_optional_clip(
+                    loss,
+                    optimizer,
+                    clip_params=self.net.parameters(),
+                    clip_max_norm=5.0,
                 )
-
-                # 4) Cross-Domain Joint Manifold Mixup
-                min_bs = min(bs_src, bs_tgt)
-
-                # Shuffle target to pair randomly with source
-                shuffle_idx = torch.randperm(min_bs, device=self.device)
-                h_tgt_shuffled = h_tgt[:min_bs][shuffle_idx]
-                z_tgt_shuffled = z_tgt[:min_bs][shuffle_idx]
-
-                # Sample lambda from Beta(2,2), ensure source dominance
-                lam = beta_dist.sample().item()
-                lam = max(lam, 1.0 - lam)  # source-dominant for label reliability
-
-                # Joint Manifold Interpolation
-                h_cross = lam * h_src[:min_bs] + (1 - lam) * h_tgt_shuffled
-                z_cross = lam * z_src[:min_bs].detach() + (1 - lam) * z_tgt_shuffled.detach()
-
-                # Modulate and Classify
-                task_logits_cross = self.net.classifier(
-                    self.net.modulator(self.net.feat_bn(h_cross), z_cross)
-                )
-
-                # Mixed Labels Loss
-                prob_tgt = F.softmax(task_logits_tgt[:min_bs][shuffle_idx].detach(), dim=1)
-                loss_src_part = lam * F.cross_entropy(task_logits_cross, src_labels[:min_bs])
-                log_prob_cross = F.log_softmax(task_logits_cross, dim=1)
-                loss_tgt_part = (1 - lam) * torch.sum(-prob_tgt * log_prob_cross, dim=1).mean()
-
-                loss_cf = loss_src_part + loss_tgt_part
-
-                # Total Loss with ramp-ups
-                loss = (loss_task
-                        + self.lambda_domain * loss_domain
-                        + self.lambda_im * ramp * loss_im
-                        + self.lambda_cf * ramp * loss_cf)
-
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=5.0)
-                optimizer.step()
                 scheduler.step()
 
                 meters['task'].update(loss_task.item())

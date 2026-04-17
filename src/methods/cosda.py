@@ -274,8 +274,12 @@ class COSDASolver(BaseSolver):
             bn_type=self.config.method.bn_type
         ).to(self.device)
 
-        if hasattr(torch, 'compile') and self.device.type != 'mps':
-            self.net = torch.compile(self.net)
+        enable_compile = bool(self.config.method.get("enable_compile", True))
+        if enable_compile and hasattr(torch, 'compile') and self.device.type != 'mps':
+            try:
+                self.net = torch.compile(self.net)
+            except Exception as e:
+                logger.warning(f"torch.compile is unavailable for COSDA in this runtime, fallback to eager mode: {e}")
 
     def _get_trainable_params(self):
         param_group = []
@@ -310,15 +314,16 @@ class COSDASolver(BaseSolver):
         begin_index = 0
         self.net.eval()
         for imgs_train, imgs_label in self.source_loader:
-            images = imgs_train.to(self.device)
-            label = imgs_label.to(self.device)
+            images = self._to_device(imgs_train)
+            label = self._to_device(imgs_label)
             bs = images.shape[0]
             index = [i for i in range(begin_index, begin_index + bs)]
             begin_index += bs
             
             with torch.no_grad():
-                rois = self.net.backbone_layer(images)
-                features_temp, _ = self.net.feat_embed_layer(rois)
+                with self._auto_cast():
+                    rois = self.net.backbone_layer(images)
+                    features_temp, _ = self.net.feat_embed_layer(rois)
                 memory_source_features[index] = features_temp
                 memory_source_labels[index] = label
                 
@@ -339,16 +344,17 @@ class COSDASolver(BaseSolver):
         begin_index = 0
         self.net.eval()
         for data_t, target_t in self.target_loader:
-            images = data_t.to(self.device)
-            label = target_t.to(self.device)
+            images = self._to_device(data_t)
+            label = self._to_device(target_t)
             bs = images.shape[0]
             index = [i for i in range(begin_index, begin_index + bs)]
             begin_index += bs
             
             with torch.no_grad():
-                rois = self.net.backbone_layer(images)
-                features_temp, _ = self.net.feat_embed_layer(rois)
-                pred_cls = self.net.class_layer(features_temp, apply_softmax=True)
+                with self._auto_cast():
+                    rois = self.net.backbone_layer(images)
+                    features_temp, _ = self.net.feat_embed_layer(rois)
+                    pred_cls = self.net.class_layer(features_temp, apply_softmax=True)
                 embed_feat_bank[index] = features_temp
                 gt_label_bank[index] = label
                 pred_cls_bank[index] = pred_cls
@@ -461,6 +467,7 @@ class COSDASolver(BaseSolver):
             if epoch >= self.config.method.warm_up_epoch:
                 all_proto, neg_proto, NUM_K = self.get_pseudo_label(new_epoch=True)
             self.net.train()
+            total_loss_meter = AverageMeter()
             
             src_iter = cycle(self.source_loader)
             tgt_iter = cycle(self.target_loader)
@@ -469,12 +476,12 @@ class COSDASolver(BaseSolver):
                 train_s, target_s = next(src_iter)
                 train_t, target_t = next(tgt_iter)
                 
-                train_s = train_s.to(self.device)
-                target_s = target_s.to(self.device)
-                train_t = train_t.to(self.device)
-                target_t = target_t.to(self.device)
+                train_s = self._to_device(train_s)
+                target_s = self._to_device(target_s)
+                train_t = self._to_device(train_t)
+                target_t = self._to_device(target_t)
                 
-                optimizer.zero_grad()
+                self._zero_grad(optimizer)
                 
                 if epoch < self.config.method.warm_up_epoch:
                     current_stage_epoch = epoch
@@ -492,18 +499,20 @@ class COSDASolver(BaseSolver):
                 self.config.method.lambda_kl = kld_weight
                 
                 # Source path
-                rois_s, v_s, rois_c_s, y_s, intervention_s, int_rois_s, int_v_s, int_y_s = self.net(train_s, apply_softmax=False)
-                loss_beta_s = self.forward_BETA_ce(v_s, y_s, intervention_s, int_v_s, int_y_s, target_s, domain='source')
-                loss_dict.update(loss_beta_s)
+                with self._auto_cast():
+                    rois_s, v_s, rois_c_s, y_s, intervention_s, int_rois_s, int_v_s, int_y_s = self.net(train_s, apply_softmax=False)
+                    loss_beta_s = self.forward_BETA_ce(v_s, y_s, intervention_s, int_v_s, int_y_s, target_s, domain='source')
+                    loss_dict.update(loss_beta_s)
                 
                 if epoch >= self.config.method.warm_up_epoch:
                     # Target path
                     self.net.train()
-                    rois_t, v_t, rois_c_t, y_t, intervention_t, int_rois_t, int_v_t, int_y_t = self.net(train_t, apply_softmax=False)
-                    hard_label_bank = self.get_pseudo_label_batch(rois_c_t, all_proto, self.known_class)
-                    hard_label_bank[hard_label_bank >= self.known_class] = self.known_class
-                    
-                    loss_beta_t = self.forward_BETA_ce(v_t, y_t, intervention_t, int_v_t, int_y_t, hard_label_bank, domain='target')
+                    with self._auto_cast():
+                        rois_t, v_t, rois_c_t, y_t, intervention_t, int_rois_t, int_v_t, int_y_t = self.net(train_t, apply_softmax=False)
+                        hard_label_bank = self.get_pseudo_label_batch(rois_c_t, all_proto, self.known_class)
+                        hard_label_bank[hard_label_bank >= self.known_class] = self.known_class
+                        
+                        loss_beta_t = self.forward_BETA_ce(v_t, y_t, intervention_t, int_v_t, int_y_t, hard_label_bank, domain='target')
                     
                     target_score, predict_target = torch.max(y_t.softmax(-1), 1)
                     idx_pseudo1 = target_score > self.config.method.confidence_th
@@ -527,8 +536,7 @@ class COSDASolver(BaseSolver):
                     loss_dict.update(loss_beta_t)
                 
                 loss_all = sum(loss for loss in loss_dict.values())
-                loss_all.backward()
-                optimizer.step()
+                self._optimizer_step_with_optional_clip(loss_all, optimizer)
                 
                 total_loss_meter.update(loss_all.item())
                 

@@ -434,12 +434,13 @@ class DARESolver(BaseSolver):
         )
 
         for src_imgs, src_labels, src_dom in self.source_loader:
-            src_imgs = src_imgs.to(self.device)
-            src_labels = src_labels.to(self.device)
-            src_dom = src_dom.to(self.device)
+            src_imgs = self._to_device(src_imgs)
+            src_labels = self._to_device(src_labels)
+            src_dom = self._to_device(src_dom)
 
-            h = model.extract_features(src_imgs)
-            h_shared = model.normalize_features(h)
+            with self._auto_cast():
+                h = model.extract_features(src_imgs)
+                h_shared = model.normalize_features(h)
 
             for dom_id in src_dom.unique().tolist():
                 dom_mask = src_dom == dom_id
@@ -545,68 +546,73 @@ class DARESolver(BaseSolver):
                 tgt_imgs = tgt_batch[0] if isinstance(tgt_batch, (tuple, list)) else tgt_batch
                 tgt_weak, tgt_strong = _unwrap_weak_strong_from_maybe_tuple(tgt_imgs)
 
-                src_imgs = src_imgs.to(self.device)
-                src_labels = src_labels.to(self.device)
-                src_dom = src_dom.to(self.device)
-                tgt_weak = tgt_weak.to(self.device)
-                tgt_strong = tgt_strong.to(self.device)
+                src_imgs = self._to_device(src_imgs)
+                src_labels = self._to_device(src_labels)
+                src_dom = self._to_device(src_dom)
+                tgt_weak = self._to_device(tgt_weak)
+                tgt_strong = self._to_device(tgt_strong)
 
-                optimizer.zero_grad()
+                self._zero_grad(optimizer)
 
-                src_h = self.net.extract_features(src_imgs)
-                src_h_shared = self.net.normalize_features(src_h)
-                logits_src, src_aux = self._forward_logits(self.net, h_shared=src_h_shared)
-                loss_task = self.criterion_task(logits_src, src_labels)
-                if self.enable_relation_forward and self.enable_source_relation_loss:
-                    loss_rel = self._source_relation_loss(
-                        src_aux["relation_logits"],
-                        src_labels,
-                        src_dom,
-                    )
-                else:
-                    loss_rel = torch.zeros((), device=self.device, dtype=loss_task.dtype)
-
-                tgt_h = self.net.extract_features(tgt_strong)
-                tgt_h_shared = self.net.normalize_features(tgt_h)
-                logits_tgt, tgt_aux = self._forward_logits(self.net, h_shared=tgt_h_shared)
-
-                if self.enable_ema_pseudo:
-                    with torch.no_grad():
-                        q_tgt, conf_tgt = self._teacher_guidance(tgt_weak)
-                        if self.enable_confidence_weighting:
-                            pseudo_weights = conf_tgt.pow(self.pseudo_conf_power)
-                        else:
-                            pseudo_weights = torch.ones_like(conf_tgt)
-                    pseudo_loss_weights = pseudo_weights * pseudo_ramp
-                    loss_pseudo = soft_target_cross_entropy(
-                        logits_tgt,
-                        q_tgt.detach(),
-                        weights=pseudo_loss_weights,
-                    )
-                    if self.enable_relation_forward and self.enable_proto_loss:
-                        loss_proto = self._target_proto_alignment_loss(
-                            tgt_h_shared,
-                            tgt_aux["proto_context"],
-                            q_tgt.detach(),
-                            pseudo_loss_weights,
+                with self._auto_cast():
+                    src_h = self.net.extract_features(src_imgs)
+                    src_h_shared = self.net.normalize_features(src_h)
+                    logits_src, src_aux = self._forward_logits(self.net, h_shared=src_h_shared)
+                    loss_task = self.criterion_task(logits_src, src_labels)
+                    if self.enable_relation_forward and self.enable_source_relation_loss:
+                        loss_rel = self._source_relation_loss(
+                            src_aux["relation_logits"],
+                            src_labels,
+                            src_dom,
                         )
                     else:
-                        loss_proto = torch.zeros((), device=self.device, dtype=loss_task.dtype)
-                else:
-                    conf_tgt = torch.zeros(tgt_h_shared.size(0), device=self.device, dtype=loss_task.dtype)
-                    pseudo_loss_weights = torch.zeros_like(conf_tgt)
-                    loss_pseudo = torch.zeros((), device=self.device, dtype=loss_task.dtype)
-                    loss_proto = torch.zeros((), device=self.device, dtype=loss_task.dtype)
+                        loss_rel = torch.zeros((), device=self.device, dtype=loss_task.dtype)
 
-                loss = (
-                    loss_task
-                    + self.lambda_source_relation * loss_rel
-                    + self.lambda_proto_align * ramp * loss_proto
-                    + self.lambda_pseudo * ramp * loss_pseudo
+                    tgt_h = self.net.extract_features(tgt_strong)
+                    tgt_h_shared = self.net.normalize_features(tgt_h)
+                    logits_tgt, tgt_aux = self._forward_logits(self.net, h_shared=tgt_h_shared)
+
+                    if self.enable_ema_pseudo:
+                        with torch.no_grad():
+                            with self._auto_cast():
+                                q_tgt, conf_tgt = self._teacher_guidance(tgt_weak)
+                            if self.enable_confidence_weighting:
+                                pseudo_weights = conf_tgt.pow(self.pseudo_conf_power)
+                            else:
+                                pseudo_weights = torch.ones_like(conf_tgt)
+                        pseudo_loss_weights = pseudo_weights * pseudo_ramp
+                        loss_pseudo = soft_target_cross_entropy(
+                            logits_tgt,
+                            q_tgt.detach(),
+                            weights=pseudo_loss_weights,
+                        )
+                        if self.enable_relation_forward and self.enable_proto_loss:
+                            loss_proto = self._target_proto_alignment_loss(
+                                tgt_h_shared,
+                                tgt_aux["proto_context"],
+                                q_tgt.detach(),
+                                pseudo_loss_weights,
+                            )
+                        else:
+                            loss_proto = torch.zeros((), device=self.device, dtype=loss_task.dtype)
+                    else:
+                        conf_tgt = torch.zeros(tgt_h_shared.size(0), device=self.device, dtype=loss_task.dtype)
+                        pseudo_loss_weights = torch.zeros_like(conf_tgt)
+                        loss_pseudo = torch.zeros((), device=self.device, dtype=loss_task.dtype)
+                        loss_proto = torch.zeros((), device=self.device, dtype=loss_task.dtype)
+
+                    loss = (
+                        loss_task
+                        + self.lambda_source_relation * loss_rel
+                        + self.lambda_proto_align * ramp * loss_proto
+                        + self.lambda_pseudo * ramp * loss_pseudo
+                    )
+                self._optimizer_step_with_optional_clip(
+                    loss,
+                    optimizer,
+                    clip_params=self.net.parameters(),
+                    clip_max_norm=self.grad_clip,
                 )
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=self.grad_clip)
-                optimizer.step()
                 scheduler.step()
 
                 self._update_ema(self._ema_decay_at(global_step, total_iters))

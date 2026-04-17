@@ -506,9 +506,31 @@ def get_dataloader(config):
 
     batch_size = config.batch_size
     num_workers = config.num_workers
+    perf_cfg = getattr(config, "performance", None)
+    dl_perf_cfg = getattr(perf_cfg, "dataloader", None) if perf_cfg is not None else None
     # Only pin memory when CUDA is actually the selected device.
     device_str = getattr(config, "device", "auto")
-    pin_memory = get_device(device_str) == "cuda"
+    is_cuda_device = get_device(device_str) == "cuda"
+    pin_memory_cfg = getattr(perf_cfg, "pin_memory", "auto") if perf_cfg is not None else "auto"
+    pin_memory = is_cuda_device if str(pin_memory_cfg).lower() == "auto" else _is_truthy(pin_memory_cfg)
+    persistent_workers = (
+        bool(getattr(dl_perf_cfg, "persistent_workers", True))
+        if dl_perf_cfg is not None
+        else True
+    )
+    prefetch_factor = (
+        int(getattr(dl_perf_cfg, "prefetch_factor", 4))
+        if dl_perf_cfg is not None
+        else 4
+    )
+
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        loader_kwargs["prefetch_factor"] = max(1, prefetch_factor)
 
     # Determine classes
     src_classes, tgt_classes, shared_classes = get_class_splits(config)
@@ -796,32 +818,28 @@ def get_dataloader(config):
         source_loader = DataLoader(
             source_dataset,
             batch_sampler=batch_sampler,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
+            **loader_kwargs,
         )
     else:
         source_loader = DataLoader(
             source_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=num_workers,
             drop_last=True,
-            pin_memory=pin_memory,
+            **loader_kwargs,
         )
     target_loader = DataLoader(
         target_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
         drop_last=True,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
     target_test_loader = DataLoader(
         target_test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
     
     # Class info for evaluation

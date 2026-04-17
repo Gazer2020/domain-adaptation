@@ -702,12 +702,13 @@ class RGRSolver(BaseSolver):
         )
 
         for src_imgs, src_labels, src_dom in self.source_loader:
-            src_imgs = src_imgs.to(self.device)
-            src_labels = src_labels.to(self.device)
-            src_dom = src_dom.to(self.device)
+            src_imgs = self._to_device(src_imgs)
+            src_labels = self._to_device(src_labels)
+            src_dom = self._to_device(src_dom)
 
-            h = model.extract_features(src_imgs)
-            h_shared = model.normalize_features(h)
+            with self._auto_cast():
+                h = model.extract_features(src_imgs)
+                h_shared = model.normalize_features(h)
 
             for dom_id in src_dom.unique().tolist():
                 dom_mask = src_dom == dom_id
@@ -832,58 +833,63 @@ class RGRSolver(BaseSolver):
                 tgt_imgs = tgt_batch[0] if isinstance(tgt_batch, (tuple, list)) else tgt_batch
                 tgt_weak, tgt_strong = _unwrap_weak_strong_from_maybe_tuple(tgt_imgs)
 
-                src_imgs = src_imgs.to(self.device)
-                src_labels = src_labels.to(self.device)
-                src_dom = src_dom.to(self.device)
-                tgt_weak = tgt_weak.to(self.device)
-                tgt_strong = tgt_strong.to(self.device)
+                src_imgs = self._to_device(src_imgs)
+                src_labels = self._to_device(src_labels)
+                src_dom = self._to_device(src_dom)
+                tgt_weak = self._to_device(tgt_weak)
+                tgt_strong = self._to_device(tgt_strong)
 
-                optimizer.zero_grad()
+                self._zero_grad(optimizer)
 
-                logits_src, src_aux = self._forward_logits(self.net, x=src_imgs)
-                loss_src = self.criterion_task(logits_src, src_labels)
-                loss_src_rel = self._source_relation_loss(
-                    src_aux["domain_logits"],
-                    src_labels,
-                    src_dom,
-                )
-
-                logits_tgt, tgt_aux = self._forward_logits(self.net, x=tgt_strong)
-                with torch.no_grad():
-                    conf_tgt, teacher_aux = self._teacher_guidance(tgt_weak)
-                    rel_weights = conf_tgt.pow(self.consistency_conf_power)
-
-                loss_rcls, loss_rnode, loss_rtrans = self._relation_consistency_loss(
-                    tgt_aux,
-                    teacher_aux,
-                    rel_weights,
-                )
-                loss_local = self._local_structure_loss(
-                    tgt_aux,
-                    teacher_aux,
-                    rel_weights,
-                )
-                loss_explain = soft_target_cross_entropy(
-                    logits_tgt,
-                    tgt_aux["class_probs"].detach(),
-                    weights=rel_weights,
-                )
-
-                loss = (
-                    loss_src
-                    + self.lambda_source_relation * loss_src_rel
-                    + ramp
-                    * consistency_ramp
-                    * (
-                        self.lambda_relation_consistency * (loss_rcls + loss_rnode + loss_rtrans)
-                        + self.lambda_local_consistency * loss_local
-                        + self.lambda_explain_consistency * loss_explain
+                with self._auto_cast():
+                    logits_src, src_aux = self._forward_logits(self.net, x=src_imgs)
+                    loss_src = self.criterion_task(logits_src, src_labels)
+                    loss_src_rel = self._source_relation_loss(
+                        src_aux["domain_logits"],
+                        src_labels,
+                        src_dom,
                     )
-                )
 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=self.grad_clip)
-                optimizer.step()
+                    logits_tgt, tgt_aux = self._forward_logits(self.net, x=tgt_strong)
+                    with torch.no_grad():
+                        with self._auto_cast():
+                            conf_tgt, teacher_aux = self._teacher_guidance(tgt_weak)
+                        rel_weights = conf_tgt.pow(self.consistency_conf_power)
+
+                    loss_rcls, loss_rnode, loss_rtrans = self._relation_consistency_loss(
+                        tgt_aux,
+                        teacher_aux,
+                        rel_weights,
+                    )
+                    loss_local = self._local_structure_loss(
+                        tgt_aux,
+                        teacher_aux,
+                        rel_weights,
+                    )
+                    loss_explain = soft_target_cross_entropy(
+                        logits_tgt,
+                        tgt_aux["class_probs"].detach(),
+                        weights=rel_weights,
+                    )
+
+                    loss = (
+                        loss_src
+                        + self.lambda_source_relation * loss_src_rel
+                        + ramp
+                        * consistency_ramp
+                        * (
+                            self.lambda_relation_consistency * (loss_rcls + loss_rnode + loss_rtrans)
+                            + self.lambda_local_consistency * loss_local
+                            + self.lambda_explain_consistency * loss_explain
+                        )
+                    )
+
+                self._optimizer_step_with_optional_clip(
+                    loss,
+                    optimizer,
+                    clip_params=self.net.parameters(),
+                    clip_max_norm=self.grad_clip,
+                )
                 scheduler.step()
 
                 self._update_ema(self._ema_decay_at(global_step, total_iters))

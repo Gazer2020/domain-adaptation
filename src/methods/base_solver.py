@@ -7,6 +7,7 @@ the required abstract methods: build_model() and train().
 
 import logging
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Tuple
 
 import torch
@@ -62,6 +63,7 @@ class BaseSolver(ABC):
         device_str = get_device(config.device)
         self.device = torch.device(device_str)
         logger.info(f"Using device: {self.device}")
+        self._setup_performance_runtime()
         
         # Setup number of classes based on setting
         self._setup_num_classes()
@@ -71,6 +73,83 @@ class BaseSolver(ABC):
         
         # Default loss function (can be overridden or unused)
         self.criterion = nn.CrossEntropyLoss()
+
+    @staticmethod
+    def _cfg_get(cfg, key, default):
+        value = cfg.get(key, default) if hasattr(cfg, "get") else default
+        return default if value is None else value
+
+    def _setup_performance_runtime(self):
+        perf = self._cfg_get(self.config, "performance", {})
+        amp_cfg = self._cfg_get(perf, "amp", {})
+
+        self.non_blocking_transfer = bool(self._cfg_get(perf, "non_blocking_transfer", True)) and self.device.type == "cuda"
+        self.zero_grad_set_to_none = bool(self._cfg_get(perf, "zero_grad_set_to_none", True))
+        self.channels_last = bool(self._cfg_get(perf, "channels_last", False)) and self.device.type == "cuda"
+
+        amp_enabled_cfg = str(self._cfg_get(amp_cfg, "enabled", "auto")).lower()
+        if amp_enabled_cfg == "auto":
+            self.amp_enabled = self.device.type == "cuda"
+        else:
+            self.amp_enabled = amp_enabled_cfg in {"1", "true", "yes", "on"}
+
+        amp_dtype_cfg = str(self._cfg_get(amp_cfg, "dtype", "bf16")).lower()
+        if amp_dtype_cfg in {"fp16", "float16", "half"}:
+            self.amp_dtype = torch.float16
+        else:
+            self.amp_dtype = torch.bfloat16
+
+        self.use_grad_scaler = self.amp_enabled and self.device.type == "cuda" and self.amp_dtype == torch.float16
+        self.grad_scaler = torch.amp.GradScaler("cuda", enabled=self.use_grad_scaler)
+        logger.info(
+            "Performance runtime | amp=%s dtype=%s non_blocking=%s set_to_none=%s channels_last=%s",
+            self.amp_enabled,
+            str(self.amp_dtype).replace("torch.", ""),
+            self.non_blocking_transfer,
+            self.zero_grad_set_to_none,
+            self.channels_last,
+        )
+
+    def _auto_cast(self):
+        if self.amp_enabled:
+            return torch.autocast(device_type=self.device.type, dtype=self.amp_dtype)
+        return nullcontext()
+
+    def _to_device(self, x):
+        if torch.is_tensor(x):
+            if self.channels_last and x.ndim == 4:
+                x = x.contiguous(memory_format=torch.channels_last)
+            return x.to(self.device, non_blocking=self.non_blocking_transfer)
+        if isinstance(x, (list, tuple)):
+            converted = [self._to_device(v) for v in x]
+            return type(x)(converted)
+        if isinstance(x, dict):
+            return {k: self._to_device(v) for k, v in x.items()}
+        return x
+
+    def _zero_grad(self, optimizer):
+        optimizer.zero_grad(set_to_none=self.zero_grad_set_to_none)
+
+    def _backward(self, loss: torch.Tensor):
+        if self.use_grad_scaler:
+            self.grad_scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+    def _optimizer_step(self, optimizer):
+        if self.use_grad_scaler:
+            self.grad_scaler.step(optimizer)
+            self.grad_scaler.update()
+        else:
+            optimizer.step()
+
+    def _optimizer_step_with_optional_clip(self, loss, optimizer, clip_params=None, clip_max_norm=None):
+        self._backward(loss)
+        if clip_params is not None and clip_max_norm is not None:
+            if self.use_grad_scaler:
+                self.grad_scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(clip_params, max_norm=clip_max_norm)
+        self._optimizer_step(optimizer)
 
     def _setup_num_classes(self):
         """
@@ -170,8 +249,9 @@ class BaseSolver(ABC):
 
         with torch.no_grad():
             for imgs, labels in self.target_test_loader:
-                imgs = imgs.to(self.device)
-                outputs = self.forward_for_eval(imgs)
+                imgs = self._to_device(imgs)
+                with self._auto_cast():
+                    outputs = self.forward_for_eval(imgs)
                 
                 probs = torch.softmax(outputs, dim=1)
                 max_probs, predicted = torch.max(probs, dim=1)
@@ -348,14 +428,14 @@ class SourceOnlySolver(BaseSolver):
                     src_imgs, src_labels = batch[0], batch[1]
                 else:
                     raise ValueError("Source-only solver expects source batches to provide at least images and labels")
-                src_imgs = src_imgs.to(self.device)
-                src_labels = src_labels.to(self.device)
+                src_imgs = self._to_device(src_imgs)
+                src_labels = self._to_device(src_labels)
                 
-                optimizer.zero_grad()
-                logits = self.net(src_imgs)
-                loss = self.criterion(logits, src_labels)
-                loss.backward()
-                optimizer.step()
+                self._zero_grad(optimizer)
+                with self._auto_cast():
+                    logits = self.net(src_imgs)
+                    loss = self.criterion(logits, src_labels)
+                self._optimizer_step_with_optional_clip(loss, optimizer)
                 
                 loss_meter.update(loss.item())
             

@@ -161,6 +161,7 @@ class CADSolver(BaseSolver):
         Returns:
             structure_loss: MSE between sample gates and class prototypes
         """
+        gates = gates.float()
         batch_size = gates.size(0)
         
         # Initialize class centers and counts
@@ -197,6 +198,8 @@ class CADSolver(BaseSolver):
         Returns:
             anomaly_loss: Penalty for activating source-unused channels in target
         """
+        src_gates = src_gates.float()
+        tgt_gates = tgt_gates.float()
         # Source domain channel importance (detached - no gradient!)
         # This represents the "global importance" of each channel for known classes
         src_importance = src_gates.mean(dim=0).detach()  # [D]
@@ -248,19 +251,19 @@ class CADSolver(BaseSolver):
             loss_meter = AverageMeter()
             
             for src_imgs, src_labels in self.source_loader:
-                src_imgs = src_imgs.to(self.device)
-                src_labels = src_labels.to(self.device)
+                src_imgs = self._to_device(src_imgs)
+                src_labels = self._to_device(src_labels)
                 
-                self.optimizer.zero_grad()
+                self._zero_grad(self.optimizer)
                 
                 # Forward with gating
-                logits, _, _, _ = self._forward_with_gating(src_imgs)
+                with self._auto_cast():
+                    logits, _, _, _ = self._forward_with_gating(src_imgs)
                 
-                # Cross-entropy loss only
-                loss = self.criterion(logits, src_labels)
+                    # Cross-entropy loss only
+                    loss = self.criterion(logits, src_labels)
                 
-                loss.backward()
-                self.optimizer.step()
+                self._optimizer_step_with_optional_clip(loss, self.optimizer)
                 
                 loss_meter.update(loss.item())
             
@@ -279,8 +282,8 @@ class CADSolver(BaseSolver):
         
         with torch.no_grad():
             for imgs, labels in self.target_test_loader:
-                imgs = imgs.to(self.device)
-                labels = labels.to(self.device)
+                imgs = self._to_device(imgs)
+                labels = self._to_device(labels)
                 
                 # Skip unknown samples if any
                 if self.unknown_label is not None:
@@ -290,7 +293,8 @@ class CADSolver(BaseSolver):
                     imgs = imgs[mask]
                     labels = labels[mask]
                 
-                outputs = self.forward_for_eval(imgs)
+                with self._auto_cast():
+                    outputs = self.forward_for_eval(imgs)
                 _, predicted = torch.max(outputs, 1)
                 
                 correct += (predicted.cpu() == labels.cpu()).sum().item()
@@ -318,16 +322,16 @@ class CADSolver(BaseSolver):
             for src_imgs, src_labels in self.source_loader:
                 tgt_imgs, _ = next(tgt_iter)
                 
-                src_imgs = src_imgs.to(self.device)
-                src_labels = src_labels.to(self.device)
-                tgt_imgs = tgt_imgs.to(self.device)
+                src_imgs = self._to_device(src_imgs)
+                src_labels = self._to_device(src_labels)
+                tgt_imgs = self._to_device(tgt_imgs)
                 
-                self.optimizer.zero_grad()
+                self._zero_grad(self.optimizer)
                 
-                loss, loss_dict = self._compute_total_loss_terms(src_imgs, src_labels, tgt_imgs)
+                with self._auto_cast():
+                    loss, loss_dict = self._compute_total_loss_terms(src_imgs, src_labels, tgt_imgs)
                 
-                loss.backward()
-                self.optimizer.step()
+                self._optimizer_step_with_optional_clip(loss, self.optimizer)
                 
                 cls_loss_meter.update(loss_dict["cls"])
                 struct_loss_meter.update(loss_dict["struct"])
@@ -391,11 +395,13 @@ class CADSolver(BaseSolver):
         
         with torch.no_grad():
             for imgs, labels in self.source_loader:
-                imgs = imgs.to(self.device)
-                labels = labels.to(self.device)
+                imgs = self._to_device(imgs)
+                labels = self._to_device(labels)
                 
                 # Get gating vectors
-                _, _, gates, _ = self._forward_with_gating(imgs)
+                with self._auto_cast():
+                    _, _, gates, _ = self._forward_with_gating(imgs)
+                gates = gates.float()
                 
                 # Accumulate gates per class
                 class_gate_sums.index_add_(0, labels, gates)
@@ -413,10 +419,12 @@ class CADSolver(BaseSolver):
         
         with torch.no_grad():
             for imgs, _ in self.target_loader:
-                imgs = imgs.to(self.device)
+                imgs = self._to_device(imgs)
                 
                 # Get gating vectors
-                _, _, gates, _ = self._forward_with_gating(imgs)
+                with self._auto_cast():
+                    _, _, gates, _ = self._forward_with_gating(imgs)
+                gates = gates.float()
                 
                 # Normalize
                 gates_norm = F.normalize(gates, p=2, dim=1)

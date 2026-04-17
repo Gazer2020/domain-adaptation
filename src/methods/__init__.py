@@ -1,39 +1,60 @@
 """
-Methods package for domain adaptation solvers.
+Methods package with lazy solver loading.
 
-All solvers are automatically registered via the @register_solver decorator.
-Use get_solver(name) to retrieve a solver class by name.
+Only the requested solver module is imported when get_solver(name) is called.
+This avoids import-time side effects from unrelated methods.
 """
 
-from methods.registry import get_solver, register_solver, list_solvers
+from importlib import import_module
 
-# Import all solvers to trigger registration
-from methods.base_solver import BaseSolver, SourceOnlySolver
-from methods.ros import RotationSolver
-from methods.mic import MICSolver
-from methods.cad import CADSolver
-from methods.cosda import COSDASolver
-from methods.rtda import RTDASolver
-from methods.dcfm import DCFMSolver
-from methods.dare import DARESolver
-from methods.rvtc import RVTCSolver
-from methods.rgr import RGRSolver
+from methods.registry import get_solver as _get_solver_from_registry
+from methods.registry import register_solver
+
+
+_SOLVER_MODULES = {
+    "sourceonly": "methods.base_solver",
+    "ros": "methods.ros",
+    "mic": "methods.mic",
+    "cad": "methods.cad",
+    "cosda": "methods.cosda",
+    "rtda": "methods.rtda",
+    "dcfm": "methods.dcfm",
+    "dare": "methods.dare",
+    "rvtc": "methods.rvtc",
+    "rgr": "methods.rgr",
+}
+
+
+def _normalize_name(name: str) -> str:
+    return str(name).strip().lower()
+
+
+def _load_solver_module(name: str) -> None:
+    module_name = _SOLVER_MODULES.get(name)
+    if module_name is None:
+        available = list(_SOLVER_MODULES.keys())
+        raise KeyError(f"Solver '{name}' not found. Available solvers: {available}")
+    import_module(module_name)
+
+
+def get_solver(name: str):
+    """
+    Get a solver class by name with lazy module import.
+    """
+    normalized = _normalize_name(name)
+    _load_solver_module(normalized)
+    return _get_solver_from_registry(normalized)
+
+
+def list_solvers() -> list:
+    """
+    List available solver names without importing all solver modules.
+    """
+    return list(_SOLVER_MODULES.keys())
+
 
 __all__ = [
-    # Registry
     "get_solver",
     "register_solver",
     "list_solvers",
-    # Solvers
-    "BaseSolver",
-    "SourceOnlySolver",
-    "RotationSolver",
-    "MICSolver",
-    "CADSolver",
-    "COSDASolver",
-    "RTDASolver",
-    "DCFMSolver",
-    "DARESolver",
-    "RVTCSolver",
-    "RGRSolver",
 ]

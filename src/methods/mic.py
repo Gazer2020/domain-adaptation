@@ -47,9 +47,13 @@ class MICSolver(BaseSolver):
         
         # Compile models if available (PyTorch 2.0+)
         # Note: torch.compile is disabled on MPS due to backward pass issues
-        if hasattr(torch, 'compile') and self.device.type != 'mps':
-            self.stu_model = torch.compile(self.stu_model)
-            self.tea_model = torch.compile(self.tea_model)
+        enable_compile = bool(self.config.method.get("enable_compile", True))
+        if enable_compile and hasattr(torch, 'compile') and self.device.type != 'mps':
+            try:
+                self.stu_model = torch.compile(self.stu_model)
+                self.tea_model = torch.compile(self.tea_model)
+            except Exception as e:
+                logger.warning(f"torch.compile is unavailable for MIC in this runtime, fallback to eager mode: {e}")
 
         # MIC masking config
         self.mask_ratio = float(self.config.method.get("mask_ratio", 0.5))
@@ -89,13 +93,15 @@ class MICSolver(BaseSolver):
         student predicts on masked images.
         """
         with torch.no_grad():
-            teacher_logits = self.tea_model(target_images)
-            pseudo_labels = torch.argmax(torch.softmax(teacher_logits, dim=1), dim=1)
+            with self._auto_cast():
+                teacher_logits = self.tea_model(target_images)
+                pseudo_labels = torch.argmax(torch.softmax(teacher_logits, dim=1), dim=1)
 
         mask = self._generate_mask(target_images)
         masked_images = target_images * mask
-        student_logits = self.stu_model(masked_images)
-        return F.cross_entropy(student_logits, pseudo_labels)
+        with self._auto_cast():
+            student_logits = self.stu_model(masked_images)
+            return F.cross_entropy(student_logits, pseudo_labels)
 
     def _get_trainable_params(self):
         """Return student model parameters for optimizer."""
@@ -131,24 +137,24 @@ class MICSolver(BaseSolver):
             for src_imgs, src_labels in self.source_loader:
                 tgt_imgs, _ = next(tgt_iter)
 
-                src_imgs = src_imgs.to(self.device)
-                src_labels = src_labels.to(self.device)
-                tgt_imgs = tgt_imgs.to(self.device)
+                src_imgs = self._to_device(src_imgs)
+                src_labels = self._to_device(src_labels)
+                tgt_imgs = self._to_device(tgt_imgs)
 
-                self.optimizer.zero_grad()
+                self._zero_grad(self.optimizer)
 
-                # Semantic loss on source
-                src_pred = self.stu_model(src_imgs)
-                sem_loss = self.criterion(src_pred, src_labels)
+                with self._auto_cast():
+                    # Semantic loss on source
+                    src_pred = self.stu_model(src_imgs)
+                    sem_loss = self.criterion(src_pred, src_labels)
 
-                # MIC consistency loss on target
-                mic_loss = self._compute_mic_loss(tgt_imgs)
+                    # MIC consistency loss on target
+                    mic_loss = self._compute_mic_loss(tgt_imgs)
 
-                # Combined loss
-                loss = sem_loss + lambda_mic * mic_loss
+                    # Combined loss
+                    loss = sem_loss + lambda_mic * mic_loss
 
-                loss.backward()
-                self.optimizer.step()
+                self._optimizer_step_with_optional_clip(loss, self.optimizer)
 
                 # Update teacher model with EMA
                 self._update_teacher_ema(ema_momentum)

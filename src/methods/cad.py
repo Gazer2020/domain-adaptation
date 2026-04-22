@@ -219,6 +219,7 @@ class CADSolver(BaseSolver):
         
         pretrain_epochs = self.config.method.pretrain_epochs
         adapt_epochs = self.config.method.adapt_epochs
+        best_metric = float("-inf")
         
         # Stage 1: Pretrain on source
         logger.info(f"Stage 1: Pretraining for {pretrain_epochs} epochs...")
@@ -226,7 +227,7 @@ class CADSolver(BaseSolver):
         
         # Stage 2: Adaptation with gating losses
         logger.info(f"Stage 2: Adaptation for {adapt_epochs} epochs...")
-        self._train_adaptation_stage(adapt_epochs)
+        best_metric = self._train_adaptation_stage(adapt_epochs, pretrain_epochs, best_metric)
         
         # Stage 3: Compute class prototypes for rejection mechanism
         logger.info("Computing class prototypes from source domain...")
@@ -235,9 +236,14 @@ class CADSolver(BaseSolver):
         # Evaluate the final model
         logger.info("Evaluating final model...")
         final_hos = self.evaluate()
+        total_epochs = pretrain_epochs + adapt_epochs
+        if final_hos > best_metric:
+            best_metric = final_hos
+        self._maybe_save_best(final_hos, total_epochs)
         logger.info(f"Final evaluation - HOS: {final_hos:.2f}%")
-        
-        logger.info("Training finished.")
+        if self._load_best_checkpoint_if_available():
+            self._log_best_checkpoint_loaded("Score")
+        self._log_training_complete(best_score=best_metric, score_name="Score")
 
     def _train_pretrain_stage(self, max_epochs: int):
         """
@@ -269,7 +275,14 @@ class CADSolver(BaseSolver):
             
             # Evaluate known accuracy only during pretrain
             known_acc = self._evaluate_known_accuracy()
-            logger.info(f"Pretrain Epoch {epoch+1}: Loss={loss_meter.avg:.4f}, Known Acc={known_acc:.2f}%")
+            self._log_epoch_summary(
+                epoch + 1,
+                max_epochs,
+                metrics={"loss": loss_meter.avg},
+                score=known_acc,
+                score_name="KnownAcc",
+                prefix="CAD Pretrain",
+            )
 
     def _evaluate_known_accuracy(self):
         """
@@ -302,7 +315,7 @@ class CADSolver(BaseSolver):
                 
         return 100.0 * correct / total if total > 0 else 0.0
 
-    def _train_adaptation_stage(self, max_epochs: int):
+    def _train_adaptation_stage(self, max_epochs: int, epoch_offset: int, best_metric: float):
         """
         Stage 2: Fine-tune with Structure-Aware and Anomaly-Aware losses.
         
@@ -338,9 +351,24 @@ class CADSolver(BaseSolver):
                 anomaly_loss_meter.update(loss_dict["anom"])
             
             hos = self.evaluate()
-            logger.info(f"Adapt Epoch {epoch+1}: Cls={cls_loss_meter.avg:.4f}, "
-                        f"Struct={struct_loss_meter.avg:.4f}, "
-                        f"Anom={anomaly_loss_meter.avg:.4f}, HOS={hos:.2f}%")
+            global_epoch = epoch_offset + epoch + 1
+            if hos > best_metric:
+                best_metric = hos
+            self._maybe_save_best(hos, global_epoch)
+            self._log_epoch_summary(
+                epoch + 1,
+                max_epochs,
+                metrics={
+                    "cls": cls_loss_meter.avg,
+                    "struct": struct_loss_meter.avg,
+                    "anom": anomaly_loss_meter.avg,
+                },
+                score=hos,
+                best_score=best_metric,
+                score_name="Score",
+                prefix="CAD Adapt",
+            )
+        return best_metric
 
     def _compute_total_loss_terms(self, src_imgs, src_labels, tgt_imgs):
         """
@@ -553,19 +581,22 @@ class CADSolver(BaseSolver):
 
     def save_checkpoint(self, path):
         """Save all model components including prototypes."""
-        torch.save({
-            "method": "cad",
-            "feature_extractor": self.feature_extractor.state_dict(),
-            "gating_module": self.gating_module.state_dict(),
-            "classifier": self.classifier.state_dict(),
-            "class_prototypes": self.class_prototypes,
-            "rejection_threshold": self.rejection_threshold,
-        }, path)
-        logger.info(f"Model saved to {path}")
+        self._save_named_modules_checkpoint(
+            path,
+            modules={
+                "feature_extractor": self.feature_extractor,
+                "gating_module": self.gating_module,
+                "classifier": self.classifier,
+            },
+            extra_state={
+                "class_prototypes": self.class_prototypes,
+                "rejection_threshold": self.rejection_threshold,
+            },
+        )
 
     def load_checkpoint(self, path):
         """Load all model components including prototypes."""
-        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        checkpoint = self._load_checkpoint_file(path)
         
         if "feature_extractor" in checkpoint:
             self.feature_extractor.load_state_dict(checkpoint["feature_extractor"])
@@ -588,4 +619,4 @@ class CADSolver(BaseSolver):
         else:
             logger.warning("Loading from old checkpoint format - may be incompatible")
             
-        logger.info(f"Model loaded from {path}")
+        logger.info("%s checkpoint loaded from %s", self._solver_display_name(), path)

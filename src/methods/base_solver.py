@@ -8,7 +8,8 @@ the required abstract methods: build_model() and train().
 import logging
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
-from typing import Any, Callable, Tuple
+from pathlib import Path
+from typing import Any, Callable, Mapping, Tuple
 
 import torch
 import torch.nn as nn
@@ -16,6 +17,7 @@ from torch.utils.data import DataLoader
 
 from models.backbones import get_backbone
 from utils import get_device
+from utils.config import cfg_get, is_truthy, resolve_auto_bool
 
 from methods.registry import register_solver
 
@@ -73,20 +75,46 @@ class BaseSolver(ABC):
         
         # Default loss function (can be overridden or unused)
         self.criterion = nn.CrossEntropyLoss()
+        self._save_start_epoch = int(self.config.method.get("save_start_epoch", 10))
+        self._best_metric = float("-inf")
+        exp_name = str(self.config.get("exp_name", "experiment"))
+        self._best_ckpt_path = Path("checkpoints") / f"{exp_name}.pth"
+        self._best_saved = False
+
+    @property
+    def solver_name(self) -> str:
+        method_cfg = getattr(self.config, "method", None)
+        configured_name = getattr(method_cfg, "name", None) if method_cfg is not None else None
+        if configured_name:
+            return str(configured_name).strip().lower()
+        return self._solver_display_name().lower()
+
+    def _solver_display_name(self) -> str:
+        class_name = self.__class__.__name__
+        if class_name.endswith("Solver"):
+            return class_name[:-6]
+        return class_name
 
     @staticmethod
     def _cfg_get(cfg, key, default):
-        value = cfg.get(key, default) if hasattr(cfg, "get") else default
-        return default if value is None else value
+        return cfg_get(cfg, key, default)
+
+    @staticmethod
+    def _is_truthy(value) -> bool:
+        return is_truthy(value)
+
+    @classmethod
+    def _resolve_auto_bool(cls, value, auto_value: bool) -> bool:
+        return resolve_auto_bool(value, auto_value)
 
     def _setup_performance_runtime(self):
         perf = self._cfg_get(self.config, "performance", {})
         amp_cfg = self._cfg_get(perf, "amp", {})
         compile_cfg = self._cfg_get(perf, "compile", {})
 
-        self.non_blocking_transfer = bool(self._cfg_get(perf, "non_blocking_transfer", True)) and self.device.type == "cuda"
-        self.zero_grad_set_to_none = bool(self._cfg_get(perf, "zero_grad_set_to_none", True))
-        self.channels_last = bool(self._cfg_get(perf, "channels_last", False)) and self.device.type == "cuda"
+        self.non_blocking_transfer = self._is_truthy(self._cfg_get(perf, "non_blocking_transfer", True)) and self.device.type == "cuda"
+        self.zero_grad_set_to_none = self._is_truthy(self._cfg_get(perf, "zero_grad_set_to_none", True))
+        self.channels_last = self._resolve_auto_bool(self._cfg_get(perf, "channels_last", False), auto_value=False) and self.device.type == "cuda"
 
         amp_enabled_cfg = str(self._cfg_get(amp_cfg, "enabled", "auto")).lower()
         if amp_enabled_cfg == "auto":
@@ -119,8 +147,8 @@ class BaseSolver(ABC):
             self.compile_mode = None
         else:
             self.compile_mode = compile_mode_cfg
-        self.compile_dynamic = bool(self._cfg_get(compile_cfg, "dynamic", False))
-        self.compile_fullgraph = bool(self._cfg_get(compile_cfg, "fullgraph", False))
+        self.compile_dynamic = self._is_truthy(self._cfg_get(compile_cfg, "dynamic", False))
+        self.compile_fullgraph = self._is_truthy(self._cfg_get(compile_cfg, "fullgraph", False))
         logger.info(
             "Performance runtime | amp=%s dtype=%s non_blocking=%s set_to_none=%s channels_last=%s compile=%s",
             self.amp_enabled,
@@ -170,6 +198,9 @@ class BaseSolver(ABC):
             logger.warning("torch.compile unavailable for %s, fallback to eager mode: %s", name, e)
             return fn
 
+    def _compile_module(self, module: nn.Module, name: str) -> Callable[..., Any]:
+        return self._compile_callable(module, name)
+
     def _probe_amp_tensor(self, tensor: torch.Tensor, name: str = "tensor"):
         if self._amp_probe_done or (not torch.is_tensor(tensor)):
             return
@@ -187,9 +218,12 @@ class BaseSolver(ABC):
 
     def _to_device(self, x):
         if torch.is_tensor(x):
-            if self.channels_last and x.ndim == 4:
-                x = x.contiguous(memory_format=torch.channels_last)
-            return x.to(self.device, non_blocking=self.non_blocking_transfer)
+            memory_format = torch.channels_last if self.channels_last and x.ndim == 4 else torch.preserve_format
+            return x.to(
+                self.device,
+                non_blocking=self.non_blocking_transfer,
+                memory_format=memory_format,
+            )
         if isinstance(x, (list, tuple)):
             converted = [self._to_device(v) for v in x]
             return type(x)(converted)
@@ -220,6 +254,144 @@ class BaseSolver(ABC):
                 self.grad_scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(clip_params, max_norm=clip_max_norm)
         self._optimizer_step(optimizer)
+
+    @staticmethod
+    def _format_log_value(value: Any) -> str:
+        fmt = None
+        if isinstance(value, tuple) and len(value) == 2:
+            value, fmt = value
+
+        if torch.is_tensor(value):
+            if value.ndim == 0:
+                value = value.item()
+            else:
+                return str(value)
+
+        if isinstance(value, float):
+            return format(value, fmt or ".4f")
+        if isinstance(value, int):
+            return format(value, fmt or "d")
+        return str(value)
+
+    def _format_log_fields(self, fields: Mapping[str, Any] | None) -> str:
+        if not fields:
+            return ""
+        return " ".join(
+            f"{name}={self._format_log_value(value)}"
+            for name, value in fields.items()
+        )
+
+    def _log_epoch_summary(
+        self,
+        epoch: int,
+        total_epochs: int,
+        *,
+        metrics: Mapping[str, Any] | None = None,
+        extras: Mapping[str, Any] | None = None,
+        score: float | None = None,
+        best_score: float | None = None,
+        score_name: str = "Acc",
+        prefix: str | None = None,
+    ):
+        parts = [f"{prefix or self._solver_display_name()} {epoch}/{total_epochs}"]
+        metric_text = self._format_log_fields(metrics)
+        if metric_text:
+            parts.append(f"| {metric_text}")
+        extra_text = self._format_log_fields(extras)
+        if extra_text:
+            parts.append(f"| {extra_text}")
+        if score is not None:
+            score_text = f"{score_name}={score:.2f}%"
+            if best_score is not None:
+                score_text += f" (best={best_score:.2f}%)"
+            parts.append(f"| {score_text}")
+        logger.info(" ".join(parts))
+
+    def _load_checkpoint_file(self, path):
+        load_kwargs = {"map_location": self.device}
+        try:
+            return torch.load(path, weights_only=True, **load_kwargs)
+        except TypeError:
+            return torch.load(path, **load_kwargs)
+
+    def _build_checkpoint_payload(
+        self,
+        *,
+        modules: Mapping[str, nn.Module] | None = None,
+        extra_state: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {"method": self.solver_name}
+        for name, module in (modules or {}).items():
+            payload[name] = module.state_dict()
+        if extra_state:
+            payload.update(extra_state)
+        return payload
+
+    def _save_named_modules_checkpoint(
+        self,
+        path,
+        *,
+        modules: Mapping[str, nn.Module],
+        extra_state: Mapping[str, Any] | None = None,
+    ):
+        payload = self._build_checkpoint_payload(modules=modules, extra_state=extra_state)
+        torch.save(payload, path)
+        logger.info("%s checkpoint saved to %s", self._solver_display_name(), path)
+
+    def _load_named_modules_checkpoint(
+        self,
+        path,
+        *,
+        modules: Mapping[str, nn.Module],
+        strict: bool = True,
+        fallback_key: str | None = None,
+    ):
+        checkpoint = self._load_checkpoint_file(path)
+
+        if isinstance(checkpoint, dict):
+            for name, module in modules.items():
+                state_dict = None
+                if name in checkpoint:
+                    state_dict = checkpoint[name]
+                elif len(modules) == 1:
+                    if fallback_key is not None and fallback_key in checkpoint:
+                        state_dict = checkpoint[fallback_key]
+                    elif "model" in checkpoint:
+                        state_dict = checkpoint["model"]
+                    else:
+                        state_dict = checkpoint
+                if state_dict is None:
+                    raise ValueError(f"Checkpoint '{path}' is missing key '{name}'.")
+                module.load_state_dict(state_dict, strict=strict)
+        else:
+            if len(modules) != 1:
+                raise ValueError(
+                    f"Checkpoint '{path}' does not contain named module states required by {self._solver_display_name()}."
+                )
+            next(iter(modules.values())).load_state_dict(checkpoint, strict=strict)
+
+        logger.info("%s checkpoint loaded from %s", self._solver_display_name(), path)
+        return checkpoint
+
+    def _log_best_checkpoint_loaded(self, metric_name: str = "Score"):
+        logger.info(
+            "Loaded best %s checkpoint from %s with %s=%.2f%%",
+            self._solver_display_name(),
+            self._best_ckpt_path,
+            metric_name,
+            self._best_metric,
+        )
+
+    def _log_training_complete(self, *, best_score: float | None = None, score_name: str = "Acc"):
+        if best_score is None:
+            logger.info("%s training finished.", self._solver_display_name())
+            return
+        logger.info(
+            "%s training finished. Best %s=%.2f%%",
+            self._solver_display_name(),
+            score_name,
+            best_score,
+        )
 
     def _setup_num_classes(self):
         """
@@ -424,11 +596,7 @@ class BaseSolver(ABC):
         Override if you have multiple components to save.
         """
         if hasattr(self, 'net'):
-            torch.save({
-                "method": "base",
-                "model": self.net.state_dict(),
-            }, path)
-            logger.info(f"Model saved to {path}")
+            self._save_named_modules_checkpoint(path, modules={"model": self.net})
         else:
             raise NotImplementedError(
                 "Subclass must either set self.net or override save_checkpoint()"
@@ -441,18 +609,38 @@ class BaseSolver(ABC):
         Override if you have multiple components to load.
         """
         if hasattr(self, 'net'):
-            checkpoint = torch.load(path, map_location=self.device)
-            
-            if "model" in checkpoint:
-                self.net.load_state_dict(checkpoint["model"])
-            else:
-                self.net.load_state_dict(checkpoint)
-                
-            logger.info(f"Model loaded from {path}")
+            self._load_named_modules_checkpoint(
+                path,
+                modules={"model": self.net},
+                strict=True,
+                fallback_key="model",
+            )
         else:
             raise NotImplementedError(
                 "Subclass must either set self.net or override load_checkpoint()"
             )
+
+    def _maybe_save_best(self, metric: float, epoch: int) -> bool:
+        """
+        Save checkpoint only when:
+        - epoch >= self._save_start_epoch
+        - metric strictly improves
+        """
+        if int(epoch) < int(self._save_start_epoch):
+            return False
+        if float(metric) <= float(self._best_metric):
+            return False
+        self._best_metric = float(metric)
+        self._best_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        self.save_checkpoint(self._best_ckpt_path)
+        self._best_saved = True
+        return True
+
+    def _load_best_checkpoint_if_available(self) -> bool:
+        if self._best_saved and self._best_ckpt_path.exists():
+            self.load_checkpoint(self._best_ckpt_path)
+            return True
+        return False
 
 
 @register_solver("sourceonly")
@@ -487,7 +675,8 @@ class SourceOnlySolver(BaseSolver):
             weight_decay=5e-4
         )
         
-        logger.info(f"Start training for {max_epochs} epochs...")
+        logger.info("%s training | epochs=%d", self._solver_display_name(), max_epochs)
+        best_acc = float("-inf")
         
         for epoch in range(max_epochs):
             self.net.train()
@@ -510,6 +699,17 @@ class SourceOnlySolver(BaseSolver):
                 loss_meter.update(loss.item())
             
             acc = self.evaluate()
-            logger.info(f"Epoch {epoch+1} finished. Loss: {loss_meter.avg:.4f}, Acc: {acc:.2f}%")
-        
-        logger.info("Training finished.")
+            if acc > best_acc:
+                best_acc = acc
+            self._maybe_save_best(acc, epoch + 1)
+            self._log_epoch_summary(
+                epoch + 1,
+                max_epochs,
+                metrics={"loss": loss_meter.avg},
+                score=acc,
+                best_score=best_acc,
+                score_name="Acc",
+            )
+        if self._load_best_checkpoint_if_available():
+            self._log_best_checkpoint_loaded("Acc")
+        self._log_training_complete(best_score=best_acc, score_name="Acc")

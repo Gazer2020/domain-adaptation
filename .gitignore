@@ -17,6 +17,7 @@ wheels/
 .agent
 .cursor
 .ipynb_checkpoints
+AGENT.md
 
 # Keep directory structure only (track README.md, ignore all other contents)
 data/**

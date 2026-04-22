@@ -485,12 +485,8 @@ class RGRSolver(BaseSolver):
     def _setup_compiled_student_forward(self):
         if self._student_forward_compiled:
             return
-
-        def _student_forward(x: Optional[torch.Tensor], h_shared: Optional[torch.Tensor]):
-            return self.net.forward_relation_logits(x=x, h_shared=h_shared)
-
         self._forward_logits_student = self._compile_callable(
-            _student_forward,
+            self.net.forward_relation_logits,
             "rgr_student.forward_relation_logits",
         )
         self._student_forward_compiled = True
@@ -498,17 +494,21 @@ class RGRSolver(BaseSolver):
     def _setup_target_tensor_augment(self):
         perf_cfg = getattr(self.config, "performance", None)
         aug_cfg = getattr(perf_cfg, "augmentation", None) if perf_cfg is not None else None
-        enabled = bool(getattr(aug_cfg, "target_tensor_v2", False)) if aug_cfg is not None else False
+        target_tensor_v2_cfg = getattr(aug_cfg, "target_tensor_v2", "auto") if aug_cfg is not None else "auto"
+        enabled = self._resolve_auto_bool(
+            target_tensor_v2_cfg,
+            auto_value=(self.device.type == "cuda"),
+        )
         if not enabled:
             return
-        if not bool(getattr(self.config.method, "strong_aug", False)):
+        if not self._is_truthy(getattr(self.config.method, "strong_aug", False)):
             logger.warning(
                 "target_tensor_v2 requested, but method.strong_aug=False. "
                 "Falling back to dataloader transforms."
             )
             return
         color_space_cfg = getattr(self.config.method, "color_space", None)
-        if color_space_cfg is not None and bool(getattr(color_space_cfg, "enabled", False)):
+        if color_space_cfg is not None and self._is_truthy(getattr(color_space_cfg, "enabled", False)):
             logger.warning(
                 "target_tensor_v2 requested with color_space.enabled=True, which is unsupported. "
                 "Falling back to dataloader transforms."
@@ -699,24 +699,22 @@ class RGRSolver(BaseSolver):
             model.train(was_training)
 
     def save_checkpoint(self, path):
-        torch.save(
-            {
-                "method": "rgr",
-                "student": self.net.state_dict(),
-                "ema": self.ema_net.state_dict(),
-            },
+        self._save_named_modules_checkpoint(
             path,
+            modules={
+                "student": self.net,
+                "ema": self.ema_net,
+            },
         )
-        logger.info(f"RGR checkpoint saved to {path}")
 
     def load_checkpoint(self, path):
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = self._load_checkpoint_file(path)
         student_state = checkpoint["student"] if isinstance(checkpoint, dict) and "student" in checkpoint else checkpoint
         ema_state = checkpoint["ema"] if isinstance(checkpoint, dict) and "ema" in checkpoint else student_state
 
         self.net.load_state_dict(student_state, strict=False)
         self.ema_net.load_state_dict(ema_state, strict=False)
-        logger.info(f"RGR checkpoint loaded from {path}")
+        logger.info("%s checkpoint loaded from %s", self._solver_display_name(), path)
 
     def train(self):
         base_lr = float(self.config.method.lr)
@@ -745,10 +743,7 @@ class RGRSolver(BaseSolver):
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
         self._setup_compiled_student_forward()
-        best_acc = 0.0
-        best_save_acc = -1e18
-        best_path = Path("checkpoints") / "best_rgr.pth"
-        best_path.parent.mkdir(parents=True, exist_ok=True)
+        best_acc = float("-inf")
 
         global_step = 0
         logger.info(
@@ -844,21 +839,28 @@ class RGRSolver(BaseSolver):
             acc = self.evaluate()
             if acc > best_acc:
                 best_acc = acc
-            if epoch + 1 > self.save_ckpt_after_epoch and acc > best_save_acc:
-                best_save_acc = acc
-                self.save_checkpoint(best_path)
+            if epoch + 1 > self.save_ckpt_after_epoch:
+                self._maybe_save_best(acc, epoch + 1)
 
-            logger.info(
-                f"RGR {epoch+1}/{self.total_epochs} | "
-                f"src={metrics['src']:.4f} "
-                f"rnode={metrics['rnode']:.4f} "
-                f"rconf={metrics['rconf']:.4f} "
-                f"conf={metrics['conf']:.3f} "
-                f"total={metrics['total']:.4f} | "
-                f"rmp={ramp:.2f} crmp={consistency_ramp:.2f} | "
-                f"Acc={acc:.2f}% (best={best_acc:.2f}%)"
+            self._log_epoch_summary(
+                epoch + 1,
+                self.total_epochs,
+                metrics={
+                    "src": metrics["src"],
+                    "rnode": metrics["rnode"],
+                    "rconf": metrics["rconf"],
+                    "conf": (metrics["conf"], ".3f"),
+                    "total": metrics["total"],
+                },
+                extras={
+                    "rmp": (ramp, ".2f"),
+                    "crmp": (consistency_ramp, ".2f"),
+                },
+                score=acc,
+                best_score=best_acc,
+                score_name="Acc",
             )
 
-        if best_path.exists():
-            self.load_checkpoint(best_path)
-            logger.info(f"Loaded best RGR checkpoint from {best_path} with Acc={best_save_acc:.2f}%")
+        if self._load_best_checkpoint_if_available():
+            self._log_best_checkpoint_loaded("Acc")
+        self._log_training_complete(best_score=best_acc, score_name="Acc")

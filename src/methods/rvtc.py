@@ -107,8 +107,8 @@ class RVTCSolver(BaseSolver):
 
     def build_model(self):
         kin_hidden = int(self.config.method.get("kin_hidden", 512))
-        pretrained = bool(self.config.method.get("pretrained", True))
-        freeze_backbone = bool(self.config.method.get("freeze_backbone", False))
+        pretrained = self._is_truthy(self.config.method.get("pretrained", True))
+        freeze_backbone = self._is_truthy(self.config.method.get("freeze_backbone", False))
         self.net = RVTCNetV2(
             num_classes=self.num_classes,
             kin_hidden=kin_hidden,
@@ -118,7 +118,7 @@ class RVTCSolver(BaseSolver):
 
         self.lambda_kin = float(self.config.method.get("lambda_kin", 0.5))
         self.lambda_ent = float(self.config.method.get("lambda_ent", 0.1))
-        self.kin_on_source = bool(self.config.method.get("kin_on_source", True))
+        self.kin_on_source = self._is_truthy(self.config.method.get("kin_on_source", True))
         rd_k = self.config.method.get("kin_ramp_denom", None)
         rd_e = self.config.method.get("ent_ramp_denom", None)
         max_ep = float(self.config.method.epochs)
@@ -149,7 +149,7 @@ class RVTCSolver(BaseSolver):
         weight_decay = float(self.config.method.get("weight_decay", 1e-4))
         backbone_lr_mult = float(self.config.method.get("backbone_lr_mult", 0.1))
 
-        freeze_backbone = bool(self.config.method.get("freeze_backbone", False))
+        freeze_backbone = self._is_truthy(self.config.method.get("freeze_backbone", False))
         fc_params = list(self.net.backbone.fc.parameters())
         kin_params = list(self.net.kinematic_head.parameters())
         backbone_non_fc = [
@@ -183,10 +183,7 @@ class RVTCSolver(BaseSolver):
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-        best_acc = 0.0
-        save_dir = Path("checkpoints")
-        save_dir.mkdir(parents=True, exist_ok=True)
-        best_path = save_dir / "best_rvtc.pth"
+        best_acc = float("-inf")
 
         global_step = 0
         logger.info(
@@ -251,11 +248,25 @@ class RVTCSolver(BaseSolver):
             acc = self.evaluate()
             if acc > best_acc:
                 best_acc = acc
-                self.save_checkpoint(best_path)
-            logger.info(
-                f"Epoch {epoch + 1}/{max_epochs} | task={meters['task'].avg:.4f} "
-                f"kin_s={meters['kin_s'].avg:.4f} kin_t={meters['kin_t'].avg:.4f} ent={meters['ent'].avg:.4f} "
-                f"w_kin={w_kin:.4f} w_ent={w_ent:.4f} | Acc={acc:.2f}% (best={best_acc:.2f}%)"
+            self._maybe_save_best(acc, epoch + 1)
+            self._log_epoch_summary(
+                epoch + 1,
+                max_epochs,
+                metrics={
+                    "task": meters["task"].avg,
+                    "kin_s": meters["kin_s"].avg,
+                    "kin_t": meters["kin_t"].avg,
+                    "ent": meters["ent"].avg,
+                },
+                extras={
+                    "w_kin": w_kin,
+                    "w_ent": w_ent,
+                },
+                score=acc,
+                best_score=best_acc,
+                score_name="Acc",
             )
 
-        logger.info("RVTC training finished.")
+        if self._load_best_checkpoint_if_available():
+            self._log_best_checkpoint_loaded("Acc")
+        self._log_training_complete(best_score=best_acc, score_name="Acc")

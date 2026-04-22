@@ -1,5 +1,6 @@
 import io
 import logging
+import math
 import os
 import pickle
 from pathlib import Path
@@ -11,38 +12,11 @@ from torch.utils.data import DataLoader, Dataset
 from PIL import Image, __version__ as PIL_VERSION
 import numpy as np
 from utils import get_device
+from utils.config import is_truthy, resolve_auto_bool, resolve_int_or_auto
 
 logger = logging.getLogger(__name__)
 
 _PILLOW_RUNTIME_LOGGED = False
-
-
-def _is_truthy(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
-
-
-def _resolve_auto_bool(value, auto_value: bool) -> bool:
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered == "auto":
-            return auto_value
-        if lowered in {"1", "true", "yes", "on"}:
-            return True
-        if lowered in {"0", "false", "no", "off"}:
-            return False
-    return bool(value)
-
-
-def _resolve_int_or_auto(value, auto_value: int) -> int:
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered == "auto":
-            return int(auto_value)
-    return int(value)
 
 
 def _class_sort_key(name: str):
@@ -737,17 +711,17 @@ def get_dataloader(config):
     dl_perf_cfg = getattr(perf_cfg, "dataloader", None) if perf_cfg is not None else None
     aug_perf_cfg = getattr(perf_cfg, "augmentation", None) if perf_cfg is not None else None
     target_tensor_v2_cfg = (
-        bool(getattr(aug_perf_cfg, "target_tensor_v2", False))
+        getattr(aug_perf_cfg, "target_tensor_v2", "auto")
         if aug_perf_cfg is not None
-        else False
+        else "auto"
     )
     # Only pin memory when CUDA is actually the selected device.
     device_str = getattr(config, "device", "auto")
     is_cuda_device = get_device(device_str) == "cuda"
     pin_memory_cfg = getattr(perf_cfg, "pin_memory", "auto") if perf_cfg is not None else "auto"
-    pin_memory = is_cuda_device if str(pin_memory_cfg).lower() == "auto" else _is_truthy(pin_memory_cfg)
+    pin_memory = is_cuda_device if str(pin_memory_cfg).lower() == "auto" else is_truthy(pin_memory_cfg)
     non_blocking_transfer = (
-        bool(getattr(perf_cfg, "non_blocking_transfer", True))
+        is_truthy(getattr(perf_cfg, "non_blocking_transfer", True))
         if perf_cfg is not None
         else True
     )
@@ -757,7 +731,7 @@ def get_dataloader(config):
         )
 
     persistent_workers_default = (
-        bool(getattr(dl_perf_cfg, "persistent_workers", True))
+        is_truthy(getattr(dl_perf_cfg, "persistent_workers", True))
         if dl_perf_cfg is not None
         else True
     )
@@ -767,20 +741,25 @@ def get_dataloader(config):
         else 4
     )
 
-    default_source_workers = max(0, int(round(float(num_workers) * 0.75)))
-    default_target_workers = max(0, int(2 * num_workers - default_source_workers))
-    default_test_workers = default_source_workers
+    if num_workers <= 0:
+        default_source_workers = 0
+        default_target_workers = 0
+        default_test_workers = 0
+    else:
+        default_source_workers = max(1, int(math.ceil(float(num_workers) / 2.0)))
+        default_target_workers = max(1, int(num_workers - default_source_workers))
+        default_test_workers = min(default_source_workers, 2)
 
     if dl_perf_cfg is not None:
-        num_workers_source = _resolve_int_or_auto(
+        num_workers_source = resolve_int_or_auto(
             getattr(dl_perf_cfg, "num_workers_source", "auto"),
             default_source_workers,
         )
-        num_workers_target = _resolve_int_or_auto(
+        num_workers_target = resolve_int_or_auto(
             getattr(dl_perf_cfg, "num_workers_target", "auto"),
             default_target_workers,
         )
-        num_workers_test = _resolve_int_or_auto(
+        num_workers_test = resolve_int_or_auto(
             getattr(dl_perf_cfg, "num_workers_test", "auto"),
             default_test_workers,
         )
@@ -790,17 +769,17 @@ def get_dataloader(config):
         num_workers_test = default_test_workers
 
     persistent_workers_source = (
-        bool(getattr(dl_perf_cfg, "persistent_workers_source", persistent_workers_default))
+        is_truthy(getattr(dl_perf_cfg, "persistent_workers_source", persistent_workers_default))
         if dl_perf_cfg is not None
         else persistent_workers_default
     )
     persistent_workers_target = (
-        bool(getattr(dl_perf_cfg, "persistent_workers_target", persistent_workers_default))
+        is_truthy(getattr(dl_perf_cfg, "persistent_workers_target", persistent_workers_default))
         if dl_perf_cfg is not None
         else persistent_workers_default
     )
     persistent_workers_test = (
-        bool(getattr(dl_perf_cfg, "persistent_workers_test", persistent_workers_target))
+        is_truthy(getattr(dl_perf_cfg, "persistent_workers_test", persistent_workers_target))
         if dl_perf_cfg is not None
         else persistent_workers_target
     )
@@ -822,7 +801,7 @@ def get_dataloader(config):
     )
 
     limit_worker_threads = (
-        bool(getattr(dl_perf_cfg, "limit_worker_threads", True))
+        is_truthy(getattr(dl_perf_cfg, "limit_worker_threads", True))
         if dl_perf_cfg is not None
         else True
     )
@@ -899,7 +878,7 @@ def get_dataloader(config):
     )
 
     # Transforms
-    strong_train_aug = getattr(config.method, "strong_train_aug", False)
+    strong_train_aug = is_truthy(getattr(config.method, "strong_train_aug", False))
     source_aug_cfg = getattr(config.method, "source_aug", None)
     target_aug_cfg = getattr(config.method, "target_aug", None)
     clipart_focus_cfg = getattr(config.method, "clipart_focus", None)
@@ -909,22 +888,22 @@ def get_dataloader(config):
     clipart_eval_pre = []
     if clipart_focus_cfg is not None:
         auto_enable = bool(is_officehome_clipart_target)
-        clipart_focus_enabled = _resolve_auto_bool(getattr(clipart_focus_cfg, "enabled", False), auto_enable)
+        clipart_focus_enabled = resolve_auto_bool(getattr(clipart_focus_cfg, "enabled", False), auto_enable)
         if clipart_focus_enabled and is_officehome_clipart_target:
             cropper = TightCropByWhiteThreshold(
                 white_threshold=int(getattr(clipart_focus_cfg, "white_threshold", 245)),
                 padding=int(getattr(clipart_focus_cfg, "bbox_padding", 2)),
                 min_foreground_pixels=int(getattr(clipart_focus_cfg, "min_foreground_pixels", 10)),
             )
-            if _is_truthy(getattr(clipart_focus_cfg, "apply_on_train", True)):
+            if is_truthy(getattr(clipart_focus_cfg, "apply_on_train", True)):
                 train_prob = float(getattr(clipart_focus_cfg, "train_prob", 0.8))
                 clipart_train_pre.append(RandomApplyTransform(cropper, p=train_prob))
-            if _is_truthy(getattr(clipart_focus_cfg, "apply_on_eval", True)):
+            if is_truthy(getattr(clipart_focus_cfg, "apply_on_eval", True)):
                 clipart_eval_pre.append(cropper)
 
     # Optional color-space stacking (used by `dcfm_cs`).
     color_space_cfg = getattr(config.method, "color_space", None)
-    use_color_space = color_space_cfg is not None and bool(getattr(color_space_cfg, "enabled", False))
+    use_color_space = color_space_cfg is not None and is_truthy(getattr(color_space_cfg, "enabled", False))
 
     if use_color_space:
         mode = str(getattr(color_space_cfg, "mode", "multi")).lower()
@@ -1019,10 +998,11 @@ def get_dataloader(config):
         )
     
     # Strong Augmentation for DGA-Revamp
-    strong_aug_enabled = getattr(config.method, "strong_aug", False)
+    strong_aug_enabled = is_truthy(getattr(config.method, "strong_aug", False))
     target_transform = train_transform
 
-    target_tensor_v2_enabled = bool(target_tensor_v2_cfg)
+    target_tensor_v2_auto = is_cuda_device and method_name == "rgr"
+    target_tensor_v2_enabled = resolve_auto_bool(target_tensor_v2_cfg, target_tensor_v2_auto)
     if target_tensor_v2_enabled and method_name != "rgr":
         logger.warning(
             "performance.augmentation.target_tensor_v2=True is currently wired for method=rgr only; "

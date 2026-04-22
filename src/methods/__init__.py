@@ -19,6 +19,7 @@ _SOLVER_MODULES = {
     "cosda": "methods.cosda",
     "rtda": "methods.rtda",
     "dcfm": "methods.dcfm",
+    "factda": "methods.factda",
     "dare": "methods.dare",
     "rvtc": "methods.rvtc",
     "rgr": "methods.rgr",
@@ -50,7 +51,7 @@ def list_solvers() -> list:
     """
     List available solver names without importing all solver modules.
     """
-    return list(_SOLVER_MODULES.keys())
+    return sorted(_SOLVER_MODULES.keys())
 
 
 __all__ = [

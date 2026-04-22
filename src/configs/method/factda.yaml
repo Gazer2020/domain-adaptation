@@ -1,0 +1,32 @@
+name: factda
+
+# Optim
+lr: 0.001
+optimizer: sgd
+momentum: 0.9
+nesterov: true
+weight_decay: 0.0005
+backbone_lr_mult: 1.0
+
+# Training
+epochs: 20
+epoch_steps_mode: max
+backbone: resnet50
+label_smoothing: 0.0
+grad_clip: 0.0
+
+# FACT-style co-teacher
+teacher_momentum: 0.9995
+temperature: 10.0
+lambda_consistency: 2.0
+consistency_warmup_epochs: 5.0
+
+# DA adaptation terms
+lambda_target_consistency: 1.0
+lambda_target_entropy: 0.0
+
+# Fourier amplitude mix (lambda ~ U(0, amplitude_mix_strength))
+amplitude_mix_strength: 0.2
+
+setting: csda
+supported_settings: [csda, msda]

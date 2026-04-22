@@ -253,14 +253,14 @@ class DARESolver(BaseSolver):
         self.relation_label_smoothing = float(m.get("relation_label_smoothing", 0.10))
         self.pseudo_conf_power = float(m.get("pseudo_conf_power", 2.0))
         self.pseudo_start_epoch = int(m.get("pseudo_start_epoch", 6))
-        self.enable_confidence_weighting = bool(m.get("enable_confidence_weighting", True))
+        self.enable_confidence_weighting = self._is_truthy(m.get("enable_confidence_weighting", True))
         self.refresh_source_prototypes_each_epoch = bool(
             m.get("refresh_source_prototypes_each_epoch", True)
         )
-        self.enable_relation_forward = bool(m.get("enable_relation_forward", True))
-        self.enable_source_relation_loss = bool(m.get("enable_source_relation_loss", True))
-        self.enable_ema_pseudo = bool(m.get("enable_ema_pseudo", True))
-        self.enable_proto_loss = bool(m.get("enable_proto_loss", True))
+        self.enable_relation_forward = self._is_truthy(m.get("enable_relation_forward", True))
+        self.enable_source_relation_loss = self._is_truthy(m.get("enable_source_relation_loss", True))
+        self.enable_ema_pseudo = self._is_truthy(m.get("enable_ema_pseudo", True))
+        self.enable_proto_loss = self._is_truthy(m.get("enable_proto_loss", True))
 
         self.T_sem = float(m.get("T_sem", 0.8))
         self.total_epochs = int(m.get("epochs", 20))
@@ -432,6 +432,8 @@ class DARESolver(BaseSolver):
             self.num_classes,
             device=self.device,
         )
+        feat_sums_flat = feat_sums.view(-1, model.feat_dim)
+        counts_flat = counts.view(-1)
 
         for src_imgs, src_labels, src_dom in self.source_loader:
             src_imgs = self._to_device(src_imgs)
@@ -442,46 +444,41 @@ class DARESolver(BaseSolver):
                 h = model.extract_features(src_imgs)
                 h_shared = model.normalize_features(h)
 
-            for dom_id in src_dom.unique().tolist():
-                dom_mask = src_dom == dom_id
-                feats_dom = h_shared[dom_mask]
-                labels_dom = src_labels[dom_mask]
-                for cls_id in labels_dom.unique().tolist():
-                    cls_mask = labels_dom == cls_id
-                    feat_sums[dom_id, cls_id] += feats_dom[cls_mask].sum(dim=0)
-                    counts[dom_id, cls_id] += float(cls_mask.sum().item())
+            flat_index = src_dom.long() * self.num_classes + src_labels.long()
+            feat_sums_flat.index_add_(0, flat_index, h_shared)
+            counts_flat.index_add_(
+                0,
+                flat_index,
+                torch.ones_like(flat_index, dtype=counts_flat.dtype),
+            )
 
         model.reset_source_prototypes()
         valid = counts > 0
+        safe_counts = counts.clamp_min(1.0).unsqueeze(-1)
+        prototypes = feat_sums / safe_counts
+        prototypes = torch.where(valid.unsqueeze(-1), prototypes, torch.zeros_like(prototypes))
         model.src_proto_inited.copy_(valid)
-        for dom_id in range(self.num_source_domains):
-            for cls_id in range(self.num_classes):
-                if bool(valid[dom_id, cls_id].item()):
-                    model.src_prototypes[dom_id, cls_id].copy_(
-                        feat_sums[dom_id, cls_id] / counts[dom_id, cls_id]
-                    )
+        model.src_prototypes.copy_(prototypes)
 
         model.train(was_training)
 
     def save_checkpoint(self, path):
-        torch.save(
-            {
-                "method": "dare",
-                "student": self.net.state_dict(),
-                "ema": self.ema_net.state_dict(),
-            },
+        self._save_named_modules_checkpoint(
             path,
+            modules={
+                "student": self.net,
+                "ema": self.ema_net,
+            },
         )
-        logger.info(f"DARE checkpoint saved to {path}")
 
     def load_checkpoint(self, path):
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = self._load_checkpoint_file(path)
         student_state = checkpoint["student"] if isinstance(checkpoint, dict) and "student" in checkpoint else checkpoint
         ema_state = checkpoint["ema"] if isinstance(checkpoint, dict) and "ema" in checkpoint else student_state
 
         self.net.load_state_dict(student_state, strict=False)
         self.ema_net.load_state_dict(ema_state, strict=False)
-        logger.info(f"DARE checkpoint loaded from {path}")
+        logger.info("%s checkpoint loaded from %s", self._solver_display_name(), path)
 
     def train(self):
         base_lr = float(self.config.method.lr)
@@ -509,10 +506,7 @@ class DARESolver(BaseSolver):
             return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        best_acc = 0.0
-        best_save_acc = -1e18
-        best_path = Path("checkpoints") / "best_dare.pth"
-        best_path.parent.mkdir(parents=True, exist_ok=True)
+        best_acc = float("-inf")
 
         global_step = 0
         logger.info(
@@ -639,24 +633,29 @@ class DARESolver(BaseSolver):
             acc = self.evaluate()
             if acc > best_acc:
                 best_acc = acc
-            if epoch + 1 > self.save_ckpt_after_epoch and acc > best_save_acc:
-                best_save_acc = acc
-                self.save_checkpoint(best_path)
+            if epoch + 1 > self.save_ckpt_after_epoch:
+                self._maybe_save_best(acc, epoch + 1)
 
-            logger.info(
-                f"DARE {epoch+1}/{self.total_epochs} | "
-                f"task={meters['task'].avg:.4f} "
-                f"rel={meters['rel'].avg:.4f} "
-                f"proto={meters['proto'].avg:.4f} "
-                f"pseudo={meters['pseudo'].avg:.4f} "
-                f"qconf={meters['conf'].avg:.3f} "
-                f"pwt={meters['pwt'].avg:.3f} "
-                f"rmax={meters['rmax'].avg:.3f} "
-                f"dlogit={meters['dlogit'].avg:.4f} "
-                f"total={meters['total'].avg:.4f} | "
-                f"rmp={ramp:.2f} | Acc={acc:.2f}% (best={best_acc:.2f}%)"
+            self._log_epoch_summary(
+                epoch + 1,
+                self.total_epochs,
+                metrics={
+                    "task": meters["task"].avg,
+                    "rel": meters["rel"].avg,
+                    "proto": meters["proto"].avg,
+                    "pseudo": meters["pseudo"].avg,
+                    "qconf": (meters["conf"].avg, ".3f"),
+                    "pwt": (meters["pwt"].avg, ".3f"),
+                    "rmax": (meters["rmax"].avg, ".3f"),
+                    "dlogit": meters["dlogit"].avg,
+                    "total": meters["total"].avg,
+                },
+                extras={"rmp": (ramp, ".2f")},
+                score=acc,
+                best_score=best_acc,
+                score_name="Acc",
             )
 
-        if best_path.exists():
-            self.load_checkpoint(best_path)
-            logger.info(f"Loaded best DARE checkpoint from {best_path} with Acc={best_save_acc:.2f}%")
+        if self._load_best_checkpoint_if_available():
+            self._log_best_checkpoint_loaded("Acc")
+        self._log_training_complete(best_score=best_acc, score_name="Acc")

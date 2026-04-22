@@ -150,8 +150,7 @@ class CrossEntropyLabelSmooth(nn.Module):
 
     def forward(self, inputs, targets):
         log_probs = self.logsoftmax(inputs)
-        targets = torch.zeros(log_probs.size()).scatter_(1, targets.unsqueeze(1).cpu(), 1)
-        if self.use_gpu: targets = targets.cuda()
+        targets = torch.zeros_like(log_probs).scatter_(1, targets.unsqueeze(1), 1)
         targets = (1 - self.epsilon) * targets + self.epsilon / self.num_classes
         loss = (- targets * log_probs).sum(dim=1)
         if self.reduction:
@@ -211,24 +210,13 @@ def ce_criterion(num_classes, config, hard_label, output, domain):
         return CrossEntropyLabelSmooth(num_classes=num_classes, epsilon=0.0, reduction=True)(output, hard_label)
 
 def CalculateMean(features, labels, class_num):
-    N = features.size(0)
     C = class_num
     A = features.size(1)
-
-    avg_CxA = torch.zeros(C, A).cuda()
-    NxCxFeatures = features.view(N, 1, A).expand(N, C, A)
-
-    onehot = torch.zeros(N, C).cuda()
-    onehot.scatter_(1, labels.view(-1, 1), 1)
-    NxCxA_onehot = onehot.view(N, C, 1).expand(N, C, A)
-
-    Amount_CxA = NxCxA_onehot.sum(0)
-    Amount_CxA[Amount_CxA == 0] = 1.0
-
-    for c in range(class_num):
-        c_temp = NxCxFeatures[:, c, :].mul(NxCxA_onehot[:, c, :])
-        c_temp = torch.sum(c_temp, dim=0)
-        avg_CxA[c] = c_temp / Amount_CxA[c]
+    avg_CxA = features.new_zeros(C, A)
+    counts = features.new_zeros(C)
+    avg_CxA.index_add_(0, labels, features)
+    counts.index_add_(0, labels, torch.ones(labels.size(0), device=labels.device, dtype=features.dtype))
+    avg_CxA = avg_CxA / counts.clamp_min(1.0).unsqueeze(1)
     return avg_CxA.detach()
 
 def MO(mean_source_up1, features_target1, hard_label_bank, class_num):
@@ -273,13 +261,11 @@ class COSDASolver(BaseSolver):
             mlp_dropout=self.config.method.mlp_dropout,
             bn_type=self.config.method.bn_type
         ).to(self.device)
-
-        enable_compile = bool(self.config.method.get("enable_compile", True))
-        if enable_compile and hasattr(torch, 'compile') and self.device.type != 'mps':
-            try:
-                self.net = torch.compile(self.net)
-            except Exception as e:
-                logger.warning(f"torch.compile is unavailable for COSDA in this runtime, fallback to eager mode: {e}")
+        self._net_forward = self.net
+        self._backbone_forward = self.net.backbone_layer
+        if self.compile_enabled:
+            self._net_forward = self._compile_module(self.net, "cosda.net")
+            self._backbone_forward = self._compile_module(self.net.backbone_layer, "cosda.backbone")
 
     def _get_trainable_params(self):
         param_group = []
@@ -322,7 +308,7 @@ class COSDASolver(BaseSolver):
             
             with torch.no_grad():
                 with self._auto_cast():
-                    rois = self.net.backbone_layer(images)
+                    rois = self._backbone_forward(images)
                     features_temp, _ = self.net.feat_embed_layer(rois)
                 memory_source_features[index] = features_temp
                 memory_source_labels[index] = label
@@ -352,7 +338,7 @@ class COSDASolver(BaseSolver):
             
             with torch.no_grad():
                 with self._auto_cast():
-                    rois = self.net.backbone_layer(images)
+                    rois = self._backbone_forward(images)
                     features_temp, _ = self.net.feat_embed_layer(rois)
                     pred_cls = self.net.class_layer(features_temp, apply_softmax=True)
                 embed_feat_bank[index] = features_temp
@@ -428,7 +414,7 @@ class COSDASolver(BaseSolver):
         memory_source_labels = memory_source_labels[batch_size:]
         
         with torch.no_grad():
-            rois = self.net.backbone_layer(train_s)
+            rois = self._backbone_forward(train_s)
             features_temp, _ = self.net.feat_embed_layer(rois)
             
         memory_source_features = torch.cat((memory_source_features, features_temp), dim=0)
@@ -456,6 +442,7 @@ class COSDASolver(BaseSolver):
         max_len = max(len_source, len_target)
         
         memory_source_features, memory_source_labels = None, None
+        best_acc = float("-inf")
         
         for epoch in range(max_epochs):
             if epoch == self.config.method.warm_up_epoch:
@@ -500,7 +487,7 @@ class COSDASolver(BaseSolver):
                 
                 # Source path
                 with self._auto_cast():
-                    rois_s, v_s, rois_c_s, y_s, intervention_s, int_rois_s, int_v_s, int_y_s = self.net(train_s, apply_softmax=False)
+                    rois_s, v_s, rois_c_s, y_s, intervention_s, int_rois_s, int_v_s, int_y_s = self._net_forward(train_s, apply_softmax=False)
                     loss_beta_s = self.forward_BETA_ce(v_s, y_s, intervention_s, int_v_s, int_y_s, target_s, domain='source')
                     loss_dict.update(loss_beta_s)
                 
@@ -508,7 +495,7 @@ class COSDASolver(BaseSolver):
                     # Target path
                     self.net.train()
                     with self._auto_cast():
-                        rois_t, v_t, rois_c_t, y_t, intervention_t, int_rois_t, int_v_t, int_y_t = self.net(train_t, apply_softmax=False)
+                        rois_t, v_t, rois_c_t, y_t, intervention_t, int_rois_t, int_v_t, int_y_t = self._net_forward(train_t, apply_softmax=False)
                         hard_label_bank = self.get_pseudo_label_batch(rois_c_t, all_proto, self.known_class)
                         hard_label_bank[hard_label_bank >= self.known_class] = self.known_class
                         
@@ -541,7 +528,20 @@ class COSDASolver(BaseSolver):
                 total_loss_meter.update(loss_all.item())
                 
             acc = self.evaluate()
-            logger.info(f"Epoch {epoch+1} finished. Loss: {total_loss_meter.avg:.4f}, Target H-Score/Acc: {acc:.2f}%")
+            if acc > best_acc:
+                best_acc = acc
+            self._maybe_save_best(acc, epoch + 1)
+            self._log_epoch_summary(
+                epoch + 1,
+                max_epochs,
+                metrics={"loss": total_loss_meter.avg},
+                score=acc,
+                best_score=best_acc,
+                score_name="Score",
+            )
+        if self._load_best_checkpoint_if_available():
+            self._log_best_checkpoint_loaded("Score")
+        self._log_training_complete(best_score=best_acc, score_name="Score")
 
     def _set_train_mode(self):
         self.net.train()
@@ -550,7 +550,7 @@ class COSDASolver(BaseSolver):
         self.net.eval()
 
     def forward_for_eval(self, imgs):
-        _, _, _, y, _, _, _, _ = self.net(imgs, apply_softmax=False)
+        _, _, _, y, _, _, _, _ = self._net_forward(imgs, apply_softmax=False)
         return y
 
     def predict_with_rejection(self, preds: torch.Tensor, probs: torch.Tensor):

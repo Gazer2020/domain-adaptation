@@ -52,7 +52,7 @@ class Accumulator(dict):
 
 
 def variable_to_numpy(x):
-    return x.cpu().data.numpy()
+    return x.detach().cpu().numpy()
 
 
 def to_np(x):
@@ -403,7 +403,7 @@ class RTDASolver(BaseSolver):
         optimizer_cls = OptimWithSheduler(optim.SGD(self.cls.parameters(), lr=learning_rate * 10, weight_decay=5e-4, momentum=0.9, nesterov=True), scheduler)
         optimizer_discriminator = OptimWithSheduler(optim.SGD(self.discriminator.parameters(), lr=learning_rate * 10, weight_decay=5e-4, momentum=0.9, nesterov=True), scheduler)
         
-        best_hos = 0.0
+        best_hos = float("-inf")
 
         for epoch in range(max_epochs):
             self._set_train_mode()
@@ -501,8 +501,17 @@ class RTDASolver(BaseSolver):
 
             # Evaluate at the end of epoch
             acc = self.evaluate()
-            best_hos = max(best_hos, acc)
-            logger.info(f"Epoch {epoch+1}/{max_epochs} finished. Loss: {loss_meter.avg:.4f}, Target H-score: {acc:.2f}% (Best: {best_hos:.2f}%)")
+            if acc > best_hos:
+                best_hos = acc
+            self._maybe_save_best(acc, epoch + 1)
+            self._log_epoch_summary(
+                epoch + 1,
+                max_epochs,
+                metrics={"loss": loss_meter.avg},
+                score=acc,
+                best_score=best_hos,
+                score_name="Score",
+            )
 
             # Update centroids for the next epoch based on recorded features
             self.all_centroids.update(ProbRecorder['pred_s'], ProbRecorder['pred_t'], ProbRecorder['label_s'])
@@ -557,5 +566,7 @@ class RTDASolver(BaseSolver):
                 gmm = BayesianGaussianMixture(n_components=4, max_iter=800).fit(ProbRecorder['kl'][:, None])
             else:
                 gmm = BayesianGaussianMixture(n_components=2, max_iter=800).fit(ProbRecorder['kl'][:, None])
-            
-            torch.cuda.empty_cache()
+        if self._load_best_checkpoint_if_available():
+            self._log_best_checkpoint_loaded("Score")
+        self._log_training_complete(best_score=best_hos, score_name="Score")
+        torch.cuda.empty_cache()

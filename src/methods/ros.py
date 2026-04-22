@@ -108,19 +108,22 @@ class RotationSolver(BaseSolver):
         """Two-stage training: rotation pretraining + semantic finetuning."""
         max_epochs = self.config.method.epochs
         logger.info(f"Start training for {max_epochs} epochs per stage...")
+        best_acc = float("-inf")
+        global_epoch = 0
 
         # Stage 1: Rotation pretraining
-        self._train_rotation_stage(max_epochs)
+        best_acc, global_epoch = self._train_rotation_stage(max_epochs, best_acc, global_epoch)
         
         # Freeze lower layers of feature extractor
         self._freeze_lower_layers()
         
         # Stage 2: Semantic finetuning
-        self._train_semantic_stage(max_epochs)
-        
-        logger.info("Training finished.")
+        best_acc, _ = self._train_semantic_stage(max_epochs, best_acc, global_epoch)
+        if self._load_best_checkpoint_if_available():
+            self._log_best_checkpoint_loaded("Acc")
+        self._log_training_complete(best_score=best_acc, score_name="Acc")
 
-    def _train_rotation_stage(self, max_epochs):
+    def _train_rotation_stage(self, max_epochs, best_acc, global_epoch):
         """Stage 1: Train rotation prediction."""
         logger.info("Stage 1: Rotation pretraining...")
         self._build_rotation_optimizer()
@@ -152,7 +155,20 @@ class RotationSolver(BaseSolver):
                 loss_meter.update(loss.item())
 
             acc = self.evaluate()
-            logger.info(f"Rotation Epoch {epoch+1} finished. Target Acc: {acc:.2f}%")
+            global_epoch += 1
+            if acc > best_acc:
+                best_acc = acc
+            self._maybe_save_best(acc, global_epoch)
+            self._log_epoch_summary(
+                epoch + 1,
+                max_epochs,
+                metrics={"loss": loss_meter.avg},
+                score=acc,
+                best_score=best_acc,
+                score_name="Acc",
+                prefix="ROS Rotation",
+            )
+        return best_acc, global_epoch
 
     def _freeze_lower_layers(self):
         """Freeze lower layers of feature extractor for finetuning."""
@@ -162,7 +178,7 @@ class RotationSolver(BaseSolver):
             for param in modules[i].parameters():
                 param.requires_grad = False
 
-    def _train_semantic_stage(self, max_epochs):
+    def _train_semantic_stage(self, max_epochs, best_acc, global_epoch):
         """Stage 2: Train semantic classification."""
         logger.info("Stage 2: Semantic finetuning...")
         self._build_semantic_optimizer()
@@ -189,7 +205,20 @@ class RotationSolver(BaseSolver):
                 loss_meter.update(loss.item())
 
             acc = self.evaluate()
-            logger.info(f"Semantic Epoch {epoch+1} finished. Target Acc: {acc:.2f}%")
+            global_epoch += 1
+            if acc > best_acc:
+                best_acc = acc
+            self._maybe_save_best(acc, global_epoch)
+            self._log_epoch_summary(
+                epoch + 1,
+                max_epochs,
+                metrics={"loss": loss_meter.avg},
+                score=acc,
+                best_score=best_acc,
+                score_name="Acc",
+                prefix="ROS Semantic",
+            )
+        return best_acc, global_epoch
 
     # Note: compute_loss is not implemented - ROS uses custom train()
 
@@ -210,17 +239,18 @@ class RotationSolver(BaseSolver):
 
     def save_checkpoint(self, path):
         """Save all model components to single checkpoint file."""
-        torch.save({
-            "method": "ros",
-            "feature_extractor": self.feature_extractor.state_dict(),
-            "rotation_head": self.rotation_head.state_dict(),
-            "semantic_head": self.semantic_head.state_dict(),
-        }, path)
-        logger.info(f"Model saved to {path}")
+        self._save_named_modules_checkpoint(
+            path,
+            modules={
+                "feature_extractor": self.feature_extractor,
+                "rotation_head": self.rotation_head,
+                "semantic_head": self.semantic_head,
+            },
+        )
 
     def load_checkpoint(self, path):
         """Load all model components from checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = self._load_checkpoint_file(path)
         
         if "feature_extractor" not in checkpoint:
             raise ValueError(f"Invalid checkpoint format: {path}")
@@ -230,5 +260,5 @@ class RotationSolver(BaseSolver):
             self.semantic_head.load_state_dict(checkpoint["semantic_head"])
         if "rotation_head" in checkpoint:
             self.rotation_head.load_state_dict(checkpoint["rotation_head"])
-                
-        logger.info(f"Model loaded from {path}")
+
+        logger.info("%s checkpoint loaded from %s", self._solver_display_name(), path)

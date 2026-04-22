@@ -255,10 +255,7 @@ class DCFMSolver(BaseSolver):
         )
 
         # Best model tracking
-        best_acc = 0.0
-        save_dir = Path("checkpoints")
-        save_dir.mkdir(parents=True, exist_ok=True)
-        best_path = save_dir / "best.pth"
+        best_acc = float("-inf")
 
         logger.info(f"DCFM Training: {warmup_epochs} warmup + {max_epochs} joint epochs")
 
@@ -317,10 +314,19 @@ class DCFMSolver(BaseSolver):
             acc = self.evaluate()
             if acc > best_acc:
                 best_acc = acc
-                self.save_checkpoint(best_path)
-            logger.info(
-                f"Warmup {epoch+1} | task={meters['task'].avg:.4f} "
-                f"dom={meters['domain'].avg:.4f} | Acc={acc:.2f}% (best={best_acc:.2f}%)"
+            self._maybe_save_best(acc, epoch + 1)
+            self._log_epoch_summary(
+                epoch + 1,
+                warmup_epochs,
+                metrics={
+                    "task": meters["task"].avg,
+                    "dom": meters["domain"].avg,
+                    "total": meters["total"].avg,
+                },
+                score=acc,
+                best_score=best_acc,
+                score_name="Acc",
+                prefix="DCFM Warmup",
             )
 
         # ===================== Stage 2: Joint ===================== #
@@ -425,31 +431,35 @@ class DCFMSolver(BaseSolver):
             acc = self.evaluate()
             if acc > best_acc:
                 best_acc = acc
-                self.save_checkpoint(best_path)
-            logger.info(
-                f"Joint {epoch+1:02d} | ts={meters['task'].avg:.3f} "
-                f"dm={meters['domain'].avg:.3f} im={meters['im'].avg:.3f} "
-                f"cf={meters['cf'].avg:.3f} | rmp={ramp:.2f} | Acc={acc:.2f}% (best={best_acc:.2f}%)"
+            self._maybe_save_best(acc, warmup_epochs + epoch + 1)
+            self._log_epoch_summary(
+                epoch + 1,
+                max_epochs,
+                metrics={
+                    "task": (meters["task"].avg, ".3f"),
+                    "dom": (meters["domain"].avg, ".3f"),
+                    "im": (meters["im"].avg, ".3f"),
+                    "cf": (meters["cf"].avg, ".3f"),
+                    "total": (meters["total"].avg, ".3f"),
+                },
+                extras={"rmp": (ramp, ".2f")},
+                score=acc,
+                best_score=best_acc,
+                score_name="Acc",
+                prefix="DCFM Joint",
             )
 
         # Load best model weights at the end of training
-        if best_path.exists():
-            self.load_checkpoint(best_path)
-            logger.info(f"Loaded best model (Acc={best_acc:.2f}%) from {best_path}")
-
-        logger.info(f"Training finished. Best Acc: {best_acc:.2f}%")
+        if self._load_best_checkpoint_if_available():
+            self._log_best_checkpoint_loaded("Acc")
+        self._log_training_complete(best_score=best_acc, score_name="Acc")
 
     def save_checkpoint(self, path):
-        torch.save({
-            "method": "dcfm",
-            "model": self.net.state_dict(),
-        }, path)
-        logger.info(f"Model saved to {path}")
+        self._save_named_modules_checkpoint(path, modules={"model": self.net})
 
     def load_checkpoint(self, path):
-        checkpoint = torch.load(path, map_location=self.device)
-        if "model" in checkpoint:
-            self.net.load_state_dict(checkpoint["model"])
-        else:
-            self.net.load_state_dict(checkpoint)
-        logger.info(f"Model loaded from {path}")
+        self._load_named_modules_checkpoint(
+            path,
+            modules={"model": self.net},
+            fallback_key="model",
+        )

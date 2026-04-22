@@ -44,21 +44,16 @@ class MICSolver(BaseSolver):
         if hasattr(tea_model, 'fc'):
             tea_model.fc = nn.Linear(tea_model.fc.in_features, self.num_classes)
         self.tea_model = tea_model.to(self.device)
-        
-        # Compile models if available (PyTorch 2.0+)
-        # Note: torch.compile is disabled on MPS due to backward pass issues
-        enable_compile = bool(self.config.method.get("enable_compile", True))
-        if enable_compile and hasattr(torch, 'compile') and self.device.type != 'mps':
-            try:
-                self.stu_model = torch.compile(self.stu_model)
-                self.tea_model = torch.compile(self.tea_model)
-            except Exception as e:
-                logger.warning(f"torch.compile is unavailable for MIC in this runtime, fallback to eager mode: {e}")
+        self._stu_forward = self.stu_model
+        self._tea_forward = self.tea_model
+        if self.compile_enabled:
+            self._stu_forward = self._compile_module(self.stu_model, "mic.student")
+            self._tea_forward = self._compile_module(self.tea_model, "mic.teacher")
 
         # MIC masking config
         self.mask_ratio = float(self.config.method.get("mask_ratio", 0.5))
         self.patch_size = int(self.config.method.get("patch_size", 32))
-        self.apply_same_mask_to_batch = bool(self.config.method.get("apply_to_batch", True))
+        self.apply_same_mask_to_batch = self._is_truthy(self.config.method.get("apply_to_batch", True))
 
     def _generate_mask(self, images: torch.Tensor) -> torch.Tensor:
         """
@@ -94,13 +89,13 @@ class MICSolver(BaseSolver):
         """
         with torch.no_grad():
             with self._auto_cast():
-                teacher_logits = self.tea_model(target_images)
+                teacher_logits = self._tea_forward(target_images)
                 pseudo_labels = torch.argmax(torch.softmax(teacher_logits, dim=1), dim=1)
 
         mask = self._generate_mask(target_images)
         masked_images = target_images * mask
         with self._auto_cast():
-            student_logits = self.stu_model(masked_images)
+            student_logits = self._stu_forward(masked_images)
             return F.cross_entropy(student_logits, pseudo_labels)
 
     def _get_trainable_params(self):
@@ -124,7 +119,8 @@ class MICSolver(BaseSolver):
         lambda_mic = self.config.method.get("lambda_mic", 0.5)
         ema_momentum = self.config.method.get("momentum", 0.999)
 
-        logger.info(f"Start MIC training for {max_epochs} epochs...")
+        logger.info("%s training | epochs=%d", self._solver_display_name(), max_epochs)
+        best_acc = float("-inf")
 
         for epoch in range(max_epochs):
             self._set_train_mode()
@@ -145,7 +141,7 @@ class MICSolver(BaseSolver):
 
                 with self._auto_cast():
                     # Semantic loss on source
-                    src_pred = self.stu_model(src_imgs)
+                    src_pred = self._stu_forward(src_imgs)
                     sem_loss = self.criterion(src_pred, src_labels)
 
                     # MIC consistency loss on target
@@ -164,11 +160,24 @@ class MICSolver(BaseSolver):
                 tot_loss_meter.update(loss.item())
 
             acc = self.evaluate()
-            logger.info(
-                f"Epoch {epoch+1} finished. Loss: {tot_loss_meter.avg:.4f}, Target Acc: {acc:.2f}%"
+            if acc > best_acc:
+                best_acc = acc
+            self._maybe_save_best(acc, epoch + 1)
+            self._log_epoch_summary(
+                epoch + 1,
+                max_epochs,
+                metrics={
+                    "sem": sem_loss_meter.avg,
+                    "mic": mic_loss_meter.avg,
+                    "total": tot_loss_meter.avg,
+                },
+                score=acc,
+                best_score=best_acc,
+                score_name="Acc",
             )
-
-        logger.info("Training finished.")
+        if self._load_best_checkpoint_if_available():
+            self._log_best_checkpoint_loaded("Acc")
+        self._log_training_complete(best_score=best_acc, score_name="Acc")
 
     def _update_teacher_ema(self, momentum: float):
         """Update teacher model with exponential moving average of student."""
@@ -181,7 +190,7 @@ class MICSolver(BaseSolver):
     def _set_train_mode(self):
         """Set both models to training mode."""
         self.stu_model.train()
-        self.tea_model.train()
+        self.tea_model.eval()
 
     def _set_eval_mode(self):
         """Set student model to evaluation mode."""
@@ -189,28 +198,29 @@ class MICSolver(BaseSolver):
 
     def forward_for_eval(self, imgs):
         """Use student model for evaluation."""
-        return self.stu_model(imgs)
+        return self._stu_forward(imgs)
 
     def save_checkpoint(self, path):
         """Save student and teacher models to single checkpoint file."""
-        torch.save({
-            "method": "mic",
-            "student_model": self.stu_model.state_dict(),
-            "teacher_model": self.tea_model.state_dict(),
-        }, path)
-        logger.info(f"Model saved to {path}")
+        self._save_named_modules_checkpoint(
+            path,
+            modules={
+                "student_model": self.stu_model,
+                "teacher_model": self.tea_model,
+            },
+        )
 
     def load_checkpoint(self, path):
         """Load student and teacher models from checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = self._load_checkpoint_file(path)
         
         # Handle both old and new checkpoint formats
-        if "student_model" in checkpoint:
+        if isinstance(checkpoint, dict) and "student_model" in checkpoint:
             self.stu_model.load_state_dict(checkpoint["student_model"])
             self.tea_model.load_state_dict(checkpoint["teacher_model"])
         else:
             # Old format: just model state dict
             self.stu_model.load_state_dict(checkpoint)
             self.tea_model.load_state_dict(checkpoint)
-            
-        logger.info(f"Model loaded from {path}")
+
+        logger.info("%s checkpoint loaded from %s", self._solver_display_name(), path)

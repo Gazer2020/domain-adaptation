@@ -1,7 +1,7 @@
 [project]
 name = "domain-adaptation"
 version = "0.1.0"
-description = "Add your description here"
+description = "Hydra-driven research codebase for domain adaptation experiments"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

@@ -11,6 +11,10 @@ if TYPE_CHECKING:
 _SOLVER_REGISTRY: Dict[str, Type["BaseSolver"]] = {}
 
 
+def _normalize_name(name: str) -> str:
+    return str(name).strip().lower()
+
+
 def register_solver(name: str):
     """
     Decorator to register a solver class.
@@ -21,9 +25,10 @@ def register_solver(name: str):
             ...
     """
     def decorator(cls: Type["BaseSolver"]) -> Type["BaseSolver"]:
-        if name in _SOLVER_REGISTRY:
-            raise ValueError(f"Solver '{name}' is already registered.")
-        _SOLVER_REGISTRY[name] = cls
+        normalized = _normalize_name(name)
+        if normalized in _SOLVER_REGISTRY:
+            raise ValueError(f"Solver '{normalized}' is already registered.")
+        _SOLVER_REGISTRY[normalized] = cls
         return cls
     return decorator
 
@@ -41,14 +46,15 @@ def get_solver(name: str) -> Type["BaseSolver"]:
     Raises:
         KeyError: If the solver is not registered
     """
-    if name not in _SOLVER_REGISTRY:
-        available = list(_SOLVER_REGISTRY.keys())
+    normalized = _normalize_name(name)
+    if normalized not in _SOLVER_REGISTRY:
+        available = list_solvers()
         raise KeyError(
-            f"Solver '{name}' not found. Available solvers: {available}"
+            f"Solver '{normalized}' not found. Available solvers: {available}"
         )
-    return _SOLVER_REGISTRY[name]
+    return _SOLVER_REGISTRY[normalized]
 
 
 def list_solvers() -> list:
     """Return a list of all registered solver names."""
-    return list(_SOLVER_REGISTRY.keys())
+    return sorted(_SOLVER_REGISTRY.keys())

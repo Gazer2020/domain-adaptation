@@ -8,7 +8,7 @@ the required abstract methods: build_model() and train().
 import logging
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
-from typing import Tuple
+from typing import Any, Callable, Tuple
 
 import torch
 import torch.nn as nn
@@ -82,6 +82,7 @@ class BaseSolver(ABC):
     def _setup_performance_runtime(self):
         perf = self._cfg_get(self.config, "performance", {})
         amp_cfg = self._cfg_get(perf, "amp", {})
+        compile_cfg = self._cfg_get(perf, "compile", {})
 
         self.non_blocking_transfer = bool(self._cfg_get(perf, "non_blocking_transfer", True)) and self.device.type == "cuda"
         self.zero_grad_set_to_none = bool(self._cfg_get(perf, "zero_grad_set_to_none", True))
@@ -101,19 +102,88 @@ class BaseSolver(ABC):
 
         self.use_grad_scaler = self.amp_enabled and self.device.type == "cuda" and self.amp_dtype == torch.float16
         self.grad_scaler = torch.amp.GradScaler("cuda", enabled=self.use_grad_scaler)
+        self._amp_probe_done = False
+
+        compile_enabled_cfg = str(self._cfg_get(compile_cfg, "enabled", "false")).lower()
+        if compile_enabled_cfg == "auto":
+            self.compile_enabled = self.device.type == "cuda"
+        else:
+            self.compile_enabled = compile_enabled_cfg in {"1", "true", "yes", "on"}
+        compile_backend_cfg = str(self._cfg_get(compile_cfg, "backend", "inductor")).strip().lower()
+        if compile_backend_cfg in {"", "none", "default", "auto"}:
+            self.compile_backend = None
+        else:
+            self.compile_backend = compile_backend_cfg
+        compile_mode_cfg = str(self._cfg_get(compile_cfg, "mode", "default")).strip().lower()
+        if compile_mode_cfg in {"", "none", "default", "auto"}:
+            self.compile_mode = None
+        else:
+            self.compile_mode = compile_mode_cfg
+        self.compile_dynamic = bool(self._cfg_get(compile_cfg, "dynamic", False))
+        self.compile_fullgraph = bool(self._cfg_get(compile_cfg, "fullgraph", False))
         logger.info(
-            "Performance runtime | amp=%s dtype=%s non_blocking=%s set_to_none=%s channels_last=%s",
+            "Performance runtime | amp=%s dtype=%s non_blocking=%s set_to_none=%s channels_last=%s compile=%s",
             self.amp_enabled,
             str(self.amp_dtype).replace("torch.", ""),
             self.non_blocking_transfer,
             self.zero_grad_set_to_none,
             self.channels_last,
+            self.compile_enabled,
         )
 
     def _auto_cast(self):
         if self.amp_enabled:
             return torch.autocast(device_type=self.device.type, dtype=self.amp_dtype)
         return nullcontext()
+
+    def _compile_callable(self, fn: Callable[..., Any], name: str) -> Callable[..., Any]:
+        if not self.compile_enabled:
+            return fn
+        if not hasattr(torch, "compile"):
+            logger.warning("torch.compile requested for %s but is unavailable; fallback to eager mode.", name)
+            return fn
+        if self.device.type == "mps":
+            logger.warning("torch.compile requested for %s on MPS; fallback to eager mode.", name)
+            return fn
+
+        compile_kwargs = {
+            "dynamic": self.compile_dynamic,
+            "fullgraph": self.compile_fullgraph,
+        }
+        if self.compile_backend is not None:
+            compile_kwargs["backend"] = self.compile_backend
+        if self.compile_mode is not None:
+            compile_kwargs["mode"] = self.compile_mode
+
+        try:
+            compiled_fn = torch.compile(fn, **compile_kwargs)
+            logger.info(
+                "torch.compile enabled for %s | backend=%s mode=%s dynamic=%s fullgraph=%s",
+                name,
+                self.compile_backend if self.compile_backend is not None else "default",
+                self.compile_mode if self.compile_mode is not None else "default",
+                self.compile_dynamic,
+                self.compile_fullgraph,
+            )
+            return compiled_fn
+        except Exception as e:
+            logger.warning("torch.compile unavailable for %s, fallback to eager mode: %s", name, e)
+            return fn
+
+    def _probe_amp_tensor(self, tensor: torch.Tensor, name: str = "tensor"):
+        if self._amp_probe_done or (not torch.is_tensor(tensor)):
+            return
+        self._amp_probe_done = True
+        if not self.amp_enabled:
+            return
+
+        dtype_str = str(tensor.dtype).replace("torch.", "")
+        logger.info("AMP probe | %s dtype=%s", name, dtype_str)
+        if self.device.type == "cuda" and tensor.dtype == torch.float32:
+            logger.warning(
+                "AMP is enabled but %s remains float32. Check autocast coverage and operator support.",
+                name,
+            )
 
     def _to_device(self, x):
         if torch.is_tensor(x):

@@ -1,27 +1,17 @@
 name: rgr
 
 lr: 0.01
-epochs: 40
+epochs: 20
 ramp_denom: 12.0
 backbone: resnet50
 
 bottleneck_dim: 256
-relation_hidden_dim: 256
-generator_hidden_dim: 512
 relation_temperature: 0.10
-boundary_temperature: 0.15
-generator_dropout: 0.2
 refresh_source_prototypes_each_epoch: true
 
-lambda_source_relation: 0.20
 lambda_relation_consistency: 0.40
-lambda_local_consistency: 0.15
-lambda_explain_consistency: 0.10
-relation_label_smoothing: 0.10
-
 consistency_conf_power: 2.0
 consistency_start_epoch: 4
-local_knn: 5
 
 ema_decay_start: 0.996
 ema_decay_end: 0.9995

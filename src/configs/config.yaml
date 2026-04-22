@@ -18,15 +18,32 @@ performance:
   benchmark: true
   allow_tf32: true
   matmul_precision: high  # highest, high, medium
+  pin_memory: auto
   channels_last: false
   non_blocking_transfer: true
+  cuda_batch_prefetch: auto  # auto/true/false; overlap H2D copies with compute on CUDA
   zero_grad_set_to_none: true
   amp:
     enabled: auto  # auto, true, false
     dtype: bf16    # bf16, fp16
+  compile:
+    enabled: false   # auto, true, false
+    backend: inductor
+    mode: default    # default, reduce-overhead, max-autotune
+    dynamic: false
+    fullgraph: false
+  augmentation:
+    target_tensor_v2: false  # rgr only: dataloader outputs uint8 tensors, weak/strong aug runs in solver (GPU-capable)
   dataloader:
+    storage_backend: files  # files, lmdb
+    lmdb_root: data/lmdb-cache  # default cache dir (recommended symlink -> /root/autodl-tmp/lmdb-cache)
     persistent_workers: true
     prefetch_factor: 4
+    num_workers_source: auto
+    num_workers_target: auto
+    num_workers_test: auto
+    limit_worker_threads: true
+    worker_threads: 1
 
 hydra:
   run:

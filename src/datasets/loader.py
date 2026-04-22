@@ -1,12 +1,20 @@
+import io
+import logging
+import os
+import pickle
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
-from PIL import Image
+from PIL import Image, __version__ as PIL_VERSION
 import numpy as np
 from utils import get_device
+
+logger = logging.getLogger(__name__)
+
+_PILLOW_RUNTIME_LOGGED = False
 
 
 def _is_truthy(value) -> bool:
@@ -29,6 +37,14 @@ def _resolve_auto_bool(value, auto_value: bool) -> bool:
     return bool(value)
 
 
+def _resolve_int_or_auto(value, auto_value: int) -> int:
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "auto":
+            return int(auto_value)
+    return int(value)
+
+
 def _class_sort_key(name: str):
     """
     Sort class folder names with numeric awareness.
@@ -40,6 +56,65 @@ def _class_sort_key(name: str):
     if s.isdigit():
         return (0, int(s))
     return (1, s.lower())
+
+
+def _log_pillow_runtime_once():
+    global _PILLOW_RUNTIME_LOGGED
+    if _PILLOW_RUNTIME_LOGGED:
+        return
+    _PILLOW_RUNTIME_LOGGED = True
+    version = str(PIL_VERSION)
+    is_simd = "post" in version
+    if is_simd:
+        logger.info("Pillow runtime: pillow-simd detected (%s)", version)
+    else:
+        logger.warning(
+            "Pillow runtime: standard Pillow detected (%s). "
+            "For image decode/resize throughput, consider pillow-simd on x86 Linux.",
+            version,
+        )
+
+
+def _build_loader_kwargs(
+    *,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
+    worker_init_fn=None,
+) -> Dict[str, object]:
+    kwargs: Dict[str, object] = {
+        "num_workers": int(max(0, num_workers)),
+        "pin_memory": bool(pin_memory),
+    }
+    if kwargs["num_workers"] > 0:
+        kwargs["persistent_workers"] = bool(persistent_workers)
+        kwargs["prefetch_factor"] = int(max(1, prefetch_factor))
+        if worker_init_fn is not None:
+            kwargs["worker_init_fn"] = worker_init_fn
+    return kwargs
+
+
+class _WorkerThreadLimiter:
+    def __init__(self, worker_threads: int):
+        self.worker_threads = int(max(1, worker_threads))
+
+    def __call__(self, _worker_id: int):
+        worker_threads = self.worker_threads
+        os.environ["OMP_NUM_THREADS"] = str(worker_threads)
+        os.environ["OPENBLAS_NUM_THREADS"] = str(worker_threads)
+        os.environ["MKL_NUM_THREADS"] = str(worker_threads)
+        os.environ["NUMEXPR_NUM_THREADS"] = str(worker_threads)
+        os.environ["VECLIB_MAXIMUM_THREADS"] = str(worker_threads)
+
+        try:
+            torch.set_num_threads(worker_threads)
+        except Exception:
+            pass
+        try:
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
 
 
 class ColorSpaceToTensorStack:
@@ -232,6 +307,155 @@ class DomainDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+
+class LmdbDomainDataset(Dataset):
+    """
+    LMDB-backed dataset with the same return contract as DomainDataset.
+
+    Each LMDB sample value is expected to be a pickled tuple:
+      (orig_class_index: int, image_bytes: bytes)
+
+    Metadata key `__meta__` stores:
+      - length: int
+      - class_names: List[str]
+      - indices_by_class: Dict[int, List[int]] (recommended)
+    """
+
+    _META_KEY = b"__meta__"
+    _ENV_CACHE = {}
+
+    def __init__(
+        self,
+        lmdb_path: Path,
+        classes: List[int],
+        transform=None,
+        class_mapping: Optional[Dict[int, int]] = None,
+    ):
+        self.lmdb_path = Path(lmdb_path)
+        self.transform = transform
+        self.classes = list(classes)
+        self.class_mapping = class_mapping
+        self._env = None
+
+        if not self.lmdb_path.exists():
+            raise FileNotFoundError(
+                f"LMDB path not found: {self.lmdb_path}. "
+                "Build it first or set performance.dataloader.storage_backend=files."
+            )
+
+        meta = self._read_meta()
+        self.class_names = list(meta.get("class_names", []))
+        self.length = int(meta.get("length", 0))
+        if len(self.class_names) == 0:
+            raise ValueError(f"Invalid LMDB metadata in {self.lmdb_path}: missing class_names")
+
+        for c in self.classes:
+            if c < 0 or c >= len(self.class_names):
+                raise ValueError(
+                    f"Class index {c} is out of range [0, {len(self.class_names)-1}] in LMDB {self.lmdb_path}"
+                )
+
+        self.samples: List[Tuple[int, int]] = []
+        local_label_by_orig: Dict[int, int] = {}
+        for idx, orig_class in enumerate(self.classes):
+            if self.class_mapping is not None:
+                local_label_by_orig[orig_class] = int(self.class_mapping[orig_class])
+            else:
+                local_label_by_orig[orig_class] = idx
+
+        indices_by_class = meta.get("indices_by_class", None)
+        if isinstance(indices_by_class, dict):
+            for orig_class in self.classes:
+                class_indices = indices_by_class.get(orig_class, indices_by_class.get(str(orig_class), []))
+                mapped_label = local_label_by_orig[orig_class]
+                for sample_idx in class_indices:
+                    self.samples.append((int(sample_idx), mapped_label))
+        else:
+            # Fallback for older LMDBs without indices_by_class metadata.
+            env = self._open_env()
+            with env.begin(write=False) as txn:
+                for sample_idx in range(self.length):
+                    key = f"{sample_idx:08d}".encode("ascii")
+                    packed = txn.get(key)
+                    if packed is None:
+                        continue
+                    orig_class, _ = pickle.loads(packed)
+                    orig_class = int(orig_class)
+                    if orig_class in local_label_by_orig:
+                        self.samples.append((sample_idx, local_label_by_orig[orig_class]))
+
+    def _open_env(self):
+        if self._env is not None:
+            return self._env
+        cache_key = str(self.lmdb_path.resolve())
+        cached_env = self._ENV_CACHE.get(cache_key, None)
+        if cached_env is not None:
+            self._env = cached_env
+            return self._env
+        try:
+            import lmdb
+        except ImportError as e:
+            raise ImportError(
+                "LMDB backend requested but `lmdb` is not installed. "
+                "Install dependency `lmdb` or set performance.dataloader.storage_backend=files."
+            ) from e
+
+        self._env = lmdb.open(
+            str(self.lmdb_path),
+            readonly=True,
+            lock=False,
+            readahead=True,
+            meminit=False,
+            max_readers=512,
+            subdir=self.lmdb_path.is_dir(),
+        )
+        self._ENV_CACHE[cache_key] = self._env
+        return self._env
+
+    def _read_meta(self) -> Dict[str, object]:
+        env = self._open_env()
+        with env.begin(write=False) as txn:
+            raw = txn.get(self._META_KEY)
+            if raw is None:
+                raise ValueError(f"LMDB {self.lmdb_path} is missing metadata key '__meta__'")
+            meta = pickle.loads(raw)
+            if not isinstance(meta, dict):
+                raise ValueError(f"LMDB metadata at {self.lmdb_path} must be a dict")
+            return meta
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_env"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._env = None
+
+    def __getitem__(self, index):
+        sample_idx, label = self.samples[index]
+        env = self._open_env()
+        key = f"{sample_idx:08d}".encode("ascii")
+        with env.begin(write=False) as txn:
+            packed = txn.get(key)
+        if packed is None:
+            raise IndexError(f"Missing sample key {sample_idx} in LMDB {self.lmdb_path}")
+
+        _, img_bytes = pickle.loads(packed)
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+    def __len__(self):
+        return len(self.samples)
+
+
+def _resolve_lmdb_path(domain_path: Path, lmdb_root: Optional[Path]) -> Path:
+    if lmdb_root is None:
+        return domain_path.with_suffix(".lmdb")
+    return (lmdb_root / f"{domain_path.name}.lmdb").resolve()
 
 
 class TightCropByWhiteThreshold:
@@ -464,6 +688,7 @@ def get_dataloader(config):
     target_domain = config.dataset.target
     dataset_name_lower = str(dataset_name).strip().lower()
     target_domain_lower = str(target_domain).strip().lower().replace("_", " ")
+    method_name = str(getattr(config.method, "name", "")).strip().lower()
 
     if setting == "msda":
         if source_domains is None:
@@ -504,33 +729,166 @@ def get_dataloader(config):
             f"Available domains: {[d.name for d in root_dir.iterdir() if d.is_dir()]}"
         )
 
-    batch_size = config.batch_size
-    num_workers = config.num_workers
+    _log_pillow_runtime_once()
+
+    batch_size = int(config.batch_size)
+    num_workers = int(config.num_workers)
     perf_cfg = getattr(config, "performance", None)
     dl_perf_cfg = getattr(perf_cfg, "dataloader", None) if perf_cfg is not None else None
+    aug_perf_cfg = getattr(perf_cfg, "augmentation", None) if perf_cfg is not None else None
+    target_tensor_v2_cfg = (
+        bool(getattr(aug_perf_cfg, "target_tensor_v2", False))
+        if aug_perf_cfg is not None
+        else False
+    )
     # Only pin memory when CUDA is actually the selected device.
     device_str = getattr(config, "device", "auto")
     is_cuda_device = get_device(device_str) == "cuda"
     pin_memory_cfg = getattr(perf_cfg, "pin_memory", "auto") if perf_cfg is not None else "auto"
     pin_memory = is_cuda_device if str(pin_memory_cfg).lower() == "auto" else _is_truthy(pin_memory_cfg)
-    persistent_workers = (
+    non_blocking_transfer = (
+        bool(getattr(perf_cfg, "non_blocking_transfer", True))
+        if perf_cfg is not None
+        else True
+    )
+    if is_cuda_device and non_blocking_transfer and not pin_memory:
+        logger.warning(
+            "non_blocking_transfer=True but pin_memory=False. Async host->GPU copies may not be effective."
+        )
+
+    persistent_workers_default = (
         bool(getattr(dl_perf_cfg, "persistent_workers", True))
         if dl_perf_cfg is not None
         else True
     )
-    prefetch_factor = (
+    prefetch_factor_default = (
         int(getattr(dl_perf_cfg, "prefetch_factor", 4))
         if dl_perf_cfg is not None
         else 4
     )
 
-    loader_kwargs = {
-        "num_workers": num_workers,
-        "pin_memory": pin_memory,
-    }
-    if num_workers > 0:
-        loader_kwargs["persistent_workers"] = persistent_workers
-        loader_kwargs["prefetch_factor"] = max(1, prefetch_factor)
+    default_source_workers = max(0, int(round(float(num_workers) * 0.75)))
+    default_target_workers = max(0, int(2 * num_workers - default_source_workers))
+    default_test_workers = default_source_workers
+
+    if dl_perf_cfg is not None:
+        num_workers_source = _resolve_int_or_auto(
+            getattr(dl_perf_cfg, "num_workers_source", "auto"),
+            default_source_workers,
+        )
+        num_workers_target = _resolve_int_or_auto(
+            getattr(dl_perf_cfg, "num_workers_target", "auto"),
+            default_target_workers,
+        )
+        num_workers_test = _resolve_int_or_auto(
+            getattr(dl_perf_cfg, "num_workers_test", "auto"),
+            default_test_workers,
+        )
+    else:
+        num_workers_source = default_source_workers
+        num_workers_target = default_target_workers
+        num_workers_test = default_test_workers
+
+    persistent_workers_source = (
+        bool(getattr(dl_perf_cfg, "persistent_workers_source", persistent_workers_default))
+        if dl_perf_cfg is not None
+        else persistent_workers_default
+    )
+    persistent_workers_target = (
+        bool(getattr(dl_perf_cfg, "persistent_workers_target", persistent_workers_default))
+        if dl_perf_cfg is not None
+        else persistent_workers_default
+    )
+    persistent_workers_test = (
+        bool(getattr(dl_perf_cfg, "persistent_workers_test", persistent_workers_target))
+        if dl_perf_cfg is not None
+        else persistent_workers_target
+    )
+
+    prefetch_factor_source = (
+        int(getattr(dl_perf_cfg, "prefetch_factor_source", prefetch_factor_default))
+        if dl_perf_cfg is not None
+        else prefetch_factor_default
+    )
+    prefetch_factor_target = (
+        int(getattr(dl_perf_cfg, "prefetch_factor_target", prefetch_factor_default))
+        if dl_perf_cfg is not None
+        else prefetch_factor_default
+    )
+    prefetch_factor_test = (
+        int(getattr(dl_perf_cfg, "prefetch_factor_test", prefetch_factor_target))
+        if dl_perf_cfg is not None
+        else prefetch_factor_target
+    )
+
+    limit_worker_threads = (
+        bool(getattr(dl_perf_cfg, "limit_worker_threads", True))
+        if dl_perf_cfg is not None
+        else True
+    )
+    worker_threads = (
+        int(getattr(dl_perf_cfg, "worker_threads", 1))
+        if dl_perf_cfg is not None
+        else 1
+    )
+    worker_init_fn = _WorkerThreadLimiter(worker_threads) if limit_worker_threads else None
+
+    source_loader_kwargs = _build_loader_kwargs(
+        num_workers=num_workers_source,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers_source,
+        prefetch_factor=prefetch_factor_source,
+        worker_init_fn=worker_init_fn,
+    )
+    target_loader_kwargs = _build_loader_kwargs(
+        num_workers=num_workers_target,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers_target,
+        prefetch_factor=prefetch_factor_target,
+        worker_init_fn=worker_init_fn,
+    )
+    target_test_loader_kwargs = _build_loader_kwargs(
+        num_workers=num_workers_test,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers_test,
+        prefetch_factor=prefetch_factor_test,
+        worker_init_fn=worker_init_fn,
+    )
+
+    storage_backend = (
+        str(getattr(dl_perf_cfg, "storage_backend", "files")).strip().lower()
+        if dl_perf_cfg is not None
+        else "files"
+    )
+    if storage_backend not in {"files", "lmdb"}:
+        raise ValueError(
+            f"Unsupported storage_backend={storage_backend}. Expected one of: files, lmdb"
+        )
+    lmdb_root_cfg = getattr(dl_perf_cfg, "lmdb_root", None) if dl_perf_cfg is not None else None
+    default_lmdb_root = (proj_path / "data" / "lmdb-cache").resolve()
+    if lmdb_root_cfg is None or str(lmdb_root_cfg).strip().lower() in {"", "auto"}:
+        lmdb_root = default_lmdb_root
+    elif str(lmdb_root_cfg).strip().lower() in {"none"}:
+        lmdb_root = None
+    else:
+        lmdb_root = Path(str(lmdb_root_cfg))
+        if not lmdb_root.is_absolute():
+            lmdb_root = (proj_path / lmdb_root).resolve()
+
+    logger.info(
+        "Dataloader runtime | backend=%s workers(src/tgt/test)=%d/%d/%d pin_memory=%s "
+        "prefetch(src/tgt/test)=%d/%d/%d worker_threads=%s lmdb_root=%s",
+        storage_backend,
+        int(source_loader_kwargs["num_workers"]),
+        int(target_loader_kwargs["num_workers"]),
+        int(target_test_loader_kwargs["num_workers"]),
+        pin_memory,
+        int(source_loader_kwargs.get("prefetch_factor", 0)),
+        int(target_loader_kwargs.get("prefetch_factor", 0)),
+        int(target_test_loader_kwargs.get("prefetch_factor", 0)),
+        worker_threads if limit_worker_threads else "off",
+        str(lmdb_root) if lmdb_root is not None else "disabled",
+    )
 
     # Determine classes
     src_classes, tgt_classes, shared_classes = get_class_splits(config)
@@ -663,99 +1021,135 @@ def get_dataloader(config):
     # Strong Augmentation for DGA-Revamp
     strong_aug_enabled = getattr(config.method, "strong_aug", False)
     target_transform = train_transform
-    
+
+    target_tensor_v2_enabled = bool(target_tensor_v2_cfg)
+    if target_tensor_v2_enabled and method_name != "rgr":
+        logger.warning(
+            "performance.augmentation.target_tensor_v2=True is currently wired for method=rgr only; "
+            "falling back to dataset weak/strong transforms for method=%s.",
+            method_name or "<unknown>",
+        )
+        target_tensor_v2_enabled = False
+    if target_tensor_v2_enabled and use_color_space:
+        logger.warning(
+            "target_tensor_v2 is incompatible with color_space.enabled=True; "
+            "falling back to dataset weak/strong transforms."
+        )
+        target_tensor_v2_enabled = False
+    if target_tensor_v2_enabled and (not strong_aug_enabled):
+        logger.warning(
+            "target_tensor_v2 requires method.strong_aug=True; "
+            "falling back to default target transform."
+        )
+        target_tensor_v2_enabled = False
+
     if strong_aug_enabled:
-        class WeakStrongAugment:
-            def __init__(self, weak, strong):
-                self.weak = weak
-                self.strong = strong
-            
-            def __call__(self, x):
-                return self.weak(x), self.strong(x)
-        
-        # Standard Weak
-        if use_color_space:
-            weak_aug = transforms.Compose(
+        if target_tensor_v2_enabled:
+            # Keep decode + deterministic resize in dataloader; apply weak/strong random ops
+            # in solver on tensor path (v2, GPU-capable).
+            target_transform = transforms.Compose(
                 clipart_train_pre
                 + [
                     transforms.Resize((256, 256)),
-                    transforms.RandomCrop(224),
-                    transforms.RandomHorizontalFlip(),
-                    ColorSpaceToTensorStack(
-                        spaces=spaces, mean=mean, std=std, random_erasing_p=0.0
-                    ),
+                    transforms.PILToTensor(),  # uint8 [C,H,W]
                 ]
+            )
+            logger.info(
+                "Target weak/strong augmentation: tensor path enabled (method=rgr). "
+                "Loader outputs uint8 tensors after resize; random weak/strong ops run in solver."
             )
         else:
-            weak_aug = transforms.Compose(
-                clipart_train_pre
-                + [
-                    transforms.Resize((256, 256)),
-                    transforms.RandomCrop(224),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.ToTensor(),
-                    transforms.Normalize(
-                        [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-                    ),
-                ]
-            )
-        
-        # Strong (RandAugment)
-        if use_color_space:
-            target_randaugment_ops = (
-                int(getattr(target_aug_cfg, "randaugment_num_ops", 2))
-                if target_aug_cfg is not None
-                else 2
-            )
-            target_randaugment_mag = (
-                int(getattr(target_aug_cfg, "randaugment_magnitude", 10))
-                if target_aug_cfg is not None
-                else 10
-            )
-            strong_aug = transforms.Compose(
-                clipart_train_pre
-                + [
-                    transforms.Resize((256, 256)),
-                    transforms.RandomCrop(224),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.RandAugment(
-                        num_ops=target_randaugment_ops,
-                        magnitude=target_randaugment_mag,
-                    ),
-                    ColorSpaceToTensorStack(
-                        spaces=spaces, mean=mean, std=std, random_erasing_p=0.0
-                    ),
-                ]
-            )
-        else:
-            target_randaugment_ops = (
-                int(getattr(target_aug_cfg, "randaugment_num_ops", 2))
-                if target_aug_cfg is not None
-                else 2
-            )
-            target_randaugment_mag = (
-                int(getattr(target_aug_cfg, "randaugment_magnitude", 10))
-                if target_aug_cfg is not None
-                else 10
-            )
-            strong_aug = transforms.Compose(
-                clipart_train_pre
-                + [
-                    transforms.Resize((256, 256)),
-                    transforms.RandomCrop(224),
-                    transforms.RandomHorizontalFlip(),
-                    transforms.RandAugment(
-                        num_ops=target_randaugment_ops,
-                        magnitude=target_randaugment_mag,
-                    ),
-                    transforms.ToTensor(),
-                    transforms.Normalize(
-                        [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-                    ),
-                ]
-            )
-        
-        target_transform = WeakStrongAugment(weak_aug, strong_aug)
+            class WeakStrongAugment:
+                def __init__(self, weak, strong):
+                    self.weak = weak
+                    self.strong = strong
+
+                def __call__(self, x):
+                    return self.weak(x), self.strong(x)
+
+            # Standard Weak
+            if use_color_space:
+                weak_aug = transforms.Compose(
+                    clipart_train_pre
+                    + [
+                        transforms.Resize((256, 256)),
+                        transforms.RandomCrop(224),
+                        transforms.RandomHorizontalFlip(),
+                        ColorSpaceToTensorStack(
+                            spaces=spaces, mean=mean, std=std, random_erasing_p=0.0
+                        ),
+                    ]
+                )
+            else:
+                weak_aug = transforms.Compose(
+                    clipart_train_pre
+                    + [
+                        transforms.Resize((256, 256)),
+                        transforms.RandomCrop(224),
+                        transforms.RandomHorizontalFlip(),
+                        transforms.ToTensor(),
+                        transforms.Normalize(
+                            [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+                        ),
+                    ]
+                )
+
+            # Strong (RandAugment)
+            if use_color_space:
+                target_randaugment_ops = (
+                    int(getattr(target_aug_cfg, "randaugment_num_ops", 2))
+                    if target_aug_cfg is not None
+                    else 2
+                )
+                target_randaugment_mag = (
+                    int(getattr(target_aug_cfg, "randaugment_magnitude", 10))
+                    if target_aug_cfg is not None
+                    else 10
+                )
+                strong_aug = transforms.Compose(
+                    clipart_train_pre
+                    + [
+                        transforms.Resize((256, 256)),
+                        transforms.RandomCrop(224),
+                        transforms.RandomHorizontalFlip(),
+                        transforms.RandAugment(
+                            num_ops=target_randaugment_ops,
+                            magnitude=target_randaugment_mag,
+                        ),
+                        ColorSpaceToTensorStack(
+                            spaces=spaces, mean=mean, std=std, random_erasing_p=0.0
+                        ),
+                    ]
+                )
+            else:
+                target_randaugment_ops = (
+                    int(getattr(target_aug_cfg, "randaugment_num_ops", 2))
+                    if target_aug_cfg is not None
+                    else 2
+                )
+                target_randaugment_mag = (
+                    int(getattr(target_aug_cfg, "randaugment_magnitude", 10))
+                    if target_aug_cfg is not None
+                    else 10
+                )
+                strong_aug = transforms.Compose(
+                    clipart_train_pre
+                    + [
+                        transforms.Resize((256, 256)),
+                        transforms.RandomCrop(224),
+                        transforms.RandomHorizontalFlip(),
+                        transforms.RandAugment(
+                            num_ops=target_randaugment_ops,
+                            magnitude=target_randaugment_mag,
+                        ),
+                        transforms.ToTensor(),
+                        transforms.Normalize(
+                            [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+                        ),
+                    ]
+                )
+
+            target_transform = WeakStrongAugment(weak_aug, strong_aug)
     elif clipart_train_pre:
         if use_color_space:
             target_transform = transforms.Compose(
@@ -779,27 +1173,60 @@ def get_dataloader(config):
                 target_tail.append(transforms.RandomErasing(p=0.25))
             target_transform = transforms.Compose(clipart_train_pre + geom_train + target_tail)
 
+    logger.info(
+        "Target augmentation runtime | strong_aug=%s tensor_v2=%s color_space=%s",
+        bool(strong_aug_enabled),
+        bool(target_tensor_v2_enabled),
+        bool(use_color_space),
+    )
+
+    def _build_domain_dataset(domain_path: Path, classes: List[int], transform, class_mapping: Optional[Dict[int, int]]):
+        if storage_backend == "lmdb":
+            lmdb_path = _resolve_lmdb_path(domain_path, lmdb_root)
+            return LmdbDomainDataset(
+                lmdb_path,
+                classes,
+                transform=transform,
+                class_mapping=class_mapping,
+            )
+        return DomainDataset(
+            domain_path,
+            classes,
+            transform=transform,
+            class_mapping=class_mapping,
+        )
+
     # Datasets with proper class mappings
     tgt_path = root_dir / target_domain
 
     if setting == "msda":
         source_datasets = [
-            DomainDataset(p, src_classes, transform=train_transform, class_mapping=src_mapping) for p in src_paths
+            _build_domain_dataset(p, src_classes, transform=train_transform, class_mapping=src_mapping)
+            for p in src_paths
         ]
         source_dataset = MultiSourceDomainDataset(source_datasets)
     else:
         src_path = root_dir / source_domain
-        source_dataset = DomainDataset(
-            src_path, src_classes, transform=train_transform, class_mapping=src_mapping
+        source_dataset = _build_domain_dataset(
+            src_path,
+            src_classes,
+            transform=train_transform,
+            class_mapping=src_mapping,
         )
     
     # Target dataset uses special transform if enabled 
-    target_dataset = DomainDataset(
-        tgt_path, tgt_classes, transform=target_transform, class_mapping=tgt_mapping
+    target_dataset = _build_domain_dataset(
+        tgt_path,
+        tgt_classes,
+        transform=target_transform,
+        class_mapping=tgt_mapping,
     )
     
-    target_test_dataset = DomainDataset(
-        tgt_path, tgt_classes, transform=test_transform, class_mapping=tgt_mapping
+    target_test_dataset = _build_domain_dataset(
+        tgt_path,
+        tgt_classes,
+        transform=test_transform,
+        class_mapping=tgt_mapping,
     )
 
     # DataLoaders
@@ -818,7 +1245,7 @@ def get_dataloader(config):
         source_loader = DataLoader(
             source_dataset,
             batch_sampler=batch_sampler,
-            **loader_kwargs,
+            **source_loader_kwargs,
         )
     else:
         source_loader = DataLoader(
@@ -826,20 +1253,20 @@ def get_dataloader(config):
             batch_size=batch_size,
             shuffle=True,
             drop_last=True,
-            **loader_kwargs,
+            **source_loader_kwargs,
         )
     target_loader = DataLoader(
         target_dataset,
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
-        **loader_kwargs,
+        **target_loader_kwargs,
     )
     target_test_loader = DataLoader(
         target_test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        **loader_kwargs,
+        **target_test_loader_kwargs,
     )
     
     # Class info for evaluation

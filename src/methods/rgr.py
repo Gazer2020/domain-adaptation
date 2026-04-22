@@ -1,45 +1,37 @@
 """
 RGR: Relational Graph Representation for MSDA.
 
-Core pipeline:
-Feature Extractor -> Relation Graph Builder -> Relation Parser
--> Relation-conditioned Representation Generator -> Classifier.
+Final winner variant (single-path):
+- Shared feature encoder + relation graph parsing.
+- Cross-domain same-class reference relations.
+- Local inter-class confusion structure relations.
+- Target adaptation via node/confusion relation consistency on weak/strong views.
+- Relation-only classifier head (no prior-fusion branch).
 
-Key idea:
-- Domain information participates in representation construction.
-- Cross-domain relations participate in target recognition.
+Core statement:
+Multi-source adaptation is better framed as relation-assisted discrimination
+on shared semantics, rather than relation-driven feature generation.
 """
 
 import copy
 import logging
 import math
-from itertools import combinations
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import v2 as transforms_v2
 
 from methods.base_solver import BaseSolver
 from methods.registry import register_solver
 from models.backbones import get_backbone
-from utils import AverageMeter, cycle
+from utils import cycle
 
 logger = logging.getLogger(__name__)
-
-
-def soft_target_cross_entropy(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    weights: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    losses = -(targets * F.log_softmax(logits, dim=1)).sum(dim=1)
-    if weights is not None:
-        weights = weights.detach()
-        return (losses * weights).sum() / weights.sum().clamp_min(1e-6)
-    return losses.mean()
 
 
 def soft_prob_cross_entropy(
@@ -64,8 +56,66 @@ def _unwrap_weak_strong_from_maybe_tuple(tgt_imgs):
     return tgt_imgs, tgt_imgs
 
 
+def _record_stream_recursive(batch: Any, stream: torch.cuda.Stream):
+    if torch.is_tensor(batch):
+        if batch.is_cuda:
+            batch.record_stream(stream)
+        return
+    if isinstance(batch, (list, tuple)):
+        for v in batch:
+            _record_stream_recursive(v, stream)
+        return
+    if isinstance(batch, dict):
+        for v in batch.values():
+            _record_stream_recursive(v, stream)
+
+
+class _CudaBatchPrefetcher:
+    """Prefetch next batch to device stream while current batch is computing."""
+
+    def __init__(
+        self,
+        iterator,
+        load_fn: Callable[[Any], Any],
+        enabled: bool,
+    ):
+        self.iterator = iterator
+        self.load_fn = load_fn
+        self.enabled = bool(enabled) and torch.cuda.is_available()
+        self.stream = torch.cuda.Stream() if self.enabled else None
+        self._next_batch = None
+        self._preload()
+
+    def _preload(self):
+        try:
+            raw = next(self.iterator)
+        except StopIteration:
+            self._next_batch = None
+            return
+
+        if not self.enabled or self.stream is None:
+            self._next_batch = self.load_fn(raw)
+            return
+
+        with torch.cuda.stream(self.stream):
+            self._next_batch = self.load_fn(raw)
+
+    def pop(self):
+        if self._next_batch is None:
+            raise StopIteration
+
+        if self.enabled and self.stream is not None:
+            current_stream = torch.cuda.current_stream()
+            current_stream.wait_stream(self.stream)
+            _record_stream_recursive(self._next_batch, current_stream)
+
+        batch = self._next_batch
+        self._preload()
+        return batch
+
+
 class RelationGraphBuilder(nn.Module):
-    """Build multi-source class relation graph from source prototypes."""
+    """Build relation primitives from source domain class prototypes."""
 
     def __init__(
         self,
@@ -73,14 +123,16 @@ class RelationGraphBuilder(nn.Module):
         num_classes: int,
         num_source_domains: int,
         relation_temperature: float = 0.10,
-        boundary_temperature: float = 0.15,
+        confusion_temperature: float = 0.15,
+        confusion_topk: int = 4,
     ):
         super().__init__()
         self.feat_dim = int(feat_dim)
         self.num_classes = int(num_classes)
         self.num_source_domains = int(num_source_domains)
         self.relation_temperature = max(1e-6, float(relation_temperature))
-        self.boundary_temperature = max(1e-6, float(boundary_temperature))
+        self.confusion_temperature = max(1e-6, float(confusion_temperature))
+        self.confusion_topk = max(0, int(confusion_topk))
 
         self.register_buffer(
             "src_prototypes",
@@ -93,111 +145,54 @@ class RelationGraphBuilder(nn.Module):
             persistent=True,
         )
 
-        pairs = list(combinations(range(self.num_source_domains), 2))
-        if pairs:
-            pair_tensor = torch.tensor(pairs, dtype=torch.long)
-        else:
-            pair_tensor = torch.empty(0, 2, dtype=torch.long)
-        self.register_buffer("domain_pairs", pair_tensor, persistent=False)
-
-    @property
-    def num_domain_pairs(self) -> int:
-        return int(self.domain_pairs.size(0))
-
     @torch.no_grad()
     def reset_source_prototypes(self):
         self.src_prototypes.zero_()
         self.src_proto_inited.zero_()
 
-    def _boundary_node_messages(self) -> torch.Tensor:
-        """Domain-internal inter-class boundary messages for each node."""
+    def _class_confusion_weights(self) -> torch.Tensor:
+        """Domain-wise class confusion structure: [D, C, C]."""
         proto = self.src_prototypes
         mask = self.src_proto_inited
         d, c, _ = proto.shape
 
         if c <= 1:
-            return torch.zeros_like(proto)
+            return torch.zeros(d, c, c, device=proto.device, dtype=proto.dtype)
 
         p_n = F.normalize(proto, dim=-1)
-        sim = torch.einsum("dcf,dkf->dck", p_n, p_n) / self.boundary_temperature
+        sim = torch.einsum("dcf,dkf->dck", p_n, p_n) / self.confusion_temperature
 
         valid_pair = mask.unsqueeze(2) & mask.unsqueeze(1)
         eye = torch.eye(c, device=proto.device, dtype=torch.bool).unsqueeze(0)
         valid_pair = valid_pair & (~eye)
 
+        if self.confusion_topk > 0 and self.confusion_topk < (c - 1):
+            topk = min(self.confusion_topk, c - 1)
+            safe_logits = sim.masked_fill(~valid_pair, -1e4)
+            topi = safe_logits.topk(topk, dim=-1).indices
+            keep = torch.zeros_like(valid_pair)
+            keep.scatter_(-1, topi, True)
+            valid_pair = valid_pair & keep
+
         safe_logits = sim.masked_fill(~valid_pair, -1e4)
         weights = torch.softmax(safe_logits, dim=-1)
         valid_row = valid_pair.any(dim=-1)
-        weights = torch.where(valid_row.unsqueeze(-1), weights, torch.zeros_like(weights))
+        return torch.where(valid_row.unsqueeze(-1), weights, torch.zeros_like(weights))
 
-        diffs = proto.unsqueeze(2) - proto.unsqueeze(1)
-        return torch.einsum("dck,dckf->dcf", weights, diffs)
-
-    def _transition_context(
-        self,
-        domain_weights: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Build same-class cross-domain transition context.
-
-        Returns:
-            transition_per_class: [B, C, F]
-            transition_mass: [B, C, E] where E = num domain pairs
-        """
-        bsz = domain_weights.size(0)
-        c = self.num_classes
-        e = self.num_domain_pairs
-        device = domain_weights.device
-        dtype = domain_weights.dtype
-
-        if e == 0:
-            transition_per_class = torch.zeros(
-                bsz, c, self.feat_dim, device=device, dtype=dtype
-            )
-            transition_mass = torch.zeros(bsz, c, 0, device=device, dtype=dtype)
-            return transition_per_class, transition_mass
-
-        pair_d1 = self.domain_pairs[:, 0]
-        pair_d2 = self.domain_pairs[:, 1]
-
-        proto = self.src_prototypes
-        mask = self.src_proto_inited
-
-        edge_feat = 0.5 * (proto[pair_d1] + proto[pair_d2])  # [E, C, F]
-        edge_feat = edge_feat.permute(1, 0, 2).contiguous()  # [C, E, F]
-
-        edge_valid = (mask[pair_d1] & mask[pair_d2]).transpose(0, 1).contiguous()  # [C, E]
-
-        wd1 = domain_weights[:, :, pair_d1].clamp_min(1e-8)
-        wd2 = domain_weights[:, :, pair_d2].clamp_min(1e-8)
-        pair_logits = torch.log(wd1) + torch.log(wd2)  # [B, C, E]
-        pair_logits = pair_logits.masked_fill(~edge_valid.unsqueeze(0), -1e4)
-
-        pair_weights = torch.softmax(pair_logits, dim=-1)
-        valid_row = edge_valid.any(dim=-1)
-        pair_weights = torch.where(
-            valid_row.unsqueeze(0).unsqueeze(-1),
-            pair_weights,
-            torch.zeros_like(pair_weights),
-        )
-
-        transition_per_class = torch.einsum("bce,cef->bcf", pair_weights, edge_feat)
-        transition_mass = pair_weights
-        return transition_per_class, transition_mass
-
-    def parse(self, h_shared: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Parse sample-to-graph relations."""
+    def parse(self, h_relation: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Parse sample-to-graph relations from relation-space features."""
         proto = self.src_prototypes
         mask = self.src_proto_inited
 
         proto_n = F.normalize(proto, dim=-1)
-        h_n = F.normalize(h_shared, dim=-1)
+        h_n = F.normalize(h_relation, dim=-1)
 
+        # Sample-to-domain-class relation logits: [B, D, C]
         node_logits_bdc = torch.einsum("bf,dcf->bdc", h_n, proto_n)
         node_logits_bdc = node_logits_bdc / self.relation_temperature
         node_logits_bdc = node_logits_bdc.masked_fill(~mask.unsqueeze(0), -1e4)
 
-        # Class-level evidence from cross-domain nodes.
+        # Same-class cross-domain evidence.
         class_logits_rel = torch.logsumexp(node_logits_bdc, dim=1)  # [B, C]
         valid_classes = mask.any(dim=0)  # [C]
         class_logits_rel = class_logits_rel.masked_fill(~valid_classes.unsqueeze(0), -1e4)
@@ -213,6 +208,7 @@ class RelationGraphBuilder(nn.Module):
             torch.full_like(domain_weights, 1.0 / float(max(1, self.num_source_domains))),
         )
 
+        # Same-class cross-domain reference features [B, C, F].
         node_context = torch.einsum("bcd,dcf->bcf", domain_weights, proto)
         node_context = torch.where(
             valid_classes.unsqueeze(0).unsqueeze(-1),
@@ -220,91 +216,44 @@ class RelationGraphBuilder(nn.Module):
             torch.zeros_like(node_context),
         )
 
-        boundary_node = self._boundary_node_messages()  # [D, C, F]
-        transition_per_class, transition_mass = self._transition_context(domain_weights)
+        # Local inter-class confusion structure conditioned on domain reference.
+        # confusion_dck: [D, C(anchor), C(confusing)]
+        confusion_dck = self._class_confusion_weights()
+        confusion_per_class = torch.einsum("bcd,dck->bck", domain_weights, confusion_dck)
+        confusion_per_class = torch.where(
+            valid_classes.unsqueeze(0).unsqueeze(-1),
+            confusion_per_class,
+            torch.zeros_like(confusion_per_class),
+        )
 
         return {
             "class_logits_rel": class_logits_rel,
             "domain_logits": domain_logits,
             "domain_weights": domain_weights,
             "node_context": node_context,
-            "boundary_node": boundary_node,
-            "transition_per_class": transition_per_class,
-            "transition_mass": transition_mass,
+            "confusion_per_class": confusion_per_class,
             "valid_classes": valid_classes,
         }
 
 
 class RelationParser(nn.Module):
-    """Fuse class prior and relation evidence into sample class relation state."""
+    """Final parser used by the winning setup: relation-only classification."""
 
-    def __init__(self, feat_dim: int, num_classes: int, hidden_dim: int = 256):
+    def __init__(self):
         super().__init__()
-        self.class_prior = nn.Sequential(
-            nn.Linear(feat_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, num_classes),
-        )
-        self.mix_logit = nn.Parameter(torch.tensor(0.0))
 
     def forward(
         self,
-        h_shared: torch.Tensor,
         class_logits_rel: torch.Tensor,
         valid_classes: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        prior_logits = self.class_prior(h_shared)
-        alpha = torch.sigmoid(self.mix_logit)
-        class_logits = alpha * prior_logits + (1.0 - alpha) * class_logits_rel
+        class_logits = class_logits_rel
         class_logits = class_logits.masked_fill(~valid_classes.unsqueeze(0), -1e4)
         class_probs = torch.softmax(class_logits, dim=1)
         return {
             "class_logits": class_logits,
             "class_probs": class_probs,
-            "class_prior_logits": prior_logits,
-            "class_rel_logits": class_logits_rel,
-            "mix_alpha": alpha,
         }
-
-
-class RelationConditionedRepresentationGenerator(nn.Module):
-    """Generate transferable semantic representation conditioned on relations."""
-
-    def __init__(
-        self,
-        feat_dim: int,
-        num_classes: int,
-        hidden_dim: int = 512,
-        dropout: float = 0.2,
-    ):
-        super().__init__()
-        self.class_embed = nn.Linear(num_classes, feat_dim, bias=False)
-        self.net = nn.Sequential(
-            nn.Linear(feat_dim * 5, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(hidden_dim, feat_dim),
-        )
-        self.out_norm = nn.LayerNorm(feat_dim)
-
-    def forward(
-        self,
-        h_shared: torch.Tensor,
-        class_context: torch.Tensor,
-        transition_context: torch.Tensor,
-        boundary_context: torch.Tensor,
-        class_probs: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        class_hint = self.class_embed(class_probs)
-        cond = torch.cat(
-            [h_shared, class_context, transition_context, boundary_context, class_hint],
-            dim=-1,
-        )
-        delta = self.net(cond)
-        z = self.out_norm(h_shared + delta)
-        return z, delta
 
 
 class RGRNetwork(nn.Module):
@@ -315,11 +264,9 @@ class RGRNetwork(nn.Module):
         num_source_domains: int,
         *,
         bottleneck_dim: int = 0,
-        relation_hidden_dim: int = 256,
-        generator_hidden_dim: int = 512,
         relation_temperature: float = 0.10,
-        boundary_temperature: float = 0.15,
-        generator_dropout: float = 0.2,
+        confusion_temperature: float = 0.10,
+        confusion_topk: int = 8,
     ):
         super().__init__()
 
@@ -347,108 +294,77 @@ class RGRNetwork(nn.Module):
             self.feat_dim = feat_dim_raw
 
         self.feature_norm = nn.LayerNorm(self.feat_dim)
+        self.relation_feat_dim = self.feat_dim
+
         self.graph_builder = RelationGraphBuilder(
-            feat_dim=self.feat_dim,
+            feat_dim=self.relation_feat_dim,
             num_classes=self.num_classes,
             num_source_domains=self.num_source_domains,
             relation_temperature=relation_temperature,
-            boundary_temperature=boundary_temperature,
+            confusion_temperature=confusion_temperature,
+            confusion_topk=confusion_topk,
         )
-        self.relation_parser = RelationParser(
-            feat_dim=self.feat_dim,
-            num_classes=self.num_classes,
-            hidden_dim=relation_hidden_dim,
-        )
-        self.representation_generator = RelationConditionedRepresentationGenerator(
-            feat_dim=self.feat_dim,
-            num_classes=self.num_classes,
-            hidden_dim=generator_hidden_dim,
-            dropout=generator_dropout,
-        )
-        self.classifier = nn.Linear(self.feat_dim, self.num_classes)
+        self.relation_parser = RelationParser()
 
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+    def extract_relation_features(self, x: torch.Tensor) -> torch.Tensor:
         return self.bottleneck(self.backbone(x))
 
-    def normalize_features(self, h: torch.Tensor) -> torch.Tensor:
+    def normalize_relation_features(self, h: torch.Tensor) -> torch.Tensor:
         return self.feature_norm(h)
+
+    def _encode_shared(
+        self,
+        x: Optional[torch.Tensor] = None,
+        h_shared: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if h_shared is not None:
+            return h_shared
+        if x is None:
+            raise ValueError("Either x or h_shared must be provided.")
+        h = self.extract_relation_features(x)
+        return self.normalize_relation_features(h)
 
     @torch.no_grad()
     def reset_source_prototypes(self):
         self.graph_builder.reset_source_prototypes()
-
-    def forward_relation_logits_from_shared(
-        self,
-        h_shared: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        graph = self.graph_builder.parse(h_shared)
-        parsed = self.relation_parser(
-            h_shared=h_shared,
-            class_logits_rel=graph["class_logits_rel"],
-            valid_classes=graph["valid_classes"],
-        )
-        class_probs = parsed["class_probs"]
-        domain_weights = graph["domain_weights"]
-        node_mass = class_probs.unsqueeze(-1) * domain_weights  # [B, C, D]
-
-        class_context = torch.einsum("bc,bcf->bf", class_probs, graph["node_context"])
-        transition_context = torch.einsum("bc,bcf->bf", class_probs, graph["transition_per_class"])
-        boundary_context = torch.einsum("bcd,dcf->bf", node_mass, graph["boundary_node"])
-
-        z, delta = self.representation_generator(
-            h_shared=h_shared,
-            class_context=class_context,
-            transition_context=transition_context,
-            boundary_context=boundary_context,
-            class_probs=class_probs,
-        )
-        logits = self.classifier(z)
-        cls_probs_from_logits = torch.softmax(logits, dim=1)
-
-        transition_mass = graph["transition_mass"] * class_probs.unsqueeze(-1)
-        if transition_mass.numel() > 0:
-            transition_global = transition_mass.flatten(1)
-            transition_global = transition_global / transition_global.sum(
-                dim=1, keepdim=True
-            ).clamp_min(1e-8)
-        else:
-            transition_global = transition_mass.new_zeros(transition_mass.size(0), 0)
-
-        aux = {
-            "h_shared": h_shared,
-            "z": z,
-            "delta": delta,
-            "class_logits": parsed["class_logits"],
-            "class_probs": class_probs,
-            "class_prior_logits": parsed["class_prior_logits"],
-            "class_rel_logits": parsed["class_rel_logits"],
-            "mix_alpha": parsed["mix_alpha"],
-            "domain_logits": graph["domain_logits"],
-            "domain_weights": domain_weights,
-            "node_context": graph["node_context"],
-            "node_mass": node_mass,
-            "class_context": class_context,
-            "transition_per_class": graph["transition_per_class"],
-            "transition_mass": graph["transition_mass"],
-            "transition_global": transition_global,
-            "boundary_node": graph["boundary_node"],
-            "boundary_context": boundary_context,
-            "valid_classes": graph["valid_classes"],
-            "cls_probs_from_logits": cls_probs_from_logits,
-        }
-        return logits, aux
 
     def forward_relation_logits(
         self,
         x: Optional[torch.Tensor] = None,
         h_shared: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if h_shared is None:
-            if x is None:
-                raise ValueError("Either x or h_shared must be provided.")
-            h = self.extract_features(x)
-            h_shared = self.normalize_features(h)
-        return self.forward_relation_logits_from_shared(h_shared)
+        h_shared = self._encode_shared(x=x, h_shared=h_shared)
+        graph = self.graph_builder.parse(h_shared)
+        parsed = self.relation_parser(
+            class_logits_rel=graph["class_logits_rel"],
+            valid_classes=graph["valid_classes"],
+        )
+
+        class_probs = parsed["class_probs"]
+        domain_weights = graph["domain_weights"]
+        node_mass = class_probs.unsqueeze(-1) * domain_weights  # [B, C, D]
+
+        confusion_per_class = graph["confusion_per_class"]  # [B, C, C]
+        confusion_profile = torch.einsum("bc,bck->bk", class_probs, confusion_per_class)
+        confusion_profile = confusion_profile / confusion_profile.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+        logits = parsed["class_logits"]
+
+        aux = {
+            "h_relation": h_shared,
+            "class_logits": parsed["class_logits"],
+            "class_probs": class_probs,
+            "domain_logits": graph["domain_logits"],
+            "domain_weights": domain_weights,
+            "node_mass": node_mass,
+            # Kept for analysis/visualization even though final training loss
+            # only uses node_mass and confusion_profile.
+            "node_context": graph["node_context"],
+            "confusion_per_class": confusion_per_class,
+            "confusion_profile": confusion_profile,
+            "valid_classes": graph["valid_classes"],
+        }
+        return logits, aux
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         logits, _ = self.forward_relation_logits(x=x)
@@ -476,74 +392,83 @@ class RGRSolver(BaseSolver):
     def build_model(self):
         m = self.config.method
         backbone_name = m.get("backbone", "resnet50")
-        sources = getattr(self.config.dataset, "sources", None)
-        if sources is None or len(list(sources)) == 0:
+        sources = list(getattr(self.config.dataset, "sources", []) or [])
+        if len(sources) == 0:
             raise ValueError("rgr requires config.dataset.sources to be a non-empty list")
 
-        self.num_source_domains = len(list(sources))
+        self.num_source_domains = len(sources)
 
-        self.bottleneck_dim = int(m.get("bottleneck_dim", 256))
-        self.relation_hidden_dim = int(m.get("relation_hidden_dim", 256))
-        self.generator_hidden_dim = int(m.get("generator_hidden_dim", 512))
-        self.relation_temperature = float(m.get("relation_temperature", 0.10))
-        self.boundary_temperature = float(m.get("boundary_temperature", 0.15))
-        self.generator_dropout = float(m.get("generator_dropout", 0.2))
-
-        self.lambda_source_relation = float(m.get("lambda_source_relation", 0.20))
-        self.lambda_relation_consistency = float(m.get("lambda_relation_consistency", 0.40))
-        self.lambda_local_consistency = float(m.get("lambda_local_consistency", 0.15))
-        self.lambda_explain_consistency = float(m.get("lambda_explain_consistency", 0.10))
-
-        self.consistency_conf_power = float(m.get("consistency_conf_power", 2.0))
-        self.consistency_start_epoch = int(m.get("consistency_start_epoch", 4))
-        self.local_knn = int(m.get("local_knn", 5))
-        self.refresh_source_prototypes_each_epoch = bool(
-            m.get("refresh_source_prototypes_each_epoch", True)
-        )
+        for key, cast, default in [
+            ("bottleneck_dim", int, 256),
+            ("relation_temperature", float, 0.10),
+            ("lambda_relation_consistency", float, 0.40),
+            ("consistency_conf_power", float, 2.0),
+            ("consistency_start_epoch", int, 4),
+            ("refresh_source_prototypes_each_epoch", bool, True),
+            ("grad_clip", float, 5.0),
+            ("save_ckpt_after_epoch", int, 0),
+            ("ema_decay_start", float, 0.996),
+            ("ema_decay_end", float, 0.9995),
+            ("label_smoothing", float, 0.05),
+        ]:
+            setattr(self, key, cast(m.get(key, default)))
 
         self.total_epochs = int(m.get("epochs", 20))
         self.ramp_denom = float(m.get("ramp_denom", max(1.0, self.total_epochs * 0.3)))
-        self.grad_clip = float(m.get("grad_clip", 5.0))
-        self.save_ckpt_after_epoch = int(m.get("save_ckpt_after_epoch", 0))
         self.epoch_steps_mode = str(m.get("epoch_steps_mode", "max")).strip().lower()
-        self.ema_decay_start = float(m.get("ema_decay_start", 0.996))
-        self.ema_decay_end = float(m.get("ema_decay_end", 0.9995))
-        self.relation_label_smoothing = float(m.get("relation_label_smoothing", 0.10))
+        # Fixed by the final winning setup.
+        self.confusion_temperature = 0.10
+        self.confusion_topk = 8
+        self.lambda_rel_consistency_node = 0.25
+        self.lambda_rel_consistency_conf = 1.0
 
-        self.label_smoothing = float(m.get("label_smoothing", 0.05))
         self.criterion_task = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
+        perf_cfg = self._cfg_get(self.config, "performance", {})
+        prefetch_cfg = self._cfg_get(perf_cfg, "cuda_batch_prefetch", "auto")
+        if isinstance(prefetch_cfg, str):
+            lowered = prefetch_cfg.strip().lower()
+            if lowered == "auto":
+                self.cuda_batch_prefetch = self.device.type == "cuda"
+            else:
+                self.cuda_batch_prefetch = lowered in {"1", "true", "yes", "on"}
+        else:
+            self.cuda_batch_prefetch = bool(prefetch_cfg)
 
         self.net = RGRNetwork(
             backbone_name=backbone_name,
             num_classes=self.num_classes,
             num_source_domains=self.num_source_domains,
             bottleneck_dim=self.bottleneck_dim,
-            relation_hidden_dim=self.relation_hidden_dim,
-            generator_hidden_dim=self.generator_hidden_dim,
             relation_temperature=self.relation_temperature,
-            boundary_temperature=self.boundary_temperature,
-            generator_dropout=self.generator_dropout,
+            confusion_temperature=self.confusion_temperature,
+            confusion_topk=self.confusion_topk,
         ).to(self.device)
 
         self.ema_net = copy.deepcopy(self.net)
         for param in self.ema_net.parameters():
             param.requires_grad_(False)
+        self._forward_logits_student = self.net.forward_relation_logits
+        self._student_forward_compiled = False
+        self._target_tensor_aug_enabled = False
+        self._target_weak_aug = None
+        self._target_strong_aug = None
+        self._setup_target_tensor_augment()
 
         logger.info(
-            "RGR: bottleneck=%d rel_hidden=%d gen_hidden=%d rel_temp=%.3f "
-            "boundary_temp=%.3f lambda_rel=%.3f lambda_rel_cons=%.3f "
-            "lambda_local=%.3f lambda_explain=%.3f consistency_start=%d knn=%d",
+            "RGR(final-winner): bottleneck=%d rel_temp=%.3f "
+            "conf_temp=%.3f conf_topk=%d rel_space_dim=%d "
+            "lambda_rel_cons=%.3f prefetch=%s "
+            "rel_w(node/conf)=%.2f/%.2f consistency_start=%d",
             self.bottleneck_dim,
-            self.relation_hidden_dim,
-            self.generator_hidden_dim,
             self.relation_temperature,
-            self.boundary_temperature,
-            self.lambda_source_relation,
+            self.confusion_temperature,
+            self.confusion_topk,
+            self.net.relation_feat_dim,
             self.lambda_relation_consistency,
-            self.lambda_local_consistency,
-            self.lambda_explain_consistency,
+            str(self.cuda_batch_prefetch),
+            self.lambda_rel_consistency_node,
+            self.lambda_rel_consistency_conf,
             self.consistency_start_epoch,
-            self.local_knn,
         )
 
     def _forward_logits(
@@ -553,12 +478,117 @@ class RGRSolver(BaseSolver):
         x: Optional[torch.Tensor] = None,
         h_shared: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if h_shared is None:
-            if x is None:
-                raise ValueError("Either x or h_shared must be provided.")
-            h = model.extract_features(x)
-            h_shared = model.normalize_features(h)
-        return model.forward_relation_logits_from_shared(h_shared=h_shared)
+        if model is self.net:
+            return self._forward_logits_student(x, h_shared)
+        return model.forward_relation_logits(x=x, h_shared=h_shared)
+
+    def _setup_compiled_student_forward(self):
+        if self._student_forward_compiled:
+            return
+
+        def _student_forward(x: Optional[torch.Tensor], h_shared: Optional[torch.Tensor]):
+            return self.net.forward_relation_logits(x=x, h_shared=h_shared)
+
+        self._forward_logits_student = self._compile_callable(
+            _student_forward,
+            "rgr_student.forward_relation_logits",
+        )
+        self._student_forward_compiled = True
+
+    def _setup_target_tensor_augment(self):
+        perf_cfg = getattr(self.config, "performance", None)
+        aug_cfg = getattr(perf_cfg, "augmentation", None) if perf_cfg is not None else None
+        enabled = bool(getattr(aug_cfg, "target_tensor_v2", False)) if aug_cfg is not None else False
+        if not enabled:
+            return
+        if not bool(getattr(self.config.method, "strong_aug", False)):
+            logger.warning(
+                "target_tensor_v2 requested, but method.strong_aug=False. "
+                "Falling back to dataloader transforms."
+            )
+            return
+        color_space_cfg = getattr(self.config.method, "color_space", None)
+        if color_space_cfg is not None and bool(getattr(color_space_cfg, "enabled", False)):
+            logger.warning(
+                "target_tensor_v2 requested with color_space.enabled=True, which is unsupported. "
+                "Falling back to dataloader transforms."
+            )
+            return
+
+        target_aug_cfg = getattr(self.config.method, "target_aug", None)
+        randaugment_num_ops = (
+            int(getattr(target_aug_cfg, "randaugment_num_ops", 2))
+            if target_aug_cfg is not None
+            else 2
+        )
+        randaugment_magnitude = (
+            int(getattr(target_aug_cfg, "randaugment_magnitude", 10))
+            if target_aug_cfg is not None
+            else 10
+        )
+
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+        self._target_weak_aug = transforms_v2.Compose(
+            [
+                transforms_v2.RandomCrop(224),
+                transforms_v2.RandomHorizontalFlip(),
+                transforms_v2.ToDtype(torch.float32, scale=True),
+                transforms_v2.Normalize(mean, std),
+            ]
+        )
+        self._target_strong_aug = transforms_v2.Compose(
+            [
+                transforms_v2.RandomCrop(224),
+                transforms_v2.RandomHorizontalFlip(),
+                transforms_v2.RandAugment(
+                    num_ops=randaugment_num_ops,
+                    magnitude=randaugment_magnitude,
+                    interpolation=InterpolationMode.BILINEAR,
+                ),
+                transforms_v2.ToDtype(torch.float32, scale=True),
+                transforms_v2.Normalize(mean, std),
+            ]
+        )
+        self._target_tensor_aug_enabled = True
+        logger.info(
+            "RGR target tensor augmentation enabled (v2, GPU-capable): "
+            "weak=RandomCrop+HFlip, strong=RandomCrop+HFlip+RandAugment(%d,%d)",
+            randaugment_num_ops,
+            randaugment_magnitude,
+        )
+
+    def _to_uint8_image_tensor(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype == torch.uint8:
+            return x
+        if torch.is_floating_point(x):
+            if x.max() <= 1.0 and x.min() >= 0.0:
+                return (x * 255.0).round().clamp(0.0, 255.0).to(torch.uint8)
+            return x.round().clamp(0.0, 255.0).to(torch.uint8)
+        return x.clamp(0, 255).to(torch.uint8)
+
+    def _prepare_target_views(self, tgt_imgs):
+        if isinstance(tgt_imgs, (tuple, list)) and len(tgt_imgs) >= 2:
+            tgt_weak, tgt_strong = tgt_imgs[0], tgt_imgs[1]
+            return self._to_device(tgt_weak), self._to_device(tgt_strong)
+
+        if not self._target_tensor_aug_enabled:
+            tgt_weak, tgt_strong = _unwrap_weak_strong_from_maybe_tuple(tgt_imgs)
+            return self._to_device(tgt_weak), self._to_device(tgt_strong)
+
+        base = self._to_device(tgt_imgs)
+        base = self._to_uint8_image_tensor(base)
+        tgt_weak = self._target_weak_aug(base)
+        tgt_strong = self._target_strong_aug(base)
+        return tgt_weak, tgt_strong
+
+    def _load_source_batch_to_device(self, src_batch):
+        src_imgs, src_labels, src_dom = src_batch
+        return self._to_device(src_imgs), self._to_device(src_labels), self._to_device(src_dom)
+
+    def _load_target_batch_to_views(self, tgt_batch):
+        tgt_imgs = tgt_batch[0] if isinstance(tgt_batch, (tuple, list)) else tgt_batch
+        return self._prepare_target_views(tgt_imgs)
 
     def _set_eval_mode(self):
         self.net.eval()
@@ -575,93 +605,31 @@ class RGRSolver(BaseSolver):
         progress = min(1.0, step / max(1, total_steps))
         return self.ema_decay_start + (self.ema_decay_end - self.ema_decay_start) * progress
 
-    def _source_relation_loss(
-        self,
-        domain_logits: torch.Tensor,
-        src_labels: torch.Tensor,
-        src_dom: torch.Tensor,
-    ) -> torch.Tensor:
-        # domain_logits: [B, C, D], supervise selected class on source domain id.
-        batch_idx = torch.arange(src_labels.size(0), device=src_labels.device)
-        true_class_domain_logits = domain_logits[batch_idx, src_labels]
-        num_domains = true_class_domain_logits.size(1)
-        if num_domains <= 1:
-            return torch.zeros((), device=true_class_domain_logits.device, dtype=true_class_domain_logits.dtype)
-
-        off_value = self.relation_label_smoothing / float(num_domains - 1)
-        target = torch.full_like(true_class_domain_logits, off_value)
-        target.scatter_(1, src_dom.unsqueeze(1), 1.0 - self.relation_label_smoothing)
-        return soft_target_cross_entropy(true_class_domain_logits, target)
-
     @staticmethod
     def _normalize_distribution(x: torch.Tensor) -> torch.Tensor:
         if x.size(1) == 0:
             return x
         return x / x.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
-    def _position_distribution(self, aux: Dict[str, torch.Tensor]) -> torch.Tensor:
-        class_part = aux["class_probs"]  # [B, C]
-        node_part = aux["node_mass"].flatten(1)  # [B, C*D], sums to ~1
-        node_part = self._normalize_distribution(node_part)
-
-        trans_part = aux["transition_global"]  # [B, C*E] or [B, 0]
-        if trans_part.size(1) > 0:
-            trans_part = self._normalize_distribution(trans_part)
-            return torch.cat([class_part, node_part, trans_part], dim=1)
-        return torch.cat([class_part, node_part], dim=1)
-
     def _relation_consistency_loss(
         self,
         student_aux: Dict[str, torch.Tensor],
         teacher_aux: Dict[str, torch.Tensor],
         weights: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        cls_loss = soft_prob_cross_entropy(
-            student_aux["class_probs"],
-            teacher_aux["class_probs"],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        node_loss = soft_prob_cross_entropy(
+            self._normalize_distribution(student_aux["node_mass"].flatten(1)),
+            self._normalize_distribution(teacher_aux["node_mass"].flatten(1)),
             weights=weights,
         )
 
-        node_s = self._normalize_distribution(student_aux["node_mass"].flatten(1))
-        node_t = self._normalize_distribution(teacher_aux["node_mass"].flatten(1))
-        node_loss = soft_prob_cross_entropy(node_s, node_t, weights=weights)
+        conf_loss = soft_prob_cross_entropy(
+            self._normalize_distribution(student_aux["confusion_profile"]),
+            self._normalize_distribution(teacher_aux["confusion_profile"]),
+            weights=weights,
+        )
 
-        if student_aux["transition_global"].size(1) > 0:
-            trans_s = self._normalize_distribution(student_aux["transition_global"])
-            trans_t = self._normalize_distribution(teacher_aux["transition_global"])
-            trans_loss = soft_prob_cross_entropy(trans_s, trans_t, weights=weights)
-        else:
-            trans_loss = torch.zeros((), device=self.device, dtype=cls_loss.dtype)
-
-        return cls_loss, node_loss, trans_loss
-
-    def _local_structure_loss(
-        self,
-        student_aux: Dict[str, torch.Tensor],
-        teacher_aux: Dict[str, torch.Tensor],
-        weights: torch.Tensor,
-    ) -> torch.Tensor:
-        pos_s = self._position_distribution(student_aux)  # [B, P]
-        pos_t = self._position_distribution(teacher_aux).detach()  # [B, P]
-        z_t = teacher_aux["z"].detach()
-
-        bsz = pos_s.size(0)
-        if bsz <= 1:
-            return torch.zeros((), device=self.device, dtype=pos_s.dtype)
-
-        k = min(max(1, self.local_knn), bsz - 1)
-        z_t_n = F.normalize(z_t, dim=1)
-        sim = z_t_n @ z_t_n.t()
-        sim.fill_diagonal_(-1e4)
-        topv, topi = sim.topk(k, dim=1)
-        neigh_w = torch.softmax(topv, dim=1)
-
-        neigh_pos = pos_t[topi]  # [B, k, P]
-        target_pos = torch.einsum("bk,bkp->bp", neigh_w, neigh_pos).detach()
-
-        losses = ((pos_s - target_pos) ** 2).sum(dim=1)
-        weights = weights.detach()
-        return (losses * weights).sum() / weights.sum().clamp_min(1e-6)
+        return node_loss, conf_loss
 
     @torch.no_grad()
     def _teacher_guidance(self, tgt_weak: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -671,8 +639,7 @@ class RGRSolver(BaseSolver):
         guide = {
             "class_probs": aux["class_probs"].detach(),
             "node_mass": aux["node_mass"].detach(),
-            "transition_global": aux["transition_global"].detach(),
-            "z": aux["z"].detach(),
+            "confusion_profile": aux["confusion_profile"].detach(),
         }
         return conf, guide
 
@@ -684,52 +651,52 @@ class RGRSolver(BaseSolver):
             logits, _ = self._forward_logits(self.ema_net, x=imgs)
             return logits
 
-    @torch.no_grad()
     def _recompute_source_prototypes(self, model: RGRNetwork):
-        was_training = model.training
-        model.eval()
+        with torch.inference_mode():
+            was_training = model.training
+            model.eval()
 
-        feat_sums = torch.zeros(
-            self.num_source_domains,
-            self.num_classes,
-            model.feat_dim,
-            device=self.device,
-        )
-        counts = torch.zeros(
-            self.num_source_domains,
-            self.num_classes,
-            device=self.device,
-        )
+            feat_sums = torch.zeros(
+                self.num_source_domains,
+                self.num_classes,
+                model.relation_feat_dim,
+                device=self.device,
+            )
+            counts = torch.zeros(
+                self.num_source_domains,
+                self.num_classes,
+                device=self.device,
+            )
+            feat_sums_flat = feat_sums.view(-1, model.relation_feat_dim)
+            counts_flat = counts.view(-1)
 
-        for src_imgs, src_labels, src_dom in self.source_loader:
-            src_imgs = self._to_device(src_imgs)
-            src_labels = self._to_device(src_labels)
-            src_dom = self._to_device(src_dom)
+            for src_imgs, src_labels, src_dom in self.source_loader:
+                src_imgs = self._to_device(src_imgs)
+                src_labels = self._to_device(src_labels)
+                src_dom = self._to_device(src_dom)
 
-            with self._auto_cast():
-                h = model.extract_features(src_imgs)
-                h_shared = model.normalize_features(h)
+                with self._auto_cast():
+                    h = model.extract_relation_features(src_imgs)
+                    h_shared = model.normalize_relation_features(h)
 
-            for dom_id in src_dom.unique().tolist():
-                dom_mask = src_dom == dom_id
-                feats_dom = h_shared[dom_mask]
-                labels_dom = src_labels[dom_mask]
-                for cls_id in labels_dom.unique().tolist():
-                    cls_mask = labels_dom == cls_id
-                    feat_sums[dom_id, cls_id] += feats_dom[cls_mask].sum(dim=0)
-                    counts[dom_id, cls_id] += float(cls_mask.sum().item())
+                flat_index = src_dom.long() * self.num_classes + src_labels.long()
+                feat_sums_flat.index_add_(0, flat_index, h_shared)
+                counts_flat.index_add_(
+                    0,
+                    flat_index,
+                    torch.ones_like(flat_index, dtype=counts_flat.dtype),
+                )
 
-        model.reset_source_prototypes()
-        valid = counts > 0
-        model.graph_builder.src_proto_inited.copy_(valid)
-        for dom_id in range(self.num_source_domains):
-            for cls_id in range(self.num_classes):
-                if bool(valid[dom_id, cls_id].item()):
-                    model.graph_builder.src_prototypes[dom_id, cls_id].copy_(
-                        feat_sums[dom_id, cls_id] / counts[dom_id, cls_id]
-                    )
+            model.reset_source_prototypes()
+            valid = counts > 0
+            safe_counts = counts.clamp_min(1.0).unsqueeze(-1)
+            prototypes = feat_sums / safe_counts
+            prototypes = torch.where(valid.unsqueeze(-1), prototypes, torch.zeros_like(prototypes))
 
-        model.train(was_training)
+            model.graph_builder.src_proto_inited.copy_(valid)
+            model.graph_builder.src_prototypes.copy_(prototypes)
+
+            model.train(was_training)
 
     def save_checkpoint(self, path):
         torch.save(
@@ -759,8 +726,6 @@ class RGRSolver(BaseSolver):
             {"params": list(self.net.feature_norm.parameters()), "lr": base_lr},
             {"params": list(self.net.graph_builder.parameters()), "lr": base_lr},
             {"params": list(self.net.relation_parser.parameters()), "lr": base_lr},
-            {"params": list(self.net.representation_generator.parameters()), "lr": base_lr},
-            {"params": list(self.net.classifier.parameters()), "lr": base_lr},
         ]
         param_groups = [group for group in param_groups if len(group["params"]) > 0]
 
@@ -779,6 +744,7 @@ class RGRSolver(BaseSolver):
             return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        self._setup_compiled_student_forward()
         best_acc = 0.0
         best_save_acc = -1e18
         best_path = Path("checkpoints") / "best_rgr.pth"
@@ -786,7 +752,7 @@ class RGRSolver(BaseSolver):
 
         global_step = 0
         logger.info(
-            "RGR Training: extractor->graph->parser->generator->classifier | "
+            "RGR Training(final-winner): relation consistency | "
             "epoch_steps_mode=%s source_steps=%d target_steps=%d epoch_steps=%d",
             self.epoch_steps_mode,
             len(self.source_loader),
@@ -805,84 +771,55 @@ class RGRSolver(BaseSolver):
                 )
 
             self.net.train()
-            meters = {
-                key: AverageMeter()
-                for key in [
-                    "src",
-                    "srel",
-                    "rcls",
-                    "rnode",
-                    "rtrans",
-                    "local",
-                    "expl",
-                    "conf",
-                    "mix",
-                    "gdelta",
-                    "total",
-                ]
+            metric_keys = ("src", "rnode", "rconf", "conf", "total")
+            metric_sums = {
+                key: torch.zeros((), device=self.device, dtype=torch.float32)
+                for key in metric_keys
             }
 
             src_iter = cycle(self.source_loader)
             tgt_iter = cycle(self.target_loader)
+            use_cuda_prefetch = bool(self.cuda_batch_prefetch and self.device.type == "cuda")
+            src_prefetcher = _CudaBatchPrefetcher(
+                src_iter,
+                self._load_source_batch_to_device,
+                enabled=use_cuda_prefetch,
+            )
+            tgt_prefetcher = _CudaBatchPrefetcher(
+                tgt_iter,
+                self._load_target_batch_to_views,
+                enabled=use_cuda_prefetch,
+            )
             ramp = min(1.0, (epoch + 1) / max(1.0, self.ramp_denom))
             consistency_ramp = 1.0 if (epoch + 1) >= self.consistency_start_epoch else 0.0
 
             for _ in range(epoch_steps):
-                src_imgs, src_labels, src_dom = next(src_iter)
-                tgt_batch = next(tgt_iter)
-                tgt_imgs = tgt_batch[0] if isinstance(tgt_batch, (tuple, list)) else tgt_batch
-                tgt_weak, tgt_strong = _unwrap_weak_strong_from_maybe_tuple(tgt_imgs)
-
-                src_imgs = self._to_device(src_imgs)
-                src_labels = self._to_device(src_labels)
-                src_dom = self._to_device(src_dom)
-                tgt_weak = self._to_device(tgt_weak)
-                tgt_strong = self._to_device(tgt_strong)
+                src_imgs, src_labels, _ = src_prefetcher.pop()
+                tgt_weak, tgt_strong = tgt_prefetcher.pop()
 
                 self._zero_grad(optimizer)
 
                 with self._auto_cast():
-                    logits_src, src_aux = self._forward_logits(self.net, x=src_imgs)
+                    logits_src, _ = self._forward_logits(self.net, x=src_imgs)
+                    self._probe_amp_tensor(logits_src, "rgr/logits_src")
                     loss_src = self.criterion_task(logits_src, src_labels)
-                    loss_src_rel = self._source_relation_loss(
-                        src_aux["domain_logits"],
-                        src_labels,
-                        src_dom,
-                    )
 
-                    logits_tgt, tgt_aux = self._forward_logits(self.net, x=tgt_strong)
+                    _, tgt_aux = self._forward_logits(self.net, x=tgt_strong)
                     with torch.no_grad():
                         with self._auto_cast():
                             conf_tgt, teacher_aux = self._teacher_guidance(tgt_weak)
                         rel_weights = conf_tgt.pow(self.consistency_conf_power)
 
-                    loss_rcls, loss_rnode, loss_rtrans = self._relation_consistency_loss(
+                    loss_rnode, loss_rconf = self._relation_consistency_loss(
                         tgt_aux,
                         teacher_aux,
                         rel_weights,
                     )
-                    loss_local = self._local_structure_loss(
-                        tgt_aux,
-                        teacher_aux,
-                        rel_weights,
+                    consistency_loss = self.lambda_relation_consistency * (
+                        self.lambda_rel_consistency_node * loss_rnode
+                        + self.lambda_rel_consistency_conf * loss_rconf
                     )
-                    loss_explain = soft_target_cross_entropy(
-                        logits_tgt,
-                        tgt_aux["class_probs"].detach(),
-                        weights=rel_weights,
-                    )
-
-                    loss = (
-                        loss_src
-                        + self.lambda_source_relation * loss_src_rel
-                        + ramp
-                        * consistency_ramp
-                        * (
-                            self.lambda_relation_consistency * (loss_rcls + loss_rnode + loss_rtrans)
-                            + self.lambda_local_consistency * loss_local
-                            + self.lambda_explain_consistency * loss_explain
-                        )
-                    )
+                    loss = loss_src + ramp * consistency_ramp * consistency_loss
 
                 self._optimizer_step_with_optional_clip(
                     loss,
@@ -895,17 +832,14 @@ class RGRSolver(BaseSolver):
                 self._update_ema(self._ema_decay_at(global_step, total_iters))
                 global_step += 1
 
-                meters["src"].update(loss_src.item())
-                meters["srel"].update(loss_src_rel.item())
-                meters["rcls"].update(loss_rcls.item())
-                meters["rnode"].update(loss_rnode.item())
-                meters["rtrans"].update(loss_rtrans.item())
-                meters["local"].update(loss_local.item())
-                meters["expl"].update(loss_explain.item())
-                meters["conf"].update(conf_tgt.mean().item())
-                meters["mix"].update(float(tgt_aux["mix_alpha"].item()))
-                meters["gdelta"].update(tgt_aux["delta"].abs().mean().item())
-                meters["total"].update(loss.item())
+                metric_sums["src"].add_(loss_src.detach().float())
+                metric_sums["rnode"].add_(loss_rnode.detach().float())
+                metric_sums["rconf"].add_(loss_rconf.detach().float())
+                metric_sums["conf"].add_(conf_tgt.detach().mean().float())
+                metric_sums["total"].add_(loss.detach().float())
+
+            scale = 1.0 / float(max(1, epoch_steps))
+            metrics = {key: (value * scale).item() for key, value in metric_sums.items()}
 
             acc = self.evaluate()
             if acc > best_acc:
@@ -916,17 +850,11 @@ class RGRSolver(BaseSolver):
 
             logger.info(
                 f"RGR {epoch+1}/{self.total_epochs} | "
-                f"src={meters['src'].avg:.4f} "
-                f"srel={meters['srel'].avg:.4f} "
-                f"rcls={meters['rcls'].avg:.4f} "
-                f"rnode={meters['rnode'].avg:.4f} "
-                f"rtrans={meters['rtrans'].avg:.4f} "
-                f"local={meters['local'].avg:.4f} "
-                f"expl={meters['expl'].avg:.4f} "
-                f"conf={meters['conf'].avg:.3f} "
-                f"mix={meters['mix'].avg:.3f} "
-                f"gdelta={meters['gdelta'].avg:.4f} "
-                f"total={meters['total'].avg:.4f} | "
+                f"src={metrics['src']:.4f} "
+                f"rnode={metrics['rnode']:.4f} "
+                f"rconf={metrics['rconf']:.4f} "
+                f"conf={metrics['conf']:.3f} "
+                f"total={metrics['total']:.4f} | "
                 f"rmp={ramp:.2f} crmp={consistency_ramp:.2f} | "
                 f"Acc={acc:.2f}% (best={best_acc:.2f}%)"
             )

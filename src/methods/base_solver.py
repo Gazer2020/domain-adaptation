@@ -201,7 +201,13 @@ class BaseSolver(ABC):
     def _compile_module(self, module: nn.Module, name: str) -> Callable[..., Any]:
         return self._compile_callable(module, name)
 
-    def _probe_amp_tensor(self, tensor: torch.Tensor, name: str = "tensor"):
+    def _probe_amp_tensor(
+        self,
+        tensor: torch.Tensor,
+        name: str = "tensor",
+        *,
+        warn_on_float32: bool = True,
+    ):
         if self._amp_probe_done or (not torch.is_tensor(tensor)):
             return
         self._amp_probe_done = True
@@ -210,7 +216,7 @@ class BaseSolver(ABC):
 
         dtype_str = str(tensor.dtype).replace("torch.", "")
         logger.info("AMP probe | %s dtype=%s", name, dtype_str)
-        if self.device.type == "cuda" and tensor.dtype == torch.float32:
+        if self.device.type == "cuda" and warn_on_float32 and tensor.dtype == torch.float32:
             logger.warning(
                 "AMP is enabled but %s remains float32. Check autocast coverage and operator support.",
                 name,

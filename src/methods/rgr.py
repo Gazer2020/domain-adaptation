@@ -78,11 +78,14 @@ class _CudaBatchPrefetcher:
         iterator,
         load_fn: Callable[[Any], Any],
         enabled: bool,
+        stream: Optional[torch.cuda.Stream] = None,
     ):
         self.iterator = iterator
         self.load_fn = load_fn
         self.enabled = bool(enabled) and torch.cuda.is_available()
-        self.stream = torch.cuda.Stream() if self.enabled else None
+        self.stream = stream if self.enabled else None
+        if self.enabled and self.stream is None:
+            self.stream = torch.cuda.Stream()
         self._next_batch = None
         self._preload()
 
@@ -112,6 +115,9 @@ class _CudaBatchPrefetcher:
         batch = self._next_batch
         self._preload()
         return batch
+
+    def close(self):
+        self._next_batch = None
 
 
 class RelationGraphBuilder(nn.Module):
@@ -449,9 +455,17 @@ class RGRSolver(BaseSolver):
             param.requires_grad_(False)
         self._forward_logits_student = self.net.forward_relation_logits
         self._student_forward_compiled = False
+        self._amp_dtype_chain_logged = False
         self._target_tensor_aug_enabled = False
         self._target_weak_aug = None
         self._target_strong_aug = None
+        self._src_prefetch_stream = None
+        self._tgt_prefetch_stream = None
+        if self.cuda_batch_prefetch and self.device.type == "cuda":
+            # Reuse long-lived streams instead of creating new ones every epoch.
+            # This keeps the CUDA caching allocator from growing per-stream pools.
+            self._src_prefetch_stream = torch.cuda.Stream()
+            self._tgt_prefetch_stream = torch.cuda.Stream()
         self._setup_target_tensor_augment()
 
         logger.info(
@@ -589,6 +603,24 @@ class RGRSolver(BaseSolver):
     def _load_target_batch_to_views(self, tgt_batch):
         tgt_imgs = tgt_batch[0] if isinstance(tgt_batch, (tuple, list)) else tgt_batch
         return self._prepare_target_views(tgt_imgs)
+
+    def _log_amp_dtype_chain_once(self, src_imgs: torch.Tensor, logits_src: torch.Tensor):
+        if self._amp_dtype_chain_logged or not self.amp_enabled:
+            return
+        self._amp_dtype_chain_logged = True
+
+        with torch.no_grad():
+            with self._auto_cast():
+                relation_features = self.net.extract_relation_features(src_imgs)
+                normalized_features = self.net.normalize_relation_features(relation_features)
+
+        logger.info(
+            "RGR AMP dtype chain | relation_features=%s normalized=%s logits=%s "
+            "(float32 normalized/logits are expected here because LayerNorm and probability ops promote for stability)",
+            str(relation_features.dtype).replace("torch.", ""),
+            str(normalized_features.dtype).replace("torch.", ""),
+            str(logits_src.dtype).replace("torch.", ""),
+        )
 
     def _set_eval_mode(self):
         self.net.eval()
@@ -779,11 +811,13 @@ class RGRSolver(BaseSolver):
                 src_iter,
                 self._load_source_batch_to_device,
                 enabled=use_cuda_prefetch,
+                stream=self._src_prefetch_stream,
             )
             tgt_prefetcher = _CudaBatchPrefetcher(
                 tgt_iter,
                 self._load_target_batch_to_views,
                 enabled=use_cuda_prefetch,
+                stream=self._tgt_prefetch_stream,
             )
             ramp = min(1.0, (epoch + 1) / max(1.0, self.ramp_denom))
             consistency_ramp = 1.0 if (epoch + 1) >= self.consistency_start_epoch else 0.0
@@ -796,7 +830,8 @@ class RGRSolver(BaseSolver):
 
                 with self._auto_cast():
                     logits_src, _ = self._forward_logits(self.net, x=src_imgs)
-                    self._probe_amp_tensor(logits_src, "rgr/logits_src")
+                    self._probe_amp_tensor(logits_src, "rgr/logits_src", warn_on_float32=False)
+                    self._log_amp_dtype_chain_once(src_imgs, logits_src)
                     loss_src = self.criterion_task(logits_src, src_labels)
 
                     _, tgt_aux = self._forward_logits(self.net, x=tgt_strong)
@@ -832,6 +867,9 @@ class RGRSolver(BaseSolver):
                 metric_sums["rconf"].add_(loss_rconf.detach().float())
                 metric_sums["conf"].add_(conf_tgt.detach().mean().float())
                 metric_sums["total"].add_(loss.detach().float())
+
+            src_prefetcher.close()
+            tgt_prefetcher.close()
 
             scale = 1.0 / float(max(1, epoch_steps))
             metrics = {key: (value * scale).item() for key, value in metric_sums.items()}

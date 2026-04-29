@@ -432,48 +432,6 @@ def _resolve_lmdb_path(domain_path: Path, lmdb_root: Optional[Path]) -> Path:
     return (lmdb_root / f"{domain_path.name}.lmdb").resolve()
 
 
-class TightCropByWhiteThreshold:
-    """Crop an image to its non-white foreground bounding box."""
-
-    def __init__(self, white_threshold: int = 245, padding: int = 2, min_foreground_pixels: int = 10):
-        self.white_threshold = int(white_threshold)
-        self.padding = int(padding)
-        self.min_foreground_pixels = int(min_foreground_pixels)
-
-    def __call__(self, image: Image.Image) -> Image.Image:
-        rgb = image.convert("RGB")
-        arr = np.asarray(rgb)
-        foreground = np.any(arr < self.white_threshold, axis=2)
-
-        ys, xs = np.where(foreground)
-        if len(xs) < self.min_foreground_pixels:
-            return rgb
-
-        x0, x1 = int(xs.min()), int(xs.max())
-        y0, y1 = int(ys.min()), int(ys.max())
-
-        if self.padding > 0:
-            x0 = max(0, x0 - self.padding)
-            y0 = max(0, y0 - self.padding)
-            x1 = min(arr.shape[1] - 1, x1 + self.padding)
-            y1 = min(arr.shape[0] - 1, y1 + self.padding)
-
-        return rgb.crop((x0, y0, x1 + 1, y1 + 1))
-
-
-class RandomApplyTransform:
-    """Apply a transform with probability p."""
-
-    def __init__(self, transform, p: float = 0.5):
-        self.transform = transform
-        self.p = float(p)
-
-    def __call__(self, image: Image.Image) -> Image.Image:
-        if self.p >= 1.0 or torch.rand(1).item() < self.p:
-            return self.transform(image)
-        return image
-
-
 class MultiSourceDomainDataset(Dataset):
     """
     Wrap multiple DomainDataset objects and return (img, label, domain_id).
@@ -881,26 +839,6 @@ def get_dataloader(config):
     strong_train_aug = is_truthy(getattr(config.method, "strong_train_aug", False))
     source_aug_cfg = getattr(config.method, "source_aug", None)
     target_aug_cfg = getattr(config.method, "target_aug", None)
-    clipart_focus_cfg = getattr(config.method, "clipart_focus", None)
-    is_officehome_clipart_target = dataset_name_lower == "office-home" and target_domain_lower == "clipart"
-
-    clipart_train_pre = []
-    clipart_eval_pre = []
-    if clipart_focus_cfg is not None:
-        auto_enable = bool(is_officehome_clipart_target)
-        clipart_focus_enabled = resolve_auto_bool(getattr(clipart_focus_cfg, "enabled", False), auto_enable)
-        if clipart_focus_enabled and is_officehome_clipart_target:
-            cropper = TightCropByWhiteThreshold(
-                white_threshold=int(getattr(clipart_focus_cfg, "white_threshold", 245)),
-                padding=int(getattr(clipart_focus_cfg, "bbox_padding", 2)),
-                min_foreground_pixels=int(getattr(clipart_focus_cfg, "min_foreground_pixels", 10)),
-            )
-            if is_truthy(getattr(clipart_focus_cfg, "apply_on_train", True)):
-                train_prob = float(getattr(clipart_focus_cfg, "train_prob", 0.8))
-                clipart_train_pre.append(RandomApplyTransform(cropper, p=train_prob))
-            if is_truthy(getattr(clipart_focus_cfg, "apply_on_eval", True)):
-                clipart_eval_pre.append(cropper)
-
     # Optional color-space stacking (used by `dcfm_cs`).
     color_space_cfg = getattr(config.method, "color_space", None)
     use_color_space = color_space_cfg is not None and is_truthy(getattr(color_space_cfg, "enabled", False))
@@ -982,7 +920,7 @@ def get_dataloader(config):
                 ]
             )
 
-    geom_test = clipart_eval_pre + [transforms.Resize((224, 224))]
+    geom_test = [transforms.Resize((224, 224))]
     if use_color_space:
         test_color_stack = ColorSpaceToTensorStack(
             spaces=spaces, mean=mean, std=std, random_erasing_p=0.0
@@ -997,15 +935,15 @@ def get_dataloader(config):
             ]
         )
     
-    # Strong Augmentation for DGA-Revamp
+    # Weak/strong target views for consistency-based methods.
     strong_aug_enabled = is_truthy(getattr(config.method, "strong_aug", False))
     target_transform = train_transform
 
-    target_tensor_v2_auto = is_cuda_device and method_name == "rgr"
+    target_tensor_v2_auto = is_cuda_device and method_name == "prc"
     target_tensor_v2_enabled = resolve_auto_bool(target_tensor_v2_cfg, target_tensor_v2_auto)
-    if target_tensor_v2_enabled and method_name != "rgr":
+    if target_tensor_v2_enabled and method_name != "prc":
         logger.warning(
-            "performance.augmentation.target_tensor_v2=True is currently wired for method=rgr only; "
+            "performance.augmentation.target_tensor_v2=True is currently wired for method=prc only; "
             "falling back to dataset weak/strong transforms for method=%s.",
             method_name or "<unknown>",
         )
@@ -1028,14 +966,13 @@ def get_dataloader(config):
             # Keep decode + deterministic resize in dataloader; apply weak/strong random ops
             # in solver on tensor path (v2, GPU-capable).
             target_transform = transforms.Compose(
-                clipart_train_pre
-                + [
+                [
                     transforms.Resize((256, 256)),
                     transforms.PILToTensor(),  # uint8 [C,H,W]
                 ]
             )
             logger.info(
-                "Target weak/strong augmentation: tensor path enabled (method=rgr). "
+                "Target weak/strong augmentation: tensor path enabled (method=prc). "
                 "Loader outputs uint8 tensors after resize; random weak/strong ops run in solver."
             )
         else:
@@ -1050,8 +987,7 @@ def get_dataloader(config):
             # Standard Weak
             if use_color_space:
                 weak_aug = transforms.Compose(
-                    clipart_train_pre
-                    + [
+                    [
                         transforms.Resize((256, 256)),
                         transforms.RandomCrop(224),
                         transforms.RandomHorizontalFlip(),
@@ -1062,8 +998,7 @@ def get_dataloader(config):
                 )
             else:
                 weak_aug = transforms.Compose(
-                    clipart_train_pre
-                    + [
+                    [
                         transforms.Resize((256, 256)),
                         transforms.RandomCrop(224),
                         transforms.RandomHorizontalFlip(),
@@ -1087,8 +1022,7 @@ def get_dataloader(config):
                     else 10
                 )
                 strong_aug = transforms.Compose(
-                    clipart_train_pre
-                    + [
+                    [
                         transforms.Resize((256, 256)),
                         transforms.RandomCrop(224),
                         transforms.RandomHorizontalFlip(),
@@ -1113,8 +1047,7 @@ def get_dataloader(config):
                     else 10
                 )
                 strong_aug = transforms.Compose(
-                    clipart_train_pre
-                    + [
+                    [
                         transforms.Resize((256, 256)),
                         transforms.RandomCrop(224),
                         transforms.RandomHorizontalFlip(),
@@ -1130,28 +1063,6 @@ def get_dataloader(config):
                 )
 
             target_transform = WeakStrongAugment(weak_aug, strong_aug)
-    elif clipart_train_pre:
-        if use_color_space:
-            target_transform = transforms.Compose(
-                clipart_train_pre
-                + geom_train
-                + [
-                    ColorSpaceToTensorStack(
-                        spaces=spaces,
-                        mean=mean,
-                        std=std,
-                        random_erasing_p=random_erasing_p,
-                    )
-                ]
-            )
-        else:
-            target_tail = [
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-            ]
-            if strong_train_aug:
-                target_tail.append(transforms.RandomErasing(p=0.25))
-            target_transform = transforms.Compose(clipart_train_pre + geom_train + target_tail)
 
     logger.info(
         "Target augmentation runtime | strong_aug=%s tensor_v2=%s color_space=%s",

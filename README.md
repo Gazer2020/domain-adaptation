@@ -85,14 +85,14 @@ python src/main.py dataset=office-31 method=mic exp_name=mic_a2w
 MSDA example:
 
 ```bash
-python src/main.py dataset=image-clef method=rgr dataset.sources='[b,c,i]' dataset.target=p exp_name=rgr_imageclef_bci_to_p
+python src/main.py dataset=image-clef method=prc dataset.sources='[b,c,i]' dataset.target=p exp_name=prc_imageclef_bci_to_p
 ```
 
 Useful override examples:
 
 ```bash
-python src/main.py method=rgr performance.compile.enabled=false
-python src/main.py method=rgr performance.augmentation.target_tensor_v2=auto
+python src/main.py method=prc performance.compile.enabled=false
+python src/main.py method=prc performance.augmentation.target_tensor_v2=auto
 python src/main.py num_workers=8 performance.dataloader.num_workers_source=4
 ```
 

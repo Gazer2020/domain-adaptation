@@ -22,7 +22,7 @@ _SOLVER_MODULES = {
     "factda": "methods.factda",
     "dare": "methods.dare",
     "rvtc": "methods.rvtc",
-    "rgr": "methods.rgr",
+    "prc": "methods.prc",
 }
 
 

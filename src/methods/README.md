@@ -37,7 +37,7 @@ Keep epoch logs compact and field-oriented:
 - prefer one summary line per epoch rather than multiple fragmented lines
 
 Examples:
-- `RGR 3/20 | src=1.2043 rnode=0.0812 total=1.2368 | rmp=0.50 crmp=1.00 | Acc=72.40% (best=73.10%)`
+- `PRC 3/20 | src=1.2043 rnode=0.0812 rconf=0.0421 total=1.2368 | rmp=0.50 crmp=1.00 tmp=0.145 | Acc=72.40% (best=73.10%)`
 - `DCFM Warmup 2/5 | task=0.9123 dom=0.3881 total=1.3004 | Acc=64.20% (best=64.20%)`
 
 ## Checkpoint Conventions

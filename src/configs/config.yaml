@@ -33,7 +33,7 @@ performance:
     dynamic: false
     fullgraph: false
   augmentation:
-    target_tensor_v2: auto  # auto enables the faster tensor path for supported CUDA+rgr runs
+    target_tensor_v2: auto  # auto enables the faster tensor path for supported CUDA+prc runs
   dataloader:
     storage_backend: files  # files, lmdb
     lmdb_root: data/lmdb-cache  # default cache dir (recommended symlink -> /root/autodl-tmp/lmdb-cache)

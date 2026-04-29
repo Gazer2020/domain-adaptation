@@ -10,11 +10,18 @@ from .config import (
     resolve_auto_bool,
     resolve_int_or_auto,
 )
-from .runtime import configure_torch_runtime, log_dataset_summary, log_runtime_summary, set_seed
+from .runtime import (
+    CudaBatchPrefetcher,
+    configure_torch_runtime,
+    log_dataset_summary,
+    log_runtime_summary,
+    set_seed,
+)
 from .utils import AverageMeter, cycle, get_device
 
 __all__ = [
     "AverageMeter",
+    "CudaBatchPrefetcher",
     "cfg_get",
     "configure_torch_runtime",
     "cycle",

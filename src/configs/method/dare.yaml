@@ -49,14 +49,5 @@ target_aug:
   randaugment_num_ops: 2
   randaugment_magnitude: 10
 
-clipart_focus:
-  enabled: false
-  apply_on_train: true
-  apply_on_eval: true
-  train_prob: 0.8
-  white_threshold: 245
-  bbox_padding: 2
-  min_foreground_pixels: 10
-
 setting: msda
 supported_settings: [msda]

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import random
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -84,3 +85,67 @@ def log_dataset_summary(logger: logging.Logger, cfg, class_info: dict) -> None:
         len(class_info["shared_classes"]),
         class_info["unknown_label"],
     )
+
+
+def _record_stream_recursive(batch: Any, stream: torch.cuda.Stream) -> None:
+    if torch.is_tensor(batch):
+        if batch.is_cuda:
+            batch.record_stream(stream)
+        return
+    if isinstance(batch, (list, tuple)):
+        for value in batch:
+            _record_stream_recursive(value, stream)
+        return
+    if isinstance(batch, dict):
+        for value in batch.values():
+            _record_stream_recursive(value, stream)
+
+
+class CudaBatchPrefetcher:
+    """Prefetch the next batch to a CUDA stream while the current batch computes."""
+
+    def __init__(
+        self,
+        iterator,
+        load_fn: Callable[[Any], Any],
+        enabled: bool,
+        stream: Optional[torch.cuda.Stream] = None,
+    ):
+        self.iterator = iterator
+        self.load_fn = load_fn
+        self.enabled = bool(enabled) and torch.cuda.is_available()
+        self.stream = stream if self.enabled else None
+        if self.enabled and self.stream is None:
+            self.stream = torch.cuda.Stream()
+        self._next_batch = None
+        self._preload()
+
+    def _preload(self) -> None:
+        try:
+            raw = next(self.iterator)
+        except StopIteration:
+            self._next_batch = None
+            return
+
+        if not self.enabled or self.stream is None:
+            self._next_batch = self.load_fn(raw)
+            return
+
+        with torch.cuda.stream(self.stream):
+            self._next_batch = self.load_fn(raw)
+
+    def pop(self):
+        if self._next_batch is None:
+            raise StopIteration
+
+        if self.enabled and self.stream is not None:
+            current_stream = torch.cuda.current_stream()
+            current_stream.wait_stream(self.stream)
+            _record_stream_recursive(self._next_batch, current_stream)
+
+        batch = self._next_batch
+        self._preload()
+        return batch
+
+    def close(self) -> None:
+        self._next_batch = None

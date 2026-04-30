@@ -8,6 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+.env
 
 # MacOS
 .DS_Store
@@ -28,3 +29,4 @@ results/**
 
 scripts/**
 !scripts/README.md
+!scripts/run_experiment_suite.py

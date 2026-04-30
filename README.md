@@ -44,6 +44,8 @@ results/                  # Hydra run outputs
 scripts/                  # local helper scripts
 ```
 
+Registered solvers are `cad`, `cosda`, `dare`, `dcfm`, `factda`, `mic`, `prc`, `ros`, `rtda`, `rvtc`, and `sourceonly`.
+
 ## Setup
 
 Python `>=3.10` is required.
@@ -66,9 +68,12 @@ Expected workflow:
 - optionally symlink `data/lmdb-cache` to a faster local disk
 
 Examples already used by this repo:
+- `data/domainnet -> /root/autodl-tmp/DomainNet`
+- `data/image-clef -> /root/autodl-tmp/image_CLEF`
 - `data/office-31 -> /root/autodl-tmp/Office-31`
 - `data/office-home -> /root/autodl-tmp/OfficeHome`
-- `data/image-clef -> /root/autodl-tmp/image_CLEF`
+- `data/pacs -> /root/autodl-tmp/PACS`
+- `data/visda-2017 -> /root/autodl-tmp/Visda-2017`
 
 See [data/README.md](data/README.md) for the local-data policy.
 
@@ -101,6 +106,28 @@ Hydra writes each run under:
 ```text
 results/<exp_name>/
 ```
+
+Because Hydra changes into that run directory, the default best checkpoint path is:
+
+```text
+results/<exp_name>/checkpoints/<exp_name>.pth
+```
+
+## Batch Experiment Suites
+
+For multi-task sweeps, use [run_experiment_suite.py](scripts/run_experiment_suite.py) with a JSON spec:
+
+```bash
+python scripts/run_experiment_suite.py --spec scripts/specs/<suite>.json --groups main
+```
+
+Useful launcher options:
+- `--screen` starts a detached `screen` session for long runs.
+- `--resume` skips completed experiment ids from an existing `summary.csv`.
+- `--notify-feishu` sends the generated `summary.md` to the Feishu webhook stored as `FEISHU_WEBHOOK_URL` in the repository-root `.env`.
+- `--shutdown` powers off after all selected runs finish and notifications are attempted; only use it when that behavior is intended.
+
+Feishu webhook requests bypass machine-wide proxy environment variables so a stopped local proxy does not block result delivery.
 
 ## Adding a New Method
 

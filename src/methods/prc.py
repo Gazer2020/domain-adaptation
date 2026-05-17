@@ -18,6 +18,7 @@ Mainline from the implementation:
 import copy
 import logging
 import math
+import time
 from contextlib import contextmanager
 from typing import Dict, Optional, Tuple
 
@@ -349,6 +350,26 @@ class PRCSolver(BaseSolver):
 
         self.total_epochs = int(m.get("epochs", 20))
         self.ramp_denom = float(m.get("ramp_denom", 16.0))
+        prototype_batch_size = m.get("prototype_batch_size", None)
+        self.prototype_batch_size = (
+            int(prototype_batch_size)
+            if prototype_batch_size is not None
+            else int(self.config.batch_size)
+        )
+        self.prototype_batch_size = max(1, self.prototype_batch_size)
+        self.prototype_prefetch_factor = max(1, int(m.get("prototype_prefetch_factor", 4)))
+        self.prototype_persistent_workers = self._is_truthy(
+            m.get("prototype_persistent_workers", True)
+        )
+        self.prototype_cache_features = self._is_truthy(m.get("prototype_cache_features", False))
+        self.prototype_cached_confusion_batch_size = max(
+            1,
+            int(m.get("prototype_cached_confusion_batch_size", 8192)),
+        )
+        self.prototype_cuda_prefetch = self._resolve_auto_bool(
+            m.get("prototype_cuda_prefetch", "auto"),
+            auto_value=(self.device.type == "cuda"),
+        )
 
         self.temperature_start = float(m.get("temperature_start", 0.15))
         self.temperature_end = float(m.get("temperature_end", 0.10))
@@ -401,7 +422,8 @@ class PRCSolver(BaseSolver):
         logger.info(
             "PRC mainline: bottleneck=%d temp=%.2f->%.2f conf_topk=%d "
             "routing=sparsemax conf_src=classifier rel_space_dim=%d lambda_rel_cons=%.2f "
-            "rel_w(node/conf)=%.2f/%.2f proto=full_eval ramp_start=%d ramp_denom=%.1f prefetch=%s",
+            "rel_w(node/conf)=%.2f/%.2f proto=full_eval proto_bs=%d proto_cache=%s proto_prefetch=%s "
+            "ramp_start=%d ramp_denom=%.1f prefetch=%s",
             self.bottleneck_dim,
             self.temperature_start,
             self.temperature_end,
@@ -410,6 +432,9 @@ class PRCSolver(BaseSolver):
             self.lambda_relation_consistency,
             self.lambda_rel_consistency_node,
             self.lambda_rel_consistency_conf,
+            self.prototype_batch_size,
+            str(self.prototype_cache_features),
+            str(self.prototype_cuda_prefetch),
             self.consistency_start_epoch,
             self.ramp_denom,
             str(self.cuda_batch_prefetch),
@@ -704,21 +729,40 @@ class PRCSolver(BaseSolver):
 
     def _prototype_source_loader(self):
         kwargs = {
-            "batch_size": int(self.config.batch_size),
+            "batch_size": self.prototype_batch_size,
             "shuffle": False,
             "drop_last": False,
             "num_workers": int(getattr(self.source_loader, "num_workers", 0)),
             "pin_memory": bool(getattr(self.source_loader, "pin_memory", False)),
         }
         if kwargs["num_workers"] > 0:
-            kwargs["persistent_workers"] = False
-            kwargs["prefetch_factor"] = 2
+            kwargs["persistent_workers"] = self.prototype_persistent_workers
+            kwargs["prefetch_factor"] = self.prototype_prefetch_factor
         return DataLoader(self.source_loader.dataset, **kwargs)
 
     @contextmanager
     def _prototype_source_iter(self):
         with self._temporary_source_transform(self._source_eval_transform()):
             yield self._prototype_source_loader()
+
+    def _iter_prototype_source_batches(self, loader):
+        if not (self.prototype_cuda_prefetch and self.device.type == "cuda"):
+            yield from loader
+            return
+
+        prefetcher = CudaBatchPrefetcher(
+            iter(loader),
+            self._load_source_batch_to_device,
+            enabled=True,
+            stream=self._src_prefetch_stream,
+        )
+        try:
+            while True:
+                yield prefetcher.pop()
+        except StopIteration:
+            return
+        finally:
+            prefetcher.close()
 
     def _compute_source_prototypes(self, model: PRCNetwork):
         feat_sums = torch.zeros(
@@ -734,6 +778,7 @@ class PRCSolver(BaseSolver):
         )
         feat_sums_flat = feat_sums.view(-1, model.relation_feat_dim)
         counts_flat = counts.view(-1)
+        feature_cache = [] if self.prototype_cache_features else None
 
         for src_imgs, src_labels, src_dom in self._active_prototype_loader:
             src_imgs = self._to_device(src_imgs)
@@ -751,12 +796,14 @@ class PRCSolver(BaseSolver):
                 flat_index,
                 torch.ones_like(flat_index, dtype=counts_flat.dtype),
             )
+            if feature_cache is not None:
+                feature_cache.append((h_shared.detach(), src_labels.detach(), src_dom.detach()))
 
         valid = counts > 0
         safe_counts = counts.clamp_min(1.0).unsqueeze(-1)
         prototypes = feat_sums / safe_counts
         prototypes = torch.where(valid.unsqueeze(-1), prototypes, torch.zeros_like(prototypes))
-        return valid, prototypes
+        return valid, prototypes, feature_cache
 
     def _compute_source_classifier_confusion(self, model: PRCNetwork, valid: torch.Tensor):
         """Average source predictions into off-diagonal per-domain class confusions."""
@@ -785,6 +832,67 @@ class PRCSolver(BaseSolver):
         confusion = confusion / confusion.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         return torch.where(valid.unsqueeze(-1), confusion, torch.zeros_like(confusion))
 
+    def _compute_source_classifier_confusion_from_features(
+        self,
+        model: PRCNetwork,
+        valid: torch.Tensor,
+        feature_cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ):
+        """Average source predictions from cached source features."""
+        confusion = torch.zeros(
+            self.num_source_domains,
+            self.num_classes,
+            self.num_classes,
+            device=self.device,
+        )
+        confusion_flat = confusion.view(-1, self.num_classes)
+
+        for h_shared, src_labels, src_dom in self._iter_cached_feature_batches(feature_cache):
+            with self._auto_cast():
+                logits, _ = self._forward_logits(model, h_shared=h_shared)
+                probs = torch.softmax(logits, dim=1)
+
+            flat_index = src_dom.long() * self.num_classes + src_labels.long()
+            confusion_flat.index_add_(0, flat_index, probs)
+
+        eye = torch.eye(self.num_classes, device=self.device).unsqueeze(0)
+        confusion = confusion * (1.0 - eye)
+        confusion = confusion / confusion.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        return torch.where(valid.unsqueeze(-1), confusion, torch.zeros_like(confusion))
+
+    def _iter_cached_feature_batches(
+        self,
+        feature_cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ):
+        target_batch_size = self.prototype_cached_confusion_batch_size
+        pending_h = []
+        pending_labels = []
+        pending_dom = []
+        pending_size = 0
+
+        for h_shared, src_labels, src_dom in feature_cache:
+            pending_h.append(h_shared)
+            pending_labels.append(src_labels)
+            pending_dom.append(src_dom)
+            pending_size += int(h_shared.shape[0])
+            if pending_size >= target_batch_size:
+                yield (
+                    torch.cat(pending_h, dim=0),
+                    torch.cat(pending_labels, dim=0),
+                    torch.cat(pending_dom, dim=0),
+                )
+                pending_h.clear()
+                pending_labels.clear()
+                pending_dom.clear()
+                pending_size = 0
+
+        if pending_size > 0:
+            yield (
+                torch.cat(pending_h, dim=0),
+                torch.cat(pending_labels, dim=0),
+                torch.cat(pending_dom, dim=0),
+            )
+
     def _recompute_source_prototypes(self, model: PRCNetwork):
         with torch.inference_mode():
             was_training = model.training
@@ -792,14 +900,31 @@ class PRCSolver(BaseSolver):
 
             with self._prototype_source_iter() as prototype_loader:
                 try:
-                    self._active_prototype_loader = prototype_loader
-                    valid, prototypes = self._compute_source_prototypes(model)
+                    self._active_prototype_loader = self._iter_prototype_source_batches(
+                        prototype_loader
+                    )
+                    started_at = time.time()
+                    valid, prototypes, feature_cache = self._compute_source_prototypes(model)
+                    prototype_minutes = (time.time() - started_at) / 60.0
 
                     model.reset_source_prototypes()
                     model.relation_router.src_proto_inited.copy_(valid)
                     model.relation_router.src_prototypes.copy_(prototypes)
-                    model.relation_router.src_classifier_confusion.copy_(
-                        self._compute_source_classifier_confusion(model, valid)
+                    confusion_started_at = time.time()
+                    if feature_cache is not None:
+                        confusion = self._compute_source_classifier_confusion_from_features(
+                            model, valid, feature_cache
+                        )
+                    else:
+                        confusion = self._compute_source_classifier_confusion(model, valid)
+                    model.relation_router.src_classifier_confusion.copy_(confusion)
+                    logger.info(
+                        "PRC source prototype refresh | proto_bs=%d cache=%s "
+                        "proto_min=%.2f confusion_min=%.2f",
+                        self.prototype_batch_size,
+                        str(feature_cache is not None),
+                        prototype_minutes,
+                        (time.time() - confusion_started_at) / 60.0,
                     )
                 finally:
                     self._active_prototype_loader = None

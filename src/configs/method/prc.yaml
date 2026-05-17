@@ -16,3 +16,12 @@ save_ckpt_after_epoch: 15
 strong_aug: true
 strong_train_aug: true
 stratified_batch: true
+
+# Optional source-eval batch size used only when refreshing source prototypes
+# and source classifier-confusion statistics. Null falls back to batch_size.
+prototype_batch_size: null
+prototype_prefetch_factor: 4
+prototype_persistent_workers: true
+prototype_cache_features: false
+prototype_cached_confusion_batch_size: 8192
+prototype_cuda_prefetch: auto

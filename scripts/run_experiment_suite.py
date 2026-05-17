@@ -40,6 +40,7 @@ import argparse
 import csv
 import json
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -52,6 +53,33 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 ACC_RE = re.compile(r"Acc=([0-9]+(?:\.[0-9]+)?)% \(best=([0-9]+(?:\.[0-9]+)?)%\)")
+MANUAL_STOP_SIGNALS = {
+    signal.SIGINT,
+    signal.SIGTERM,
+    signal.SIGHUP,
+    signal.SIGQUIT,
+}
+
+
+class RunFailedError(RuntimeError):
+    def __init__(self, exp_name: str, returncode: int):
+        super().__init__(f"Run failed: {exp_name} rc={returncode}")
+        self.exp_name = exp_name
+        self.returncode = returncode
+
+    @property
+    def stop_signal(self) -> signal.Signals | None:
+        if self.returncode >= 0:
+            return None
+        try:
+            return signal.Signals(-self.returncode)
+        except ValueError:
+            return None
+
+    @property
+    def is_manual_stop(self) -> bool:
+        stop_signal = self.stop_signal
+        return stop_signal in MANUAL_STOP_SIGNALS
 
 
 def parse_args() -> argparse.Namespace:
@@ -187,7 +215,7 @@ def run_one(
 
         rc = proc.wait()
         if rc != 0:
-            raise RuntimeError(f"Run failed: {exp_name} rc={rc}")
+            raise RunFailedError(exp_name, rc)
 
     return {
         "suite": suite_name,
@@ -444,12 +472,27 @@ def run_suite(args: argparse.Namespace, spec: dict) -> None:
     started_at = time.time()
     status = "success"
     error = None
+    caught_exc = None
+    should_shutdown = args.shutdown
     try:
         run_suite_body(args, spec, groups)
+    except KeyboardInterrupt as exc:
+        status = "interrupted"
+        error = "KeyboardInterrupt"
+        caught_exc = exc
+        should_shutdown = False
     except Exception as exc:
-        status = "failed"
-        error = str(exc)
-        raise
+        caught_exc = exc
+        if isinstance(exc, RunFailedError) and exc.is_manual_stop:
+            status = "interrupted"
+            stop_signal = exc.stop_signal
+            signal_name = stop_signal.name if stop_signal is not None else f"signal {-exc.returncode}"
+            error = f"{exc} ({signal_name}; treated as manual stop)"
+            should_shutdown = False
+        else:
+            status = "failed"
+            error = str(exc)
+            should_shutdown = args.shutdown
     finally:
         maybe_notify_feishu(
             args=args,
@@ -459,9 +502,13 @@ def run_suite(args: argparse.Namespace, spec: dict) -> None:
             started_at=started_at,
             error=error,
         )
-    if args.shutdown:
+    if should_shutdown:
         print(f"All requested runs finished. Calling shutdown via shell: {args.shutdown_cmd}", flush=True)
         subprocess.run(["bash", "-lc", args.shutdown_cmd], check=False, cwd=ROOT)
+    else:
+        print(f"Shutdown skipped for suite status: {status}", flush=True)
+    if caught_exc is not None:
+        raise caught_exc
 
 
 def main() -> None:

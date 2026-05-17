@@ -53,6 +53,9 @@ def soft_prob_cross_entropy(
     return losses.mean()
 
 
+_sparsemax_ks_cache: dict[tuple, torch.Tensor] = {}
+
+
 def sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Sparsemax over `dim` with the same shape as softmax outputs."""
     if logits.numel() == 0:
@@ -64,7 +67,11 @@ def sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
 
     z_sorted, _ = torch.sort(z, dim=-1, descending=True)
     z_cumsum = z_sorted.cumsum(dim=-1)
-    ks = torch.arange(1, z.size(-1) + 1, device=z.device, dtype=z.dtype).unsqueeze(0)
+    cache_key = (z.device, z.dtype, z.size(-1))
+    ks = _sparsemax_ks_cache.get(cache_key)
+    if ks is None:
+        ks = torch.arange(1, z.size(-1) + 1, device=z.device, dtype=z.dtype).unsqueeze(0)
+        _sparsemax_ks_cache[cache_key] = ks
     support = 1 + ks * z_sorted > z_cumsum
     support_size = support.sum(dim=-1, keepdim=True).clamp_min(1)
     tau = (z_cumsum.gather(-1, support_size - 1) - 1.0) / support_size.to(z.dtype)
@@ -90,13 +97,12 @@ class PrototypeRelationRouter(nn.Module):
         num_classes: int,
         num_source_domains: int,
         relation_temperature: float = 0.10,
-        confusion_topk: int = 4,
     ):
         super().__init__()
         self.feat_dim = int(feat_dim)
         self.num_classes = int(num_classes)
         self.num_source_domains = int(num_source_domains)
-        self.confusion_topk = max(0, int(confusion_topk))
+        self.confusion_topk = 4
         self.register_buffer(
             "relation_temperature",
             torch.tensor(max(1e-6, float(relation_temperature)), dtype=torch.float32),
@@ -222,7 +228,6 @@ class PRCNetwork(nn.Module):
         *,
         bottleneck_dim: int = 256,
         relation_temperature: float = 0.10,
-        confusion_topk: int = 4,
     ):
         super().__init__()
 
@@ -257,7 +262,6 @@ class PRCNetwork(nn.Module):
             num_classes=self.num_classes,
             num_source_domains=self.num_source_domains,
             relation_temperature=relation_temperature,
-            confusion_topk=confusion_topk,
         )
 
     def extract_relation_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -361,11 +365,6 @@ class PRCSolver(BaseSolver):
         self.prototype_persistent_workers = self._is_truthy(
             m.get("prototype_persistent_workers", True)
         )
-        self.prototype_cache_features = self._is_truthy(m.get("prototype_cache_features", False))
-        self.prototype_cached_confusion_batch_size = max(
-            1,
-            int(m.get("prototype_cached_confusion_batch_size", 8192)),
-        )
         self.prototype_cuda_prefetch = self._resolve_auto_bool(
             m.get("prototype_cuda_prefetch", "auto"),
             auto_value=(self.device.type == "cuda"),
@@ -399,7 +398,6 @@ class PRCSolver(BaseSolver):
             num_source_domains=self.num_source_domains,
             bottleneck_dim=self.bottleneck_dim,
             relation_temperature=self.relation_temperature,
-            confusion_topk=self.confusion_topk,
         ).to(self.device)
 
         self.ema_net = copy.deepcopy(self.net)
@@ -408,7 +406,6 @@ class PRCSolver(BaseSolver):
 
         self._forward_logits_student = self.net.forward_relation_logits
         self._student_forward_compiled = False
-        self._amp_dtype_chain_logged = False
         self._target_tensor_aug_enabled = False
         self._target_weak_aug = None
         self._target_strong_aug = None
@@ -422,7 +419,7 @@ class PRCSolver(BaseSolver):
         logger.info(
             "PRC mainline: bottleneck=%d temp=%.2f->%.2f conf_topk=%d "
             "routing=sparsemax conf_src=classifier rel_space_dim=%d lambda_rel_cons=%.2f "
-            "rel_w(node/conf)=%.2f/%.2f proto=full_eval proto_bs=%d proto_cache=%s proto_prefetch=%s "
+            "rel_w(node/conf)=%.2f/%.2f proto=full_eval proto_bs=%d proto_prefetch=%s "
             "ramp_start=%d ramp_denom=%.1f prefetch=%s",
             self.bottleneck_dim,
             self.temperature_start,
@@ -433,7 +430,6 @@ class PRCSolver(BaseSolver):
             self.lambda_rel_consistency_node,
             self.lambda_rel_consistency_conf,
             self.prototype_batch_size,
-            str(self.prototype_cache_features),
             str(self.prototype_cuda_prefetch),
             self.consistency_start_epoch,
             self.ramp_denom,
@@ -576,23 +572,10 @@ class PRCSolver(BaseSolver):
         tgt_imgs = tgt_batch[0] if isinstance(tgt_batch, (tuple, list)) else tgt_batch
         return self._prepare_target_views(tgt_imgs)
 
-    def _log_amp_dtype_chain_once(self, src_imgs: torch.Tensor, logits_src: torch.Tensor):
-        if self._amp_dtype_chain_logged or not self.amp_enabled:
-            return
-        self._amp_dtype_chain_logged = True
-
-        with torch.no_grad():
-            with self._auto_cast():
-                relation_features = self.net.extract_relation_features(src_imgs)
-                normalized_features = self.net.normalize_relation_features(relation_features)
-
-        logger.info(
-            "PRC AMP dtype chain | relation_features=%s normalized=%s logits=%s "
-            "(float32 normalized/logits are expected here because LayerNorm and probability ops promote for stability)",
-            str(relation_features.dtype).replace("torch.", ""),
-            str(normalized_features.dtype).replace("torch.", ""),
-            str(logits_src.dtype).replace("torch.", ""),
-        )
+    # NOTE: Under AMP, LayerNorm and log_softmax/logsumexp internally promote to
+    # float32 for numerical stability even when autocast wraps the region. The
+    # backbone runs in BF16/FP16 (tensor cores), but the relation head operates in
+    # FP32. This is expected PyTorch behaviour and is not a correctness issue.
 
     @torch.no_grad()
     def _update_ema(self, decay: float):
@@ -618,11 +601,18 @@ class PRCSolver(BaseSolver):
         weights: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Match teacher/student target relations, not just class marginals."""
-        node_loss = soft_prob_cross_entropy(
-            self._normalize_distribution(student_aux["node_mass"].flatten(1)),
-            self._normalize_distribution(teacher_aux["node_mass"].flatten(1)),
-            weights=weights,
-        )
+        # Two-step normalization preserves class-domain structure:
+        #  1. Per-class domain distribution (each class sums to 1 over domains)
+        #  2. Global normalize over flat (C*D) so total sums to 1
+        student_node = student_aux["node_mass"]  # [B, C, D]
+        student_node = student_node / student_node.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        student_node = self._normalize_distribution(student_node.flatten(1))
+
+        teacher_node = teacher_aux["node_mass"]
+        teacher_node = teacher_node / teacher_node.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        teacher_node = self._normalize_distribution(teacher_node.flatten(1))
+
+        node_loss = soft_prob_cross_entropy(student_node, teacher_node, weights=weights)
         conf_loss = soft_prob_cross_entropy(
             self._normalize_distribution(student_aux["confusion_profile"]),
             self._normalize_distribution(teacher_aux["confusion_profile"]),
@@ -764,7 +754,8 @@ class PRCSolver(BaseSolver):
         finally:
             prefetcher.close()
 
-    def _compute_source_prototypes(self, model: PRCNetwork):
+    def _compute_source_prototypes(self, model: PRCNetwork, prototype_loader):
+        """Single-pass: compute per-class prototypes and classifier confusion."""
         feat_sums = torch.zeros(
             self.num_source_domains,
             self.num_classes,
@@ -776,11 +767,17 @@ class PRCSolver(BaseSolver):
             self.num_classes,
             device=self.device,
         )
+        confusion = torch.zeros(
+            self.num_source_domains,
+            self.num_classes,
+            self.num_classes,
+            device=self.device,
+        )
         feat_sums_flat = feat_sums.view(-1, model.relation_feat_dim)
         counts_flat = counts.view(-1)
-        feature_cache = [] if self.prototype_cache_features else None
+        confusion_flat = confusion.view(-1, self.num_classes)
 
-        for src_imgs, src_labels, src_dom in self._active_prototype_loader:
+        for src_imgs, src_labels, src_dom in prototype_loader:
             src_imgs = self._to_device(src_imgs)
             src_labels = self._to_device(src_labels)
             src_dom = self._to_device(src_dom)
@@ -788,110 +785,29 @@ class PRCSolver(BaseSolver):
             with self._auto_cast():
                 h = model.extract_relation_features(src_imgs)
                 h_shared = model.normalize_relation_features(h)
+                logits, _ = self._forward_logits(model, h_shared=h_shared)
+                probs = torch.softmax(logits, dim=1)
 
             flat_index = src_dom.long() * self.num_classes + src_labels.long()
-            feat_sums_flat.index_add_(0, flat_index, h_shared)
-            counts_flat.index_add_(
-                0,
-                flat_index,
-                torch.ones_like(flat_index, dtype=counts_flat.dtype),
-            )
-            if feature_cache is not None:
-                feature_cache.append((h_shared.detach(), src_labels.detach(), src_dom.detach()))
+            # Sort by flat_index so index_add_ writes are coalesced on CUDA.
+            order = flat_index.argsort()
+            flat_index_sorted = flat_index[order]
+            feat_sums_flat.index_add_(0, flat_index_sorted, h_shared[order])
+            ones = torch.ones(flat_index_sorted.size(0), dtype=counts_flat.dtype, device=self.device)
+            counts_flat.index_add_(0, flat_index_sorted, ones)
+            confusion_flat.index_add_(0, flat_index_sorted, probs[order])
 
         valid = counts > 0
         safe_counts = counts.clamp_min(1.0).unsqueeze(-1)
         prototypes = feat_sums / safe_counts
         prototypes = torch.where(valid.unsqueeze(-1), prototypes, torch.zeros_like(prototypes))
-        return valid, prototypes, feature_cache
-
-    def _compute_source_classifier_confusion(self, model: PRCNetwork, valid: torch.Tensor):
-        """Average source predictions into off-diagonal per-domain class confusions."""
-        confusion = torch.zeros(
-            self.num_source_domains,
-            self.num_classes,
-            self.num_classes,
-            device=self.device,
-        )
-        confusion_flat = confusion.view(-1, self.num_classes)
-
-        for src_imgs, src_labels, src_dom in self._active_prototype_loader:
-            src_imgs = self._to_device(src_imgs)
-            src_labels = self._to_device(src_labels)
-            src_dom = self._to_device(src_dom)
-
-            with self._auto_cast():
-                logits, _ = self._forward_logits(model, x=src_imgs)
-                probs = torch.softmax(logits, dim=1)
-
-            flat_index = src_dom.long() * self.num_classes + src_labels.long()
-            confusion_flat.index_add_(0, flat_index, probs)
 
         eye = torch.eye(self.num_classes, device=self.device).unsqueeze(0)
         confusion = confusion * (1.0 - eye)
         confusion = confusion / confusion.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        return torch.where(valid.unsqueeze(-1), confusion, torch.zeros_like(confusion))
+        confusion = torch.where(valid.unsqueeze(-1), confusion, torch.zeros_like(confusion))
 
-    def _compute_source_classifier_confusion_from_features(
-        self,
-        model: PRCNetwork,
-        valid: torch.Tensor,
-        feature_cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    ):
-        """Average source predictions from cached source features."""
-        confusion = torch.zeros(
-            self.num_source_domains,
-            self.num_classes,
-            self.num_classes,
-            device=self.device,
-        )
-        confusion_flat = confusion.view(-1, self.num_classes)
-
-        for h_shared, src_labels, src_dom in self._iter_cached_feature_batches(feature_cache):
-            with self._auto_cast():
-                logits, _ = self._forward_logits(model, h_shared=h_shared)
-                probs = torch.softmax(logits, dim=1)
-
-            flat_index = src_dom.long() * self.num_classes + src_labels.long()
-            confusion_flat.index_add_(0, flat_index, probs)
-
-        eye = torch.eye(self.num_classes, device=self.device).unsqueeze(0)
-        confusion = confusion * (1.0 - eye)
-        confusion = confusion / confusion.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        return torch.where(valid.unsqueeze(-1), confusion, torch.zeros_like(confusion))
-
-    def _iter_cached_feature_batches(
-        self,
-        feature_cache: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    ):
-        target_batch_size = self.prototype_cached_confusion_batch_size
-        pending_h = []
-        pending_labels = []
-        pending_dom = []
-        pending_size = 0
-
-        for h_shared, src_labels, src_dom in feature_cache:
-            pending_h.append(h_shared)
-            pending_labels.append(src_labels)
-            pending_dom.append(src_dom)
-            pending_size += int(h_shared.shape[0])
-            if pending_size >= target_batch_size:
-                yield (
-                    torch.cat(pending_h, dim=0),
-                    torch.cat(pending_labels, dim=0),
-                    torch.cat(pending_dom, dim=0),
-                )
-                pending_h.clear()
-                pending_labels.clear()
-                pending_dom.clear()
-                pending_size = 0
-
-        if pending_size > 0:
-            yield (
-                torch.cat(pending_h, dim=0),
-                torch.cat(pending_labels, dim=0),
-                torch.cat(pending_dom, dim=0),
-            )
+        return valid, prototypes, confusion
 
     def _recompute_source_prototypes(self, model: PRCNetwork):
         with torch.inference_mode():
@@ -899,35 +815,21 @@ class PRCSolver(BaseSolver):
             model.eval()
 
             with self._prototype_source_iter() as prototype_loader:
-                try:
-                    self._active_prototype_loader = self._iter_prototype_source_batches(
-                        prototype_loader
-                    )
-                    started_at = time.time()
-                    valid, prototypes, feature_cache = self._compute_source_prototypes(model)
-                    prototype_minutes = (time.time() - started_at) / 60.0
+                batch_iter = self._iter_prototype_source_batches(prototype_loader)
+                started_at = time.time()
+                valid, prototypes, confusion = self._compute_source_prototypes(model, batch_iter)
+                elapsed_minutes = (time.time() - started_at) / 60.0
 
-                    model.reset_source_prototypes()
-                    model.relation_router.src_proto_inited.copy_(valid)
-                    model.relation_router.src_prototypes.copy_(prototypes)
-                    confusion_started_at = time.time()
-                    if feature_cache is not None:
-                        confusion = self._compute_source_classifier_confusion_from_features(
-                            model, valid, feature_cache
-                        )
-                    else:
-                        confusion = self._compute_source_classifier_confusion(model, valid)
-                    model.relation_router.src_classifier_confusion.copy_(confusion)
-                    logger.info(
-                        "PRC source prototype refresh | proto_bs=%d cache=%s "
-                        "proto_min=%.2f confusion_min=%.2f",
-                        self.prototype_batch_size,
-                        str(feature_cache is not None),
-                        prototype_minutes,
-                        (time.time() - confusion_started_at) / 60.0,
-                    )
-                finally:
-                    self._active_prototype_loader = None
+                model.reset_source_prototypes()
+                model.relation_router.src_proto_inited.copy_(valid)
+                model.relation_router.src_prototypes.copy_(prototypes)
+                model.relation_router.src_classifier_confusion.copy_(confusion)
+                logger.info(
+                    "PRC source prototype refresh | proto_bs=%d single_pass "
+                    "elapsed_min=%.2f",
+                    self.prototype_batch_size,
+                    elapsed_minutes,
+                )
 
             model.train(was_training)
 
@@ -954,7 +856,6 @@ class PRCSolver(BaseSolver):
         with self._auto_cast():
             logits_src, _ = self._forward_logits(self.net, x=src_imgs)
             self._probe_amp_tensor(logits_src, "prc/logits_src", warn_on_float32=False)
-            self._log_amp_dtype_chain_once(src_imgs, logits_src)
             loss_src = self.criterion_task(logits_src, src_labels)
             loss = loss_src
 

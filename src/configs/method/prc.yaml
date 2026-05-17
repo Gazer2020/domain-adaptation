@@ -22,6 +22,4 @@ stratified_batch: true
 prototype_batch_size: null
 prototype_prefetch_factor: 4
 prototype_persistent_workers: true
-prototype_cache_features: false
-prototype_cached_confusion_batch_size: 8192
 prototype_cuda_prefetch: auto

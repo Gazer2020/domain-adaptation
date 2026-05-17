@@ -125,7 +125,7 @@ Useful launcher options:
 - `--screen` starts a detached `screen` session for long runs.
 - `--resume` skips completed experiment ids from an existing `summary.csv`.
 - `--notify-feishu` sends the generated `summary.md` to the Feishu webhook stored as `FEISHU_WEBHOOK_URL` in the repository-root `.env`.
-- `--shutdown` powers off after all selected runs finish and notifications are attempted; only use it when that behavior is intended.
+- `--shutdown` powers off after all selected runs finish and notifications are attempted. Shutdown is skipped if the suite is interrupted (KeyboardInterrupt or manual-stop signals); only use it when that behavior is intended.
 
 Feishu webhook requests bypass machine-wide proxy environment variables so a stopped local proxy does not block result delivery.
 

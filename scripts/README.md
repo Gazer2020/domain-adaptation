@@ -13,6 +13,7 @@ Current launcher:
 
 Auto shutdown is only for runs where the user explicitly requested it; pass `--shutdown` only after that confirmation.
 When both Feishu notification and shutdown are enabled, the launcher sends the notification before calling the shutdown command.
+Shutdown is automatically skipped if the suite is interrupted (KeyboardInterrupt or SIGINT/SIGTERM/SIGHUP/SIGQUIT), so a manual stop does not power off the machine.
 
 Feishu notification:
 - Store `FEISHU_WEBHOOK_URL=...` in the repository-root `.env` file.

@@ -16,6 +16,7 @@ wheels/
 # IDE
 .vscode
 .agent
+.claude
 .cursor
 .ipynb_checkpoints
 AGENTS.md

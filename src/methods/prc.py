@@ -53,9 +53,6 @@ def soft_prob_cross_entropy(
     return losses.mean()
 
 
-_sparsemax_ks_cache: dict[tuple, torch.Tensor] = {}
-
-
 def sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Sparsemax over `dim` with the same shape as softmax outputs."""
     if logits.numel() == 0:
@@ -67,11 +64,7 @@ def sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
 
     z_sorted, _ = torch.sort(z, dim=-1, descending=True)
     z_cumsum = z_sorted.cumsum(dim=-1)
-    cache_key = (z.device, z.dtype, z.size(-1))
-    ks = _sparsemax_ks_cache.get(cache_key)
-    if ks is None:
-        ks = torch.arange(1, z.size(-1) + 1, device=z.device, dtype=z.dtype).unsqueeze(0)
-        _sparsemax_ks_cache[cache_key] = ks
+    ks = torch.arange(1, z.size(-1) + 1, device=z.device, dtype=z.dtype).unsqueeze(0)
     support = 1 + ks * z_sorted > z_cumsum
     support_size = support.sum(dim=-1, keepdim=True).clamp_min(1)
     tau = (z_cumsum.gather(-1, support_size - 1) - 1.0) / support_size.to(z.dtype)

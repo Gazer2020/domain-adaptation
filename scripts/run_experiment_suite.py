@@ -96,6 +96,11 @@ def parse_args() -> argparse.Namespace:
         help="Send a Feishu webhook notification after the suite finishes or fails. Reads URL from .env.",
     )
     parser.add_argument(
+        "--notify-each-run",
+        action="store_true",
+        help="Send a Feishu webhook notification after each completed experiment. Reads URL from .env.",
+    )
+    parser.add_argument(
         "--notify-title",
         default="",
         help="Optional notification title. Defaults to the suite prefix.",
@@ -262,6 +267,8 @@ def launch_in_screen(args: argparse.Namespace, spec: dict) -> None:
         rerun.append("--resume")
     if args.notify_feishu:
         rerun.append("--notify-feishu")
+    if args.notify_each_run:
+        rerun.append("--notify-each-run")
     if args.notify_title:
         rerun.extend(["--notify-title", args.notify_title])
     if args.notify_max_chars != 3500:
@@ -436,6 +443,54 @@ def maybe_notify_feishu(
     )
 
 
+def build_run_notification_markdown(
+    suite_name: str,
+    row: dict,
+    summary_md: Path,
+) -> str:
+    lines = [
+        "**Status:** success",
+        f"**Suite:** `{suite_name}`",
+        f"**Group:** `{row['group']}`",
+        f"**Run:** `{row['id']}`",
+        f"**Name:** `{row['name']}`",
+        f"**Best Acc:** {row['best_acc']}",
+        f"**Last Acc:** {row['last_acc']}",
+        f"**Minutes:** {row['minutes']}",
+        "",
+        f"**Summary:** `{summary_md}`",
+    ]
+    return "\n".join(lines)
+
+
+def maybe_notify_completed_run(
+    args: argparse.Namespace,
+    suite_name: str,
+    row: dict,
+    out_dir: Path,
+) -> None:
+    if not args.notify_each_run:
+        return
+    try:
+        webhook = load_feishu_webhook()
+    except ValueError as exc:
+        print(f"Skip per-run Feishu notification: {exc}", flush=True)
+        return
+    title = f"{suite_name} {row['id']}: success"
+    markdown = build_run_notification_markdown(
+        suite_name=suite_name,
+        row=row,
+        summary_md=out_dir / "summary.md",
+    )
+    send_feishu_notification(
+        webhook=webhook,
+        title=title,
+        markdown=markdown,
+        status="success",
+        suite_log=out_dir / "suite.log",
+    )
+
+
 def run_suite_body(args: argparse.Namespace, spec: dict, groups: list[str]) -> None:
     suite_prefix = spec["suite_prefix"]
     summary_lines = list(spec.get("summary_lines", []))
@@ -464,6 +519,7 @@ def run_suite_body(args: argparse.Namespace, spec: dict, groups: list[str]) -> N
             )
             rows.append(row)
             write_summary(suite_name, out_dir, rows, summary_lines)
+            maybe_notify_completed_run(args, suite_name, row, out_dir)
 
 
 def run_suite(args: argparse.Namespace, spec: dict) -> None:
@@ -513,7 +569,7 @@ def run_suite(args: argparse.Namespace, spec: dict) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.notify_feishu:
+    if args.notify_feishu or args.notify_each_run:
         load_feishu_webhook()
     spec = load_spec(Path(args.spec))
     if args.screen:

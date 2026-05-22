@@ -594,16 +594,8 @@ class PRCSolver(BaseSolver):
         weights: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Match teacher/student target relations, not just class marginals."""
-        # Two-step normalization preserves class-domain structure:
-        #  1. Per-class domain distribution (each class sums to 1 over domains)
-        #  2. Global normalize over flat (C*D) so total sums to 1
-        student_node = student_aux["node_mass"]  # [B, C, D]
-        student_node = student_node / student_node.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        student_node = self._normalize_distribution(student_node.flatten(1))
-
-        teacher_node = teacher_aux["node_mass"]
-        teacher_node = teacher_node / teacher_node.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        teacher_node = self._normalize_distribution(teacher_node.flatten(1))
+        student_node = self._normalize_distribution(student_aux["node_mass"].flatten(1))
+        teacher_node = self._normalize_distribution(teacher_aux["node_mass"].flatten(1))
 
         node_loss = soft_prob_cross_entropy(student_node, teacher_node, weights=weights)
         conf_loss = soft_prob_cross_entropy(
@@ -655,6 +647,12 @@ class PRCSolver(BaseSolver):
         )
 
     def _build_scheduler(self, optimizer, total_iters: int):
+        scheduler_t_max_epochs = getattr(self.config.method, "scheduler_t_max_epochs", None)
+        if scheduler_t_max_epochs is not None:
+            epoch_steps = max(1, self._resolve_epoch_steps())
+            total_iters = max(1, int(round(float(scheduler_t_max_epochs) * epoch_steps)))
+            logger.info("PRC scheduler horizon override: t_max_epochs=%.2f", float(scheduler_t_max_epochs))
+
         def lr_lambda(step):
             progress = step / max(1, total_iters)
             return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))

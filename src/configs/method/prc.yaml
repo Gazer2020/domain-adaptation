@@ -17,9 +17,9 @@ strong_aug: true
 strong_train_aug: true
 stratified_batch: true
 
-# Optional source-eval batch size used only when refreshing source prototypes
-# and source classifier-confusion statistics. Null falls back to batch_size.
-prototype_batch_size: null
+# Source-eval batch size used only when refreshing source prototypes
+# and source classifier-confusion statistics.
+prototype_batch_size: 256
 prototype_prefetch_factor: 4
 prototype_persistent_workers: true
 prototype_cuda_prefetch: auto

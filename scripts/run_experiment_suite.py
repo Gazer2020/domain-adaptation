@@ -4,7 +4,7 @@ Generic experiment-suite runner.
 
 Spec format (JSON):
 {
-  "suite_prefix": "prc_oh_cpr2a_mainline",
+  "suite_prefix": "dcpr_oh_cpr2a_mainline",
   "summary_lines": [
     "- dataset: Office-Home",
     "- task: cpr2a (sources=[Clipart, Product, Real World] -> target=Art)"
@@ -18,7 +18,7 @@ Spec format (JSON):
     "dataset=office-home",
     "dataset.target=Art",
     "dataset.sources=[\"Clipart\",\"Product\",\"Real World\"]",
-    "method=prc",
+    "method=dcpr",
     "method.epochs=20"
   ],
   "groups": {
@@ -90,6 +90,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--screen", action="store_true", help="Launch this suite in a detached screen session.")
     parser.add_argument("--session", default="", help="Optional screen session name.")
     parser.add_argument("--resume", action="store_true", help="Skip completed experiment ids from existing summary.csv.")
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue later experiments in the same suite when one run fails.",
+    )
     parser.add_argument(
         "--notify-feishu",
         action="store_true",
@@ -509,17 +514,35 @@ def run_suite_body(args: argparse.Namespace, spec: dict, groups: list[str]) -> N
             if args.resume and exp["id"] in completed:
                 print(f"Skip completed: {suite_name} {exp['id']} {exp['name']}", flush=True)
                 continue
-            row = run_one(
-                suite_name=suite_name,
-                group_name=group,
-                exp=exp,
-                common=common,
-                python_executable=args.python,
-                suite_log=suite_log,
-            )
+            try:
+                row = run_one(
+                    suite_name=suite_name,
+                    group_name=group,
+                    exp=exp,
+                    common=common,
+                    python_executable=args.python,
+                    suite_log=suite_log,
+                )
+            except RunFailedError as exc:
+                if not args.continue_on_error or exc.is_manual_stop:
+                    raise
+                row = {
+                    "suite": suite_name,
+                    "group": group,
+                    "id": exp["id"],
+                    "name": exp["name"],
+                    "purpose": f"{exp.get('purpose', '')} FAILED rc={exc.returncode}".strip(),
+                    "exp_name": exc.exp_name,
+                    "best_acc": "",
+                    "last_acc": "",
+                    "minutes": "",
+                }
+                with suite_log.open("a", encoding="utf-8") as log:
+                    log.write(f"\nContinuing after failed run: {exc}\n")
             rows.append(row)
             write_summary(suite_name, out_dir, rows, summary_lines)
-            maybe_notify_completed_run(args, suite_name, row, out_dir)
+            if row["best_acc"] != "":
+                maybe_notify_completed_run(args, suite_name, row, out_dir)
 
 
 def run_suite(args: argparse.Namespace, spec: dict) -> None:

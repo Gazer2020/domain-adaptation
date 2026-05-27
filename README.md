@@ -44,7 +44,7 @@ results/                  # Hydra run outputs
 scripts/                  # local helper scripts
 ```
 
-Registered solvers are `cad`, `cosda`, `dare`, `dcfm`, `factda`, `mic`, `prc`, `ros`, `rtda`, `rvtc`, and `sourceonly`.
+Registered solvers are `cad`, `cosda`, `dare`, `dcfm`, `dcpr`, `factda`, `mic`, `ros`, `rtda`, `rvtc`, and `sourceonly`.
 
 ## Setup
 
@@ -90,14 +90,14 @@ python src/main.py dataset=office-31 method=mic exp_name=mic_a2w
 MSDA example:
 
 ```bash
-python src/main.py dataset=image-clef method=prc dataset.sources='[b,c,i]' dataset.target=p exp_name=prc_imageclef_bci_to_p
+python src/main.py dataset=image-clef method=dcpr dataset.sources='[b,c,i]' dataset.target=p exp_name=dcpr_imageclef_bci_to_p
 ```
 
 Useful override examples:
 
 ```bash
-python src/main.py method=prc performance.compile.enabled=false
-python src/main.py method=prc performance.augmentation.target_tensor_v2=auto
+python src/main.py method=dcpr performance.compile.enabled=false
+python src/main.py method=dcpr performance.augmentation.target_tensor_v2=auto
 python src/main.py num_workers=8 performance.dataloader.num_workers_source=4
 ```
 
@@ -124,6 +124,7 @@ python scripts/run_experiment_suite.py --spec scripts/specs/<suite>.json --group
 Useful launcher options:
 - `--screen` starts a detached `screen` session for long runs.
 - `--resume` skips completed experiment ids from an existing `summary.csv`.
+- `--continue-on-error` continues later experiments in the same suite when one run fails instead of aborting.
 - `--notify-feishu` sends the generated `summary.md` to the Feishu webhook stored as `FEISHU_WEBHOOK_URL` in the repository-root `.env`.
 - `--notify-each-run` sends a Feishu success card after each completed experiment, using the same webhook.
 - `--shutdown` powers off after all selected runs finish and notifications are attempted. Shutdown is skipped if the suite is interrupted (KeyboardInterrupt or manual-stop signals); only use it when that behavior is intended.

@@ -1,4 +1,4 @@
-name: prc
+name: dcpr
 
 setting: msda
 supported_settings: [msda]
@@ -9,6 +9,13 @@ lr: 0.01
 
 temperature_start: 0.15
 temperature_end: 0.10
+prototype_granularity: domain_class
+routing_mode: softmax
+routing_scope: class
+ambiguity_source: domain_class
+ambiguity_reciprocal: harmonic
+support_consistency_target: node_mass
+ambiguity_consistency: true
 consistency_start_epoch: 5
 ramp_denom: 16.0
 save_ckpt_after_epoch: 15

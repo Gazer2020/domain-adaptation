@@ -939,12 +939,14 @@ def get_dataloader(config):
     strong_aug_enabled = is_truthy(getattr(config.method, "strong_aug", False))
     target_transform = train_transform
 
-    target_tensor_v2_auto = is_cuda_device and method_name == "dcpr"
+    target_tensor_v2_methods = {"dcpr", "dcpr_alt"}
+    target_tensor_v2_auto = is_cuda_device and method_name in target_tensor_v2_methods
     target_tensor_v2_enabled = resolve_auto_bool(target_tensor_v2_cfg, target_tensor_v2_auto)
-    if target_tensor_v2_enabled and method_name != "dcpr":
+    if target_tensor_v2_enabled and method_name not in target_tensor_v2_methods:
         logger.warning(
-            "performance.augmentation.target_tensor_v2=True is currently wired for method=dcpr only; "
+            "performance.augmentation.target_tensor_v2=True is currently wired for methods=%s only; "
             "falling back to dataset weak/strong transforms for method=%s.",
+            sorted(target_tensor_v2_methods),
             method_name or "<unknown>",
         )
         target_tensor_v2_enabled = False
@@ -972,8 +974,9 @@ def get_dataloader(config):
                 ]
             )
             logger.info(
-                "Target weak/strong augmentation: tensor path enabled (method=dcpr). "
-                "Loader outputs uint8 tensors after resize; random weak/strong ops run in solver."
+                "Target weak/strong augmentation: tensor path enabled (method=%s). "
+                "Loader outputs uint8 tensors after resize; random weak/strong ops run in solver.",
+                method_name or "<unknown>",
             )
         else:
             class WeakStrongAugment:

@@ -1,0 +1,68 @@
+name: dcpr_alt
+
+setting: msda
+supported_settings: [msda]
+
+backbone: resnet50
+epochs: 20
+lr: 0.01
+bottleneck_dim: 256
+label_smoothing: 0.05
+save_ckpt_after_epoch: 15
+scheduler_t_max_epochs: null
+
+temperature_start: 0.15
+temperature_end: 0.10
+lambda_relation_consistency: 0.40
+consistency_start_epoch: 5
+consistency_conf_power: 2.0
+ramp_denom: 16.0
+grad_clip: 5.0
+ema_decay_start: 0.996
+ema_decay_end: 0.9995
+
+strong_aug: true
+strong_train_aug: true
+stratified_batch: true
+target_aug:
+  randaugment_num_ops: 2
+  randaugment_magnitude: 10
+
+# Source-eval batch size used only when refreshing source prototypes.
+prototype_batch_size: 256
+
+# Optional target-adaptive boundary. The default keeps the original
+# source-prototype classifier; experiments can enable hybrid/soft-relation mode.
+decision_mode: prototype
+adaptive_logit_weight: 0.0
+target_logit_weight: 0.0
+adaptive_head_scale: 10.0
+
+# Target prototype anchors can be updated from the domain-class relation graph
+# without a hard confidence threshold by setting target_prototype_update=soft_relation.
+target_prototype_update: hard
+target_prototype_start_epoch: 5
+target_prototype_threshold: 0.70
+target_prototype_momentum: 0.98
+target_soft_temperature: 0.70
+target_soft_entropy_power: 1.0
+target_soft_balance: true
+target_soft_ambiguity_smooth: 0.30
+
+# Optional target/adaptive objectives.
+lambda_source_proto_ce: 0.0
+lambda_target_pseudo_ce: 0.0
+pseudo_threshold: 0.80
+pseudo_start_epoch: 5
+pseudo_conf_power: 1.0
+lambda_target_im: 0.0
+target_im_start_epoch: 5
+
+# Ambiguous-class handling derived from source class-prototype similarities.
+lambda_ambiguity_margin: 0.0
+ambiguity_start_epoch: 5
+ambiguity_margin: 1.0
+ambiguity_min_conf: 0.45
+ambiguity_threshold: 0.30
+ambiguity_relation_boost: 0.0
+ambiguity_power: 1.0

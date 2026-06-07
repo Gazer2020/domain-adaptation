@@ -30,8 +30,8 @@ performance:
   compile:
     enabled: false   # auto, true, false
     backend: inductor
-    mode: default    # default, reduce-overhead, max-autotune
-    dynamic: false
+    mode: default    # default, reduce-overhead, max-autotune, max-autotune-no-cudagraphs
+    dynamic: auto    # let PyTorch specialize first and generalize after recompilation
     fullgraph: false
   augmentation:
     target_tensor_v2: auto  # auto enables the faster tensor path for supported CUDA+dcpr runs
@@ -45,6 +45,17 @@ performance:
     num_workers_test: 2
     limit_worker_threads: true
     worker_threads: 1
+
+resume:
+  path: null  # full training-state checkpoint to resume from
+  save_path: auto  # auto -> checkpoints/<exp_name>.resume.pth
+  save_every_epochs: 0  # 0 disables periodic training-state checkpoints
+
+distributed:
+  enabled: auto  # auto enables under torchrun when WORLD_SIZE > 1
+  backend: auto  # auto -> nccl on CUDA, otherwise gloo
+  timeout_seconds: 1800
+  gradient_bucket_mb: 25
 
 hydra:
   run:

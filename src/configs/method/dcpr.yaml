@@ -21,6 +21,7 @@ ramp_denom: 16.0
 save_ckpt_after_epoch: 15
 
 strong_aug: true
+target_aug_backend: tensor_v2
 strong_train_aug: true
 stratified_batch: true
 

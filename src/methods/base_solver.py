@@ -5,7 +5,9 @@ All domain adaptation methods should inherit from BaseSolver and implement
 the required abstract methods: build_model() and train().
 """
 
+import io
 import logging
+import random
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from pathlib import Path
@@ -13,11 +15,20 @@ from typing import Any, Callable, Mapping, Tuple
 
 import torch
 import torch.nn as nn
+import numpy as np
 from torch.utils.data import DataLoader
 
 from models.backbones import get_backbone
-from utils import get_device
-from utils.config import cfg_get, is_truthy, resolve_auto_bool
+from utils import (
+    average_module_buffers,
+    broadcast_modules,
+    distributed_barrier,
+    gather_objects_to_main,
+    get_device,
+    get_distributed_context,
+    synchronize_optimizer_gradients,
+)
+from utils.config import cfg_get, is_truthy, resolve_auto_bool, resolve_optional_auto_bool
 
 from methods.registry import register_solver
 
@@ -72,6 +83,8 @@ class BaseSolver(ABC):
         
         # Build model (must be implemented by subclass)
         self.build_model()
+        self.distributed = get_distributed_context()
+        broadcast_modules(self._solver_modules())
         
         # Default loss function (can be overridden or unused)
         self.criterion = nn.CrossEntropyLoss()
@@ -80,6 +93,30 @@ class BaseSolver(ABC):
         exp_name = str(self.config.get("exp_name", "experiment"))
         self._best_ckpt_path = Path("checkpoints") / f"{exp_name}.pth"
         self._best_saved = False
+        self._training_state_objects: dict[str, Any] = {}
+        self._pending_training_state: dict[str, Any] = {}
+        self._resume_epoch = 0
+        self._training_global_step = 0
+
+        resume_cfg = self._cfg_get(self.config, "resume", {})
+        resume_path = self._cfg_get(resume_cfg, "path", None)
+        self._resume_path = (
+            None
+            if resume_path is None or str(resume_path).strip().lower() in {"", "none"}
+            else Path(str(resume_path))
+        )
+        save_path = self._cfg_get(resume_cfg, "save_path", "auto")
+        self._training_ckpt_path = (
+            Path("checkpoints") / f"{exp_name}.resume.pth"
+            if str(save_path).strip().lower() in {"", "auto"}
+            else Path(str(save_path))
+        )
+        self._training_save_every = max(
+            0,
+            int(self._cfg_get(resume_cfg, "save_every_epochs", 0)),
+        )
+        if self._resume_path is not None:
+            self._load_training_checkpoint(self._resume_path)
 
     @property
     def solver_name(self) -> str:
@@ -147,7 +184,9 @@ class BaseSolver(ABC):
             self.compile_mode = None
         else:
             self.compile_mode = compile_mode_cfg
-        self.compile_dynamic = self._is_truthy(self._cfg_get(compile_cfg, "dynamic", False))
+        self.compile_dynamic = resolve_optional_auto_bool(
+            self._cfg_get(compile_cfg, "dynamic", "auto")
+        )
         self.compile_fullgraph = self._is_truthy(self._cfg_get(compile_cfg, "fullgraph", False))
         logger.info(
             "Performance runtime | amp=%s dtype=%s non_blocking=%s set_to_none=%s channels_last=%s compile=%s",
@@ -174,10 +213,9 @@ class BaseSolver(ABC):
             logger.warning("torch.compile requested for %s on MPS; fallback to eager mode.", name)
             return fn
 
-        compile_kwargs = {
-            "dynamic": self.compile_dynamic,
-            "fullgraph": self.compile_fullgraph,
-        }
+        compile_kwargs = {"fullgraph": self.compile_fullgraph}
+        if self.compile_dynamic is not None:
+            compile_kwargs["dynamic"] = self.compile_dynamic
         if self.compile_backend is not None:
             compile_kwargs["backend"] = self.compile_backend
         if self.compile_mode is not None:
@@ -246,19 +284,26 @@ class BaseSolver(ABC):
         else:
             loss.backward()
 
-    def _optimizer_step(self, optimizer):
+    def _optimizer_step(self, optimizer, *, synchronize: bool = True):
+        self._register_automatic_optimizer(optimizer)
+        if synchronize:
+            synchronize_optimizer_gradients(optimizer)
         if self.use_grad_scaler:
             self.grad_scaler.step(optimizer)
             self.grad_scaler.update()
         else:
             optimizer.step()
+        self._training_global_step += 1
 
     def _optimizer_step_with_optional_clip(self, loss, optimizer, clip_params=None, clip_max_norm=None):
         self._backward(loss)
         if clip_params is not None and clip_max_norm is not None:
             if self.use_grad_scaler:
                 self.grad_scaler.unscale_(optimizer)
+            synchronize_optimizer_gradients(optimizer)
             torch.nn.utils.clip_grad_norm_(clip_params, max_norm=clip_max_norm)
+            self._optimizer_step(optimizer, synchronize=False)
+            return
         self._optimizer_step(optimizer)
 
     @staticmethod
@@ -332,6 +377,176 @@ class BaseSolver(ABC):
         if extra_state:
             payload.update(extra_state)
         return payload
+
+    def register_training_state(self, **objects: Any) -> None:
+        """Register optimizer/scheduler-like objects for resumable training."""
+        for name, value in objects.items():
+            if value is None:
+                continue
+            if not hasattr(value, "state_dict") or not hasattr(value, "load_state_dict"):
+                raise TypeError(
+                    f"Training state object '{name}' must implement state_dict/load_state_dict"
+                )
+            self._training_state_objects[name] = value
+            pending = self._pending_training_state.pop(name, None)
+            if pending is not None:
+                value.load_state_dict(pending)
+                logger.info("Restored training state object: %s", name)
+
+    def _register_automatic_optimizer(self, optimizer: Any) -> None:
+        if any(value is optimizer for value in self._training_state_objects.values()):
+            return
+        index = sum(name.startswith("optimizer_") for name in self._training_state_objects)
+        self.register_training_state(**{f"optimizer_{index}": optimizer})
+
+    def _capture_model_checkpoint(self) -> bytes:
+        buffer = io.BytesIO()
+        self.save_checkpoint(buffer)
+        return buffer.getvalue()
+
+    def _restore_model_checkpoint(self, payload: bytes) -> None:
+        self.load_checkpoint(io.BytesIO(payload))
+
+    @staticmethod
+    def _rng_state_dict() -> dict[str, Any]:
+        state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    @staticmethod
+    def _load_rng_state(state: Mapping[str, Any]) -> None:
+        if "python" in state:
+            random.setstate(state["python"])
+        if "numpy" in state:
+            np.random.set_state(state["numpy"])
+        if "torch" in state:
+            torch.set_rng_state(state["torch"])
+        if "cuda" in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["cuda"])
+
+    def extra_training_state_dict(self) -> dict[str, Any]:
+        """Hook for method-specific non-module state."""
+        return {}
+
+    def load_extra_training_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore method-specific non-module state."""
+
+    def save_training_checkpoint(
+        self,
+        path,
+        *,
+        epoch: int,
+        global_step: int | None = None,
+    ) -> None:
+        context = get_distributed_context()
+        rng_by_rank = gather_objects_to_main(self._rng_state_dict())
+        if not context.is_main_process:
+            return
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "format_version": 1,
+            "method": self.solver_name,
+            "epoch": int(epoch),
+            "global_step": int(
+                self._training_global_step if global_step is None else global_step
+            ),
+            "best_metric": float(self._best_metric),
+            "model_checkpoint": self._capture_model_checkpoint(),
+            "training_objects": {
+                name: value.state_dict()
+                for name, value in self._training_state_objects.items()
+            },
+            "grad_scaler": self.grad_scaler.state_dict(),
+            "rng": rng_by_rank[0],
+            "rng_by_rank": rng_by_rank,
+            "extra_state": self.extra_training_state_dict(),
+        }
+        torch.save(payload, path)
+        logger.info("Training checkpoint saved to %s", path)
+
+    def _load_training_checkpoint(self, path) -> None:
+        path = Path(path)
+        checkpoint = torch.load(
+            path,
+            map_location=self.device,
+            weights_only=False,
+        )
+        if checkpoint.get("method") != self.solver_name:
+            raise ValueError(
+                f"Resume checkpoint method={checkpoint.get('method')!r} does not match "
+                f"solver={self.solver_name!r}"
+            )
+        self._restore_model_checkpoint(checkpoint["model_checkpoint"])
+        self._resume_epoch = int(checkpoint.get("epoch", 0))
+        self._training_global_step = int(checkpoint.get("global_step", 0))
+        self._best_metric = float(checkpoint.get("best_metric", float("-inf")))
+        self._pending_training_state = dict(checkpoint.get("training_objects", {}))
+        grad_scaler_state = checkpoint.get("grad_scaler")
+        if grad_scaler_state:
+            self.grad_scaler.load_state_dict(grad_scaler_state)
+        rng_by_rank = checkpoint.get("rng_by_rank")
+        if rng_by_rank:
+            rank = min(get_distributed_context().rank, len(rng_by_rank) - 1)
+            self._load_rng_state(rng_by_rank[rank])
+        else:
+            self._load_rng_state(checkpoint.get("rng", {}))
+        self.load_extra_training_state_dict(checkpoint.get("extra_state", {}))
+        logger.info(
+            "Training checkpoint loaded from %s | epoch=%d global_step=%d pending=%s",
+            path,
+            self._resume_epoch,
+            self._training_global_step,
+            sorted(self._pending_training_state),
+        )
+
+    def _epoch_range(self, total_epochs: int, *, offset: int = 0):
+        """Return the remaining local epochs after a resume checkpoint."""
+        local_start = max(0, self._resume_epoch - int(offset))
+        for local_epoch in range(
+            min(local_start, int(total_epochs)),
+            int(total_epochs),
+        ):
+            self._set_dataloader_epoch(int(offset) + local_epoch)
+            yield local_epoch
+
+    def _set_dataloader_epoch(self, epoch: int) -> None:
+        for loader in (
+            self.source_loader,
+            self.target_loader,
+            self.target_test_loader,
+        ):
+            sampler = getattr(loader, "sampler", None)
+            batch_sampler = getattr(loader, "batch_sampler", None)
+            for candidate in (sampler, batch_sampler):
+                set_epoch = getattr(candidate, "set_epoch", None)
+                if callable(set_epoch):
+                    set_epoch(int(epoch))
+
+    def _solver_modules(self) -> list[nn.Module]:
+        modules = []
+        seen: set[int] = set()
+        for value in self.__dict__.values():
+            if isinstance(value, nn.Module) and id(value) not in seen:
+                seen.add(id(value))
+                modules.append(value)
+        return modules
+
+    def _synchronize_model_buffers(self) -> None:
+        average_module_buffers(self._solver_modules())
+
+    def _maybe_save_training_checkpoint(self, epoch: int) -> bool:
+        if self._training_save_every <= 0:
+            return False
+        if int(epoch) % self._training_save_every != 0:
+            return False
+        self.save_training_checkpoint(self._training_ckpt_path, epoch=int(epoch))
+        return True
 
     def _save_named_modules_checkpoint(
         self,
@@ -490,12 +705,13 @@ class BaseSolver(ABC):
             acc: Overall accuracy (or H-score for OSDA)
         """
         self._set_eval_mode()
+        self._synchronize_model_buffers()
         
         all_preds = []
         all_labels = []
         all_probs = []
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for imgs, labels in self.target_test_loader:
                 imgs = self._to_device(imgs)
                 with self._auto_cast():
@@ -632,19 +848,29 @@ class BaseSolver(ABC):
         - epoch >= self._save_start_epoch
         - metric strictly improves
         """
-        if int(epoch) < int(self._save_start_epoch):
-            return False
-        if float(metric) <= float(self._best_metric):
-            return False
-        self._best_metric = float(metric)
-        self._best_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-        self.save_checkpoint(self._best_ckpt_path)
-        self._best_saved = True
-        return True
+        saved_best = False
+        if (
+            int(epoch) >= int(self._save_start_epoch)
+            and float(metric) > float(self._best_metric)
+        ):
+            self._best_metric = float(metric)
+            if get_distributed_context().is_main_process:
+                self._best_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+                self.save_checkpoint(self._best_ckpt_path)
+            self._best_saved = True
+            saved_best = True
+        self._maybe_save_training_checkpoint(epoch)
+        distributed_barrier()
+        return saved_best
 
     def _load_best_checkpoint_if_available(self) -> bool:
-        if self._best_saved and self._best_ckpt_path.exists():
-            self.load_checkpoint(self._best_ckpt_path)
+        if self._best_saved:
+            if get_distributed_context().is_main_process:
+                if not self._best_ckpt_path.exists():
+                    return False
+                self.load_checkpoint(self._best_ckpt_path)
+            distributed_barrier()
+            broadcast_modules(self._solver_modules())
             return True
         return False
 
@@ -680,11 +906,12 @@ class SourceOnlySolver(BaseSolver):
             momentum=0.9,
             weight_decay=5e-4
         )
+        self.register_training_state(optimizer=optimizer)
         
         logger.info("%s training | epochs=%d", self._solver_display_name(), max_epochs)
-        best_acc = float("-inf")
+        best_acc = self._best_metric
         
-        for epoch in range(max_epochs):
+        for epoch in self._epoch_range(max_epochs):
             self.net.train()
             loss_meter = AverageMeter()
             

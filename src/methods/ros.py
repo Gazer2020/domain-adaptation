@@ -116,8 +116,8 @@ class RotationSolver(BaseSolver):
         """Two-stage training: rotation pretraining + semantic finetuning."""
         max_epochs = self.config.method.epochs
         logger.info(f"Start training for {max_epochs} epochs per stage...")
-        best_acc = float("-inf")
-        global_epoch = 0
+        best_acc = self._best_metric
+        global_epoch = self._resume_epoch
 
         # Stage 1: Rotation pretraining
         best_acc, global_epoch = self._train_rotation_stage(max_epochs, best_acc, global_epoch)
@@ -135,8 +135,9 @@ class RotationSolver(BaseSolver):
         """Stage 1: Train rotation prediction."""
         logger.info("Stage 1: Rotation pretraining...")
         self._build_rotation_optimizer()
+        self.register_training_state(rotation_optimizer=self.rot_optimizer)
 
-        for epoch in range(max_epochs):
+        for epoch in self._epoch_range(max_epochs):
             self.feature_extractor.train()
             self.rotation_head.train()
 
@@ -190,8 +191,9 @@ class RotationSolver(BaseSolver):
         """Stage 2: Train semantic classification."""
         logger.info("Stage 2: Semantic finetuning...")
         self._build_semantic_optimizer()
+        self.register_training_state(semantic_optimizer=self.sem_optimizer)
 
-        for epoch in range(max_epochs):
+        for epoch in self._epoch_range(max_epochs, offset=max_epochs):
             self.feature_extractor.train()
             self.semantic_head.train()
 

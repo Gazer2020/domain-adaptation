@@ -21,10 +21,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torchvision.transforms import InterpolationMode
-from torchvision.transforms import v2 as transforms_v2
 
 from methods.base_solver import BaseSolver
+from methods.components import TargetViewBuilder, linear_ema_decay, update_ema_model
 from methods.registry import register_solver
 from models.backbones import get_backbone
 from utils import CudaBatchPrefetcher, cycle
@@ -46,14 +45,6 @@ def soft_prob_cross_entropy(
     return losses.mean()
 
 
-def _unwrap_weak_strong_from_maybe_tuple(tgt_imgs):
-    if isinstance(tgt_imgs, (tuple, list)) and len(tgt_imgs) >= 2:
-        return tgt_imgs[0], tgt_imgs[1]
-    if isinstance(tgt_imgs, (tuple, list)) and len(tgt_imgs) == 1:
-        return tgt_imgs[0], tgt_imgs[0]
-    return tgt_imgs, tgt_imgs
-
-
 class PrototypeRelationRouter(nn.Module):
     """Prototype classifier plus class-conditioned source-domain routing."""
 
@@ -63,11 +54,15 @@ class PrototypeRelationRouter(nn.Module):
         num_classes: int,
         num_source_domains: int,
         relation_temperature: float = 0.10,
+        relation_space_mode: str = "standard",
     ):
         super().__init__()
         self.feat_dim = int(feat_dim)
         self.num_classes = int(num_classes)
         self.num_source_domains = int(num_source_domains)
+        self.relation_space_mode = str(relation_space_mode).strip().lower()
+        if self.relation_space_mode not in {"standard", "domain_relative"}:
+            raise ValueError("relation_space_mode must be 'standard' or 'domain_relative'")
         self.register_buffer(
             "relation_temperature",
             torch.tensor(max(1e-6, float(relation_temperature)), dtype=torch.float32),
@@ -84,6 +79,16 @@ class PrototypeRelationRouter(nn.Module):
             torch.zeros(self.num_source_domains, self.num_classes, dtype=torch.bool),
             persistent=True,
         )
+        self.register_buffer(
+            "src_domain_centers",
+            torch.zeros(self.num_source_domains, self.feat_dim),
+            persistent=True,
+        )
+        self.register_buffer(
+            "src_domain_center_inited",
+            torch.zeros(self.num_source_domains, dtype=torch.bool),
+            persistent=True,
+        )
 
     @torch.no_grad()
     def set_relation_temperature(self, value: float):
@@ -93,11 +98,57 @@ class PrototypeRelationRouter(nn.Module):
     def reset_source_prototypes(self):
         self.src_prototypes.zero_()
         self.src_proto_inited.zero_()
+        self.src_domain_centers.zero_()
+        self.src_domain_center_inited.zero_()
 
-    def parse(self, h_relation: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Return class logits plus sparse source-domain routing statistics."""
+    def source_relation_prototypes(self) -> torch.Tensor:
         proto = self.src_prototypes
+        if self.relation_space_mode != "domain_relative":
+            return proto
+        centers = self.src_domain_centers.unsqueeze(1)
+        valid_centers = self.src_domain_center_inited.view(-1, 1, 1)
+        return torch.where(valid_centers, proto - centers, proto)
+
+    def center_features(
+        self,
+        h_relation: torch.Tensor,
+        *,
+        domain_ids: Optional[torch.Tensor] = None,
+        sample_center: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.relation_space_mode != "domain_relative":
+            return h_relation
+        if sample_center is not None:
+            center = sample_center.to(device=h_relation.device, dtype=h_relation.dtype)
+            if center.ndim == 1:
+                center = center.unsqueeze(0)
+            return h_relation - center
+        if domain_ids is not None:
+            domain_ids = domain_ids.to(device=h_relation.device).long().clamp(0, self.num_source_domains - 1)
+            centers = self.src_domain_centers.to(device=h_relation.device, dtype=h_relation.dtype)[domain_ids]
+            valid = self.src_domain_center_inited.to(device=h_relation.device)[domain_ids].unsqueeze(1)
+            return h_relation - torch.where(valid, centers, torch.zeros_like(centers))
+        valid = self.src_domain_center_inited.to(device=h_relation.device)
+        if bool(valid.any()):
+            center = self.src_domain_centers.to(device=h_relation.device, dtype=h_relation.dtype)[valid].mean(dim=0)
+            return h_relation - center.unsqueeze(0)
+        return h_relation
+
+    def parse(
+        self,
+        h_relation: torch.Tensor,
+        *,
+        domain_ids: Optional[torch.Tensor] = None,
+        sample_center: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Return class logits plus sparse source-domain routing statistics."""
+        proto = self.source_relation_prototypes()
         mask = self.src_proto_inited
+        h_relation = self.center_features(
+            h_relation,
+            domain_ids=domain_ids,
+            sample_center=sample_center,
+        )
 
         proto_n = F.normalize(proto, dim=-1)
         h_n = F.normalize(h_relation, dim=-1)
@@ -127,6 +178,7 @@ class PrototypeRelationRouter(nn.Module):
             "class_logits_rel": class_logits_rel,
             "domain_weights": domain_weights,
             "valid_classes": valid_classes,
+            "h_relation": h_relation,
         }
 
 
@@ -142,6 +194,17 @@ class DCPRNetwork(nn.Module):
         adaptive_head_scale: float = 10.0,
         adaptive_logit_weight: float = 0.0,
         target_logit_weight: float = 0.0,
+        relation_space_mode: str = "standard",
+        class_logits_mode: str = "single",
+        classifier_anchor_blend: float = 0.0,
+        logit_fusion: str = "linear",
+        proto_logit_weight: Optional[float] = None,
+        proto_logit_temperature: float = 1.0,
+        adaptive_logit_temperature: float = 1.0,
+        target_logit_temperature: float = 1.0,
+        feature_norm_mode: str = "layernorm",
+        classification_structure: str = "legacy",
+        target_classifier_mode: str = "head",
     ):
         super().__init__()
 
@@ -168,19 +231,47 @@ class DCPRNetwork(nn.Module):
             self.bottleneck = nn.Identity()
             self.feat_dim = feat_dim_raw
 
-        self.feature_norm = nn.LayerNorm(self.feat_dim)
+        self.feature_norm_mode = str(feature_norm_mode).strip().lower()
+        if self.feature_norm_mode == "layernorm":
+            self.feature_norm = nn.LayerNorm(self.feat_dim)
+        elif self.feature_norm_mode in {"l2", "identity"}:
+            self.feature_norm = nn.Identity()
+        else:
+            raise ValueError("feature_norm_mode must be 'layernorm', 'l2', or 'identity'")
         self.relation_feat_dim = self.feat_dim
         self.adaptive_logit_weight = float(adaptive_logit_weight)
         self.target_logit_weight = float(target_logit_weight)
         self.adaptive_head_scale = float(adaptive_head_scale)
+        self.relation_space_mode = str(relation_space_mode).strip().lower()
+        self.class_logits_mode = str(class_logits_mode).strip().lower()
+        if self.class_logits_mode not in {"single", "fusion"}:
+            raise ValueError("class_logits_mode must be 'single' or 'fusion'")
+        self.classifier_anchor_blend = min(1.0, max(0.0, float(classifier_anchor_blend)))
+        self.logit_fusion = str(logit_fusion).strip().lower()
+        if self.logit_fusion not in {"linear", "logprob"}:
+            raise ValueError("logit_fusion must be 'linear' or 'logprob'")
+        self.proto_logit_weight = (
+            None if proto_logit_weight is None else min(1.0, max(0.0, float(proto_logit_weight)))
+        )
+        self.proto_logit_temperature = max(1e-6, float(proto_logit_temperature))
+        self.adaptive_logit_temperature = max(1e-6, float(adaptive_logit_temperature))
+        self.target_logit_temperature = max(1e-6, float(target_logit_temperature))
+        self.classification_structure = str(classification_structure).strip().lower()
+        if self.classification_structure not in {"legacy", "decoupled"}:
+            raise ValueError("classification_structure must be 'legacy' or 'decoupled'")
+        self.target_classifier_mode = str(target_classifier_mode).strip().lower()
+        if self.target_classifier_mode not in {"head", "prototype"}:
+            raise ValueError("target_classifier_mode must be 'head' or 'prototype'")
 
         self.relation_router = PrototypeRelationRouter(
             feat_dim=self.relation_feat_dim,
             num_classes=self.num_classes,
             num_source_domains=self.num_source_domains,
             relation_temperature=relation_temperature,
+            relation_space_mode=self.relation_space_mode,
         )
         self.adaptive_classifier = nn.Linear(self.relation_feat_dim, self.num_classes, bias=False)
+        self.target_classifier = nn.Linear(self.relation_feat_dim, self.num_classes, bias=False)
         self.register_buffer(
             "target_prototypes",
             torch.zeros(self.num_classes, self.relation_feat_dim),
@@ -191,12 +282,45 @@ class DCPRNetwork(nn.Module):
             torch.zeros(self.num_classes, dtype=torch.bool),
             persistent=True,
         )
+        self.register_buffer(
+            "target_center",
+            torch.zeros(self.relation_feat_dim),
+            persistent=True,
+        )
+        self.register_buffer(
+            "target_center_inited",
+            torch.tensor(False, dtype=torch.bool),
+            persistent=True,
+        )
+        self.register_buffer(
+            "class_relation_anchors",
+            torch.zeros(self.num_classes, self.relation_feat_dim),
+            persistent=True,
+        )
+        self.register_buffer(
+            "class_anchor_inited",
+            torch.zeros(self.num_classes, dtype=torch.bool),
+            persistent=True,
+        )
+        self.register_buffer(
+            "classifier_anchor_initialized",
+            torch.tensor(False, dtype=torch.bool),
+            persistent=True,
+        )
+        self.register_buffer(
+            "target_classifier_initialized",
+            torch.tensor(False, dtype=torch.bool),
+            persistent=True,
+        )
 
     def extract_relation_features(self, x: torch.Tensor) -> torch.Tensor:
         return self.bottleneck(self.backbone(x))
 
     def normalize_relation_features(self, h: torch.Tensor) -> torch.Tensor:
-        return self.feature_norm(h)
+        h = self.feature_norm(h)
+        if self.feature_norm_mode == "l2":
+            h = F.normalize(h, dim=-1)
+        return h
 
     def _encode_shared(
         self,
@@ -217,6 +341,54 @@ class DCPRNetwork(nn.Module):
     @torch.no_grad()
     def reset_source_prototypes(self):
         self.relation_router.reset_source_prototypes()
+
+    @torch.no_grad()
+    def set_class_relation_anchors(self, valid: torch.Tensor, anchors: torch.Tensor):
+        self.class_anchor_inited.copy_(valid.to(device=self.class_anchor_inited.device))
+        self.class_relation_anchors.copy_(anchors.to(device=self.class_relation_anchors.device))
+
+    def classifier_anchor_loss(self) -> torch.Tensor:
+        valid = self.class_anchor_inited
+        if not bool(valid.any()):
+            return self.adaptive_classifier.weight.sum() * 0.0
+        weights = F.normalize(self.adaptive_classifier.weight[valid], dim=-1)
+        anchors = F.normalize(self.class_relation_anchors[valid], dim=-1)
+        return (1.0 - (weights * anchors).sum(dim=1)).mean()
+
+    @torch.no_grad()
+    def maybe_init_classifier_from_anchors(self, *, force: bool = False):
+        if bool(self.classifier_anchor_initialized) and not force:
+            return
+        valid = self.class_anchor_inited
+        if not bool(valid.any()):
+            return
+        anchors = F.normalize(self.class_relation_anchors[valid], dim=-1)
+        self.adaptive_classifier.weight.data[valid].copy_(anchors.to(dtype=self.adaptive_classifier.weight.dtype))
+        self.classifier_anchor_initialized.fill_(True)
+
+    @torch.no_grad()
+    def maybe_init_target_classifier_from_source(self, *, force: bool = False):
+        if bool(self.target_classifier_initialized) and not force:
+            return
+        self.target_classifier.weight.copy_(self.adaptive_classifier.weight)
+        self.target_classifier_initialized.fill_(True)
+
+    @torch.no_grad()
+    def update_target_center(self, h_shared: torch.Tensor, momentum: float):
+        if self.relation_space_mode != "domain_relative" or h_shared.numel() == 0:
+            return
+        batch_center = h_shared.detach().mean(dim=0).to(dtype=self.target_center.dtype)
+        momentum = min(0.9999, max(0.0, float(momentum)))
+        if bool(self.target_center_inited):
+            self.target_center.mul_(momentum).add_(batch_center, alpha=1.0 - momentum)
+        else:
+            self.target_center.copy_(batch_center)
+            self.target_center_inited.fill_(True)
+
+    def _target_sample_center(self, h_shared: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.relation_space_mode != "domain_relative" or not bool(self.target_center_inited):
+            return None
+        return self.target_center.to(device=h_shared.device, dtype=h_shared.dtype)
 
     @torch.no_grad()
     def update_target_prototypes(
@@ -281,7 +453,21 @@ class DCPRNetwork(nn.Module):
 
     def _adaptive_logits(self, h_shared: torch.Tensor) -> torch.Tensor:
         h_n = F.normalize(h_shared, dim=-1)
-        w_n = F.normalize(self.adaptive_classifier.weight, dim=-1)
+        weight = self.adaptive_classifier.weight
+        if self.class_logits_mode == "single" and self.classifier_anchor_blend > 0.0:
+            valid = self.class_anchor_inited
+            if bool(valid.any()):
+                blended = weight.clone()
+                anchors = self.class_relation_anchors.to(device=weight.device, dtype=weight.dtype)
+                blend = self.classifier_anchor_blend
+                blended[valid] = (1.0 - blend) * weight[valid] + blend * anchors[valid]
+                weight = blended
+        w_n = F.normalize(weight, dim=-1)
+        return F.linear(h_n, w_n) * self.adaptive_head_scale
+
+    def _target_head_logits(self, h_shared: torch.Tensor) -> torch.Tensor:
+        h_n = F.normalize(h_shared, dim=-1)
+        w_n = F.normalize(self.target_classifier.weight, dim=-1)
         return F.linear(h_n, w_n) * self.adaptive_head_scale
 
     def _target_prototype_logits(self, h_shared: torch.Tensor) -> torch.Tensor:
@@ -290,27 +476,138 @@ class DCPRNetwork(nn.Module):
         logits = F.linear(h_n, target_n) * self.adaptive_head_scale
         return logits
 
+    @staticmethod
+    def _branch_log_probs(
+        logits: torch.Tensor,
+        valid_classes: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
+        masked_logits = logits.masked_fill(~valid_classes.unsqueeze(0), -1e4)
+        return F.log_softmax(masked_logits / max(1e-6, float(temperature)), dim=1)
+
+    def _linear_fuse_class_logits(
+        self,
+        proto_logits: torch.Tensor,
+        adaptive_logits: torch.Tensor,
+        target_logits: torch.Tensor,
+        *,
+        use_target_logits: bool,
+    ) -> torch.Tensor:
+        class_logits = proto_logits
+        if self.adaptive_logit_weight > 0.0:
+            adaptive_weight = min(1.0, max(0.0, self.adaptive_logit_weight))
+            class_logits = (1.0 - adaptive_weight) * class_logits + adaptive_weight * adaptive_logits
+        if use_target_logits and self.target_logit_weight > 0.0:
+            target_weight = min(1.0, max(0.0, self.target_logit_weight))
+            valid_weight = self.target_proto_inited.to(dtype=class_logits.dtype).unsqueeze(0) * target_weight
+            class_logits = (1.0 - valid_weight) * class_logits + valid_weight * target_logits
+        return class_logits
+
+    def _logprob_fuse_class_logits(
+        self,
+        proto_logits: torch.Tensor,
+        adaptive_logits: torch.Tensor,
+        target_logits: torch.Tensor,
+        valid_classes: torch.Tensor,
+        *,
+        use_target_logits: bool,
+    ) -> torch.Tensor:
+        adaptive_weight = min(1.0, max(0.0, self.adaptive_logit_weight))
+        target_weight = min(1.0, max(0.0, self.target_logit_weight)) if use_target_logits else 0.0
+        if self.proto_logit_weight is None:
+            proto_weight = max(0.0, 1.0 - adaptive_weight - target_weight)
+        else:
+            proto_weight = self.proto_logit_weight
+
+        if proto_weight <= 0.0 and adaptive_weight <= 0.0 and target_weight <= 0.0:
+            proto_weight = 1.0
+
+        proto_lp = self._branch_log_probs(proto_logits, valid_classes, self.proto_logit_temperature)
+        fused = proto_lp.new_zeros(proto_lp.shape)
+        effective_weight = proto_lp.new_full((1, proto_lp.size(1)), 1e-8)
+
+        if proto_weight > 0.0:
+            fused = fused + proto_weight * proto_lp
+            effective_weight = effective_weight + proto_weight * valid_classes.to(dtype=proto_lp.dtype).unsqueeze(0)
+
+        if adaptive_weight > 0.0:
+            adaptive_lp = self._branch_log_probs(
+                adaptive_logits,
+                valid_classes,
+                self.adaptive_logit_temperature,
+            )
+            fused = fused + adaptive_weight * adaptive_lp
+            effective_weight = effective_weight + adaptive_weight * valid_classes.to(dtype=proto_lp.dtype).unsqueeze(0)
+
+        target_valid = valid_classes & self.target_proto_inited if target_weight > 0.0 else valid_classes.new_zeros(valid_classes.shape)
+        if target_weight > 0.0 and bool(target_valid.any()):
+            target_lp = self._branch_log_probs(
+                target_logits,
+                target_valid,
+                self.target_logit_temperature,
+            )
+            target_mask = target_valid.to(dtype=proto_lp.dtype).unsqueeze(0)
+            fused = fused + target_weight * target_mask * target_lp
+            effective_weight = effective_weight + target_weight * target_mask
+
+        fused = fused / effective_weight.clamp_min(1e-6)
+        return fused.masked_fill(~valid_classes.unsqueeze(0), -1e4)
+
     def forward_relation_logits(
         self,
         x: Optional[torch.Tensor] = None,
         h_shared: Optional[torch.Tensor] = None,
+        domain_ids: Optional[torch.Tensor] = None,
+        use_target_center: bool = False,
+        use_target_logits: bool = True,
+        classification_role: str = "target",
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         h_shared = self._encode_shared(x=x, h_shared=h_shared)
-        relations = self.relation_router.parse(h_shared)
+        target_center = self._target_sample_center(h_shared) if use_target_center else None
+        relations = self.relation_router.parse(
+            h_shared,
+            domain_ids=domain_ids,
+            sample_center=target_center,
+        )
+        h_relation = relations["h_relation"]
         proto_class_logits = relations["class_logits_rel"].masked_fill(
             ~relations["valid_classes"].unsqueeze(0), -1e4
         )
-        adaptive_logits = self._adaptive_logits(h_shared)
-        target_logits = self._target_prototype_logits(h_shared)
-
-        class_logits = proto_class_logits
-        if self.adaptive_logit_weight > 0.0:
-            adaptive_weight = min(1.0, max(0.0, self.adaptive_logit_weight))
-            class_logits = (1.0 - adaptive_weight) * class_logits + adaptive_weight * adaptive_logits
-        if self.target_logit_weight > 0.0:
-            target_weight = min(1.0, max(0.0, self.target_logit_weight))
-            valid_weight = self.target_proto_inited.to(dtype=class_logits.dtype).unsqueeze(0) * target_weight
-            class_logits = (1.0 - valid_weight) * class_logits + valid_weight * target_logits
+        adaptive_logits = self._adaptive_logits(h_relation)
+        target_head_logits = self._target_head_logits(h_relation)
+        if self.classification_structure == "decoupled":
+            role = str(classification_role).strip().lower()
+            if role == "source":
+                class_logits = adaptive_logits
+            elif role == "target":
+                class_logits = (
+                    target_head_logits
+                    if self.target_classifier_mode == "head"
+                    else proto_class_logits
+                )
+            else:
+                raise ValueError("classification_role must be 'source' or 'target'")
+            target_logits = target_head_logits
+        elif self.class_logits_mode == "single":
+            target_logits = torch.zeros_like(adaptive_logits)
+            class_logits = adaptive_logits
+        else:
+            target_logits = self._target_prototype_logits(h_relation)
+            if self.logit_fusion == "logprob":
+                class_logits = self._logprob_fuse_class_logits(
+                    proto_class_logits,
+                    adaptive_logits,
+                    target_logits,
+                    relations["valid_classes"],
+                    use_target_logits=use_target_logits,
+                )
+            else:
+                class_logits = self._linear_fuse_class_logits(
+                    proto_class_logits,
+                    adaptive_logits,
+                    target_logits,
+                    use_target_logits=use_target_logits,
+                )
 
         class_logits = class_logits.masked_fill(~relations["valid_classes"].unsqueeze(0), -1e4)
         class_probs = torch.softmax(class_logits, dim=1)
@@ -318,10 +615,13 @@ class DCPRNetwork(nn.Module):
         node_mass = class_probs.unsqueeze(-1) * domain_weights
 
         aux = {
-            "h_relation": h_shared,
+            "h_shared": h_shared,
+            "h_relation": h_relation,
             "class_logits": class_logits,
             "proto_class_logits": proto_class_logits,
             "adaptive_class_logits": adaptive_logits,
+            "source_class_logits": adaptive_logits,
+            "target_head_logits": target_head_logits,
             "target_class_logits": target_logits,
             "class_probs": class_probs,
             "domain_weights": domain_weights,
@@ -366,6 +666,8 @@ class DCPRAltSolver(BaseSolver):
         self.lambda_target_pseudo_ce = float(m.get("lambda_target_pseudo_ce", 0.0))
         self.lambda_target_im = float(m.get("lambda_target_im", 0.0))
         self.lambda_source_proto_ce = float(m.get("lambda_source_proto_ce", 0.0))
+        self.lambda_source_adaptive_ce = float(m.get("lambda_source_adaptive_ce", 0.0))
+        self.lambda_classifier_anchor = float(m.get("lambda_classifier_anchor", 0.0))
         self.lambda_ambiguity_margin = float(m.get("lambda_ambiguity_margin", 0.0))
         self.pseudo_threshold = float(m.get("pseudo_threshold", 0.80))
         self.pseudo_start_epoch = int(m.get("pseudo_start_epoch", self.consistency_start_epoch))
@@ -377,6 +679,10 @@ class DCPRAltSolver(BaseSolver):
         self.ambiguity_threshold = float(m.get("ambiguity_threshold", 0.30))
         self.ambiguity_relation_boost = float(m.get("ambiguity_relation_boost", 0.0))
         self.ambiguity_power = float(m.get("ambiguity_power", 1.0))
+        self.relation_space_mode = str(m.get("relation_space_mode", "standard")).strip().lower()
+        if self.relation_space_mode not in {"standard", "domain_relative"}:
+            raise ValueError("method.relation_space_mode must be 'standard' or 'domain_relative'")
+        self.target_center_momentum = float(m.get("target_center_momentum", 0.98))
         self.target_prototype_momentum = float(m.get("target_prototype_momentum", 0.98))
         self.target_prototype_threshold = float(m.get("target_prototype_threshold", 0.70))
         self.target_prototype_update = str(m.get("target_prototype_update", "hard")).strip().lower()
@@ -411,6 +717,30 @@ class DCPRAltSolver(BaseSolver):
         self.adaptive_logit_weight = float(m.get("adaptive_logit_weight", adaptive_weight_default))
         self.target_logit_weight = float(m.get("target_logit_weight", target_weight_default))
         self.adaptive_head_scale = float(m.get("adaptive_head_scale", 10.0))
+        self.class_logits_mode = str(m.get("class_logits_mode", "single")).strip().lower()
+        if self.class_logits_mode not in {"single", "fusion"}:
+            raise ValueError("method.class_logits_mode must be 'single' or 'fusion'")
+        self.classifier_init_from_anchors = self._is_truthy(m.get("classifier_init_from_anchors", True))
+        self.classifier_anchor_blend = float(m.get("classifier_anchor_blend", 0.0))
+        self.feature_norm_mode = str(m.get("feature_norm_mode", "layernorm")).strip().lower()
+        if self.feature_norm_mode not in {"layernorm", "l2", "identity"}:
+            raise ValueError("method.feature_norm_mode must be 'layernorm', 'l2', or 'identity'")
+        self.classification_structure = str(m.get("classification_structure", "legacy")).strip().lower()
+        if self.classification_structure not in {"legacy", "decoupled"}:
+            raise ValueError("method.classification_structure must be 'legacy' or 'decoupled'")
+        self.target_classifier_mode = str(m.get("target_classifier_mode", "head")).strip().lower()
+        if self.target_classifier_mode not in {"head", "prototype"}:
+            raise ValueError("method.target_classifier_mode must be 'head' or 'prototype'")
+        self.target_head_init_from_source = self._is_truthy(m.get("target_head_init_from_source", True))
+        self.target_head_warmup_sync = self._is_truthy(m.get("target_head_warmup_sync", True))
+        self.logit_fusion = str(m.get("logit_fusion", "linear")).strip().lower()
+        if self.logit_fusion not in {"linear", "logprob"}:
+            raise ValueError("method.logit_fusion must be 'linear' or 'logprob'")
+        proto_logit_weight = m.get("proto_logit_weight", None)
+        self.proto_logit_weight = None if proto_logit_weight is None else float(proto_logit_weight)
+        self.proto_logit_temperature = float(m.get("proto_logit_temperature", 1.0))
+        self.adaptive_logit_temperature = float(m.get("adaptive_logit_temperature", 1.0))
+        self.target_logit_temperature = float(m.get("target_logit_temperature", 1.0))
         self.update_target_prototypes = self.target_logit_weight > 0.0
 
         self.total_epochs = int(m.get("epochs", 20))
@@ -458,6 +788,17 @@ class DCPRAltSolver(BaseSolver):
             adaptive_head_scale=self.adaptive_head_scale,
             adaptive_logit_weight=self.adaptive_logit_weight,
             target_logit_weight=self.target_logit_weight,
+            relation_space_mode=self.relation_space_mode,
+            class_logits_mode=self.class_logits_mode,
+            classifier_anchor_blend=self.classifier_anchor_blend,
+            logit_fusion=self.logit_fusion,
+            proto_logit_weight=self.proto_logit_weight,
+            proto_logit_temperature=self.proto_logit_temperature,
+            adaptive_logit_temperature=self.adaptive_logit_temperature,
+            target_logit_temperature=self.target_logit_temperature,
+            feature_norm_mode=self.feature_norm_mode,
+            classification_structure=self.classification_structure,
+            target_classifier_mode=self.target_classifier_mode,
         ).to(self.device)
 
         self.ema_net = copy.deepcopy(self.net)
@@ -466,30 +807,43 @@ class DCPRAltSolver(BaseSolver):
 
         self._forward_logits_student = self.net.forward_relation_logits
         self._student_forward_compiled = False
-        self._target_tensor_aug_enabled = False
-        self._target_weak_aug = None
-        self._target_strong_aug = None
         self.class_ambiguity_weights = torch.zeros(self.num_classes, device=self.device)
         self._src_prefetch_stream = None
         self._tgt_prefetch_stream = None
         if self.cuda_batch_prefetch and self.device.type == "cuda":
             self._src_prefetch_stream = torch.cuda.Stream()
             self._tgt_prefetch_stream = torch.cuda.Stream()
-        self._setup_target_tensor_augment()
+        self._target_view_builder = TargetViewBuilder(
+            config=self.config,
+            device=self.device,
+            to_device=self._to_device,
+            logger=logger,
+            display_name="DCPR-ALT",
+        )
 
         logger.info(
-            "DCPR-ALT: bottleneck=%d temp=%.2f->%.2f "
-            "rel_space_dim=%d decision=%s adaptive_w=%.2f target_w=%.2f "
+            "DCPR-ALT: bottleneck=%d rel_space=%s temp=%.2f->%.2f "
+            "rel_space_dim=%d norm=%s structure=%s target_cls=%s "
+            "logits=%s decision=%s fusion=%s proto_w=%s adaptive_w=%.2f target_w=%.2f "
             "lambda_rel=%.2f lambda_pseudo=%.2f "
             "pseudo_thr=%.2f pseudo_start=%d lambda_im=%.2f im_start=%d "
-            "target_proto=%s lambda_src_proto=%.2f lambda_amb=%.2f amb_boost=%.2f "
+            "target_proto=%s init_anchor=%s anchor_blend=%.2f "
+            "lambda_src_proto=%.2f lambda_src_adapt=%.2f lambda_anchor=%.2f "
+            "lambda_amb=%.2f amb_boost=%.2f "
             "proto=full_eval proto_bs=%d proto_prefetch=%s "
             "ramp_start=%d ramp_denom=%.1f prefetch=%s",
             self.bottleneck_dim,
+            self.relation_space_mode,
             self.temperature_start,
             self.temperature_end,
             self.net.relation_feat_dim,
+            self.feature_norm_mode,
+            self.classification_structure,
+            self.target_classifier_mode,
+            self.class_logits_mode,
             self.decision_mode,
+            self.logit_fusion,
+            "auto" if self.proto_logit_weight is None else f"{self.proto_logit_weight:.2f}",
             self.adaptive_logit_weight,
             self.target_logit_weight,
             self.lambda_relation_consistency,
@@ -499,7 +853,11 @@ class DCPRAltSolver(BaseSolver):
             self.lambda_target_im,
             self.target_im_start_epoch,
             self.target_prototype_update,
+            str(self.classifier_init_from_anchors),
+            self.classifier_anchor_blend,
             self.lambda_source_proto_ce,
+            self.lambda_source_adaptive_ce,
+            self.lambda_classifier_anchor,
             self.lambda_ambiguity_margin,
             self.ambiguity_relation_boost,
             self.prototype_batch_size,
@@ -539,10 +897,28 @@ class DCPRAltSolver(BaseSolver):
         *,
         x: Optional[torch.Tensor] = None,
         h_shared: Optional[torch.Tensor] = None,
+        domain_ids: Optional[torch.Tensor] = None,
+        use_target_center: bool = False,
+        use_target_logits: bool = True,
+        classification_role: str = "target",
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if model is self.net:
-            return self._forward_logits_student(x, h_shared)
-        return model.forward_relation_logits(x=x, h_shared=h_shared)
+            return self._forward_logits_student(
+                x,
+                h_shared,
+                domain_ids,
+                use_target_center,
+                use_target_logits,
+                classification_role,
+            )
+        return model.forward_relation_logits(
+            x=x,
+            h_shared=h_shared,
+            domain_ids=domain_ids,
+            use_target_center=use_target_center,
+            use_target_logits=use_target_logits,
+            classification_role=classification_role,
+        )
 
     def _setup_compiled_student_forward(self):
         if self._student_forward_compiled:
@@ -553,96 +929,8 @@ class DCPRAltSolver(BaseSolver):
         )
         self._student_forward_compiled = True
 
-    def _setup_target_tensor_augment(self):
-        perf_cfg = getattr(self.config, "performance", None)
-        aug_cfg = getattr(perf_cfg, "augmentation", None) if perf_cfg is not None else None
-        target_tensor_v2_cfg = getattr(aug_cfg, "target_tensor_v2", "auto") if aug_cfg is not None else "auto"
-        enabled = self._resolve_auto_bool(
-            target_tensor_v2_cfg,
-            auto_value=(self.device.type == "cuda"),
-        )
-        if not enabled:
-            return
-        if not self._is_truthy(getattr(self.config.method, "strong_aug", False)):
-            logger.warning(
-                "target_tensor_v2 requested, but method.strong_aug=False. "
-                "Falling back to dataloader transforms."
-            )
-            return
-        color_space_cfg = getattr(self.config.method, "color_space", None)
-        if color_space_cfg is not None and self._is_truthy(getattr(color_space_cfg, "enabled", False)):
-            logger.warning(
-                "target_tensor_v2 requested with color_space.enabled=True, which is unsupported. "
-                "Falling back to dataloader transforms."
-            )
-            return
-
-        target_aug_cfg = getattr(self.config.method, "target_aug", None)
-        randaugment_num_ops = (
-            int(getattr(target_aug_cfg, "randaugment_num_ops", 2))
-            if target_aug_cfg is not None
-            else 2
-        )
-        randaugment_magnitude = (
-            int(getattr(target_aug_cfg, "randaugment_magnitude", 10))
-            if target_aug_cfg is not None
-            else 10
-        )
-
-        mean = [0.485, 0.456, 0.406]
-        std = [0.229, 0.224, 0.225]
-        self._target_weak_aug = transforms_v2.Compose(
-            [
-                transforms_v2.RandomCrop(224),
-                transforms_v2.RandomHorizontalFlip(),
-                transforms_v2.ToDtype(torch.float32, scale=True),
-                transforms_v2.Normalize(mean, std),
-            ]
-        )
-        self._target_strong_aug = transforms_v2.Compose(
-            [
-                transforms_v2.RandomCrop(224),
-                transforms_v2.RandomHorizontalFlip(),
-                transforms_v2.RandAugment(
-                    num_ops=randaugment_num_ops,
-                    magnitude=randaugment_magnitude,
-                    interpolation=InterpolationMode.BILINEAR,
-                ),
-                transforms_v2.ToDtype(torch.float32, scale=True),
-                transforms_v2.Normalize(mean, std),
-            ]
-        )
-        self._target_tensor_aug_enabled = True
-        logger.info(
-            "DCPR-ALT target tensor augmentation enabled (v2, GPU-capable): "
-            "weak=RandomCrop+HFlip, strong=RandomCrop+HFlip+RandAugment(%d,%d)",
-            randaugment_num_ops,
-            randaugment_magnitude,
-        )
-
-    def _to_uint8_image_tensor(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype == torch.uint8:
-            return x
-        if torch.is_floating_point(x):
-            if x.max() <= 1.0 and x.min() >= 0.0:
-                return (x * 255.0).round().clamp(0.0, 255.0).to(torch.uint8)
-            return x.round().clamp(0.0, 255.0).to(torch.uint8)
-        return x.clamp(0, 255).to(torch.uint8)
-
     def _prepare_target_views(self, tgt_imgs):
-        if isinstance(tgt_imgs, (tuple, list)) and len(tgt_imgs) >= 2:
-            tgt_weak, tgt_strong = tgt_imgs[0], tgt_imgs[1]
-            return self._to_device(tgt_weak), self._to_device(tgt_strong)
-
-        if not self._target_tensor_aug_enabled:
-            tgt_weak, tgt_strong = _unwrap_weak_strong_from_maybe_tuple(tgt_imgs)
-            return self._to_device(tgt_weak), self._to_device(tgt_strong)
-
-        base = self._to_device(tgt_imgs)
-        base = self._to_uint8_image_tensor(base)
-        tgt_weak = self._target_weak_aug(base)
-        tgt_strong = self._target_strong_aug(base)
-        return tgt_weak, tgt_strong
+        return self._target_view_builder.prepare(tgt_imgs)
 
     def _load_source_batch_to_device(self, src_batch):
         src_imgs, src_labels, src_dom = src_batch
@@ -659,14 +947,15 @@ class DCPRAltSolver(BaseSolver):
 
     @torch.no_grad()
     def _update_ema(self, decay: float):
-        for p_ema, p_student in zip(self.ema_net.parameters(), self.net.parameters()):
-            p_ema.data.mul_(decay).add_(p_student.data, alpha=1.0 - decay)
-        for b_ema, b_student in zip(self.ema_net.buffers(), self.net.buffers()):
-            b_ema.data.copy_(b_student.data)
+        update_ema_model(self.ema_net, self.net, decay)
 
     def _ema_decay_at(self, step: int, total_steps: int) -> float:
-        progress = min(1.0, step / max(1, total_steps))
-        return self.ema_decay_start + (self.ema_decay_end - self.ema_decay_start) * progress
+        return linear_ema_decay(
+            step,
+            total_steps,
+            self.ema_decay_start,
+            self.ema_decay_end,
+        )
 
     @staticmethod
     def _normalize_distribution(x: torch.Tensor) -> torch.Tensor:
@@ -763,8 +1052,11 @@ class DCPRAltSolver(BaseSolver):
         self,
         valid: torch.Tensor,
         prototypes: torch.Tensor,
+        domain_centers: Optional[torch.Tensor] = None,
     ):
         valid_class = valid.any(dim=0)
+        if self.relation_space_mode == "domain_relative" and domain_centers is not None:
+            prototypes = prototypes - domain_centers.unsqueeze(1)
         proto = F.normalize(prototypes, dim=-1)
         valid_f = valid.to(dtype=proto.dtype).unsqueeze(-1)
         class_sum = (proto * valid_f).sum(dim=0)
@@ -777,6 +1069,24 @@ class DCPRAltSolver(BaseSolver):
         weights = ((top_sim - self.ambiguity_threshold) / denom).clamp(0.0, 1.0)
         weights = torch.where(valid_class, weights, torch.zeros_like(weights))
         self.class_ambiguity_weights.copy_(weights.detach())
+
+    def _compute_class_relation_anchors(
+        self,
+        valid: torch.Tensor,
+        prototypes: torch.Tensor,
+        domain_centers: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        valid_class = valid.any(dim=0)
+        relation_proto = prototypes
+        if self.relation_space_mode == "domain_relative":
+            relation_proto = relation_proto - domain_centers.unsqueeze(1)
+        proto = F.normalize(relation_proto, dim=-1)
+        valid_f = valid.to(dtype=proto.dtype).unsqueeze(-1)
+        class_sum = (proto * valid_f).sum(dim=0)
+        class_count = valid_f.sum(dim=0).clamp_min(1.0)
+        anchors = F.normalize(class_sum / class_count, dim=-1)
+        anchors = torch.where(valid_class.unsqueeze(1), anchors, torch.zeros_like(anchors))
+        return valid_class, anchors
 
     def _ambiguity_relation_weights(
         self,
@@ -825,7 +1135,10 @@ class DCPRAltSolver(BaseSolver):
     @torch.no_grad()
     def _teacher_guidance(self, tgt_weak: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         self.ema_net.eval()
-        _, aux = self._forward_logits(self.ema_net, x=tgt_weak)
+        h_shared = self.ema_net._encode_shared(x=tgt_weak)
+        self.net.update_target_center(h_shared, momentum=self.target_center_momentum)
+        self.ema_net.update_target_center(h_shared, momentum=self.target_center_momentum)
+        _, aux = self._forward_logits(self.ema_net, h_shared=h_shared, use_target_center=True)
         conf = aux["class_probs"].max(dim=1).values.detach()
         guide = {
             "class_probs": aux["class_probs"].detach(),
@@ -839,15 +1152,36 @@ class DCPRAltSolver(BaseSolver):
         if isinstance(imgs, (tuple, list)):
             imgs = imgs[0]
         with torch.no_grad():
-            logits, _ = self._forward_logits(self.ema_net, x=imgs)
+            logits, _ = self._forward_logits(self.ema_net, x=imgs, use_target_center=True)
             return logits
 
     @torch.no_grad()
     def _sync_relation_buffers_to_ema(self):
-        for name in ["src_prototypes", "src_proto_inited"]:
+        for name in ["src_prototypes", "src_proto_inited", "src_domain_centers", "src_domain_center_inited"]:
             getattr(self.ema_net.relation_router, name).copy_(getattr(self.net.relation_router, name))
-        for name in ["target_prototypes", "target_proto_inited"]:
+        for name in [
+            "target_prototypes",
+            "target_proto_inited",
+            "target_center",
+            "target_center_inited",
+            "class_relation_anchors",
+            "class_anchor_inited",
+            "classifier_anchor_initialized",
+            "target_classifier_initialized",
+        ]:
             getattr(self.ema_net, name).copy_(getattr(self.net, name))
+
+    @torch.no_grad()
+    def _sync_classifier_initialization_to_ema(self):
+        self.ema_net.adaptive_classifier.weight.copy_(self.net.adaptive_classifier.weight)
+        self.ema_net.target_classifier.weight.copy_(self.net.target_classifier.weight)
+
+    @torch.no_grad()
+    def _sync_target_head_from_source(self):
+        self.net.target_classifier.weight.copy_(self.net.adaptive_classifier.weight)
+        self.ema_net.target_classifier.weight.copy_(self.net.adaptive_classifier.weight)
+        self.net.target_classifier_initialized.fill_(True)
+        self.ema_net.target_classifier_initialized.fill_(True)
 
     def _build_optimizer(self):
         base_lr = float(self.config.method.lr)
@@ -856,6 +1190,7 @@ class DCPRAltSolver(BaseSolver):
             {"params": list(self.net.bottleneck.parameters()), "lr": base_lr},
             {"params": list(self.net.feature_norm.parameters()), "lr": base_lr},
             {"params": list(self.net.adaptive_classifier.parameters()), "lr": base_lr},
+            {"params": list(self.net.target_classifier.parameters()), "lr": base_lr},
             {"params": list(self.net.relation_router.parameters()), "lr": base_lr},
         ]
         param_groups = [group for group in param_groups if len(group["params"]) > 0]
@@ -978,6 +1313,15 @@ class DCPRAltSolver(BaseSolver):
             self.num_classes,
             device=self.device,
         )
+        domain_sums = torch.zeros(
+            self.num_source_domains,
+            model.relation_feat_dim,
+            device=self.device,
+        )
+        domain_counts = torch.zeros(
+            self.num_source_domains,
+            device=self.device,
+        )
         feat_sums_flat = feat_sums.view(-1, model.relation_feat_dim)
         counts_flat = counts.view(-1)
 
@@ -997,13 +1341,28 @@ class DCPRAltSolver(BaseSolver):
             feat_sums_flat.index_add_(0, flat_index_sorted, h_shared[order])
             ones = torch.ones(flat_index_sorted.size(0), dtype=counts_flat.dtype, device=self.device)
             counts_flat.index_add_(0, flat_index_sorted, ones)
+            domain_order = src_dom.long().argsort()
+            domain_sorted = src_dom.long()[domain_order]
+            domain_sums.index_add_(0, domain_sorted, h_shared[domain_order])
+            domain_counts.index_add_(
+                0,
+                domain_sorted,
+                torch.ones(domain_sorted.size(0), dtype=domain_counts.dtype, device=self.device),
+            )
 
         valid = counts > 0
         safe_counts = counts.clamp_min(1.0).unsqueeze(-1)
         prototypes = feat_sums / safe_counts
         prototypes = torch.where(valid.unsqueeze(-1), prototypes, torch.zeros_like(prototypes))
+        domain_valid = domain_counts > 0
+        domain_centers = domain_sums / domain_counts.clamp_min(1.0).unsqueeze(1)
+        domain_centers = torch.where(
+            domain_valid.unsqueeze(1),
+            domain_centers,
+            torch.zeros_like(domain_centers),
+        )
 
-        return valid, prototypes
+        return valid, prototypes, domain_valid, domain_centers
 
     def _recompute_source_prototypes(self, model: DCPRNetwork):
         with torch.inference_mode():
@@ -1013,14 +1372,26 @@ class DCPRAltSolver(BaseSolver):
             with self._prototype_source_iter() as prototype_loader:
                 batch_iter = self._iter_prototype_source_batches(prototype_loader)
                 started_at = time.time()
-                valid, prototypes = self._compute_source_prototypes(model, batch_iter)
+                valid, prototypes, domain_valid, domain_centers = self._compute_source_prototypes(model, batch_iter)
                 elapsed_minutes = (time.time() - started_at) / 60.0
 
                 model.reset_source_prototypes()
                 model.relation_router.src_proto_inited.copy_(valid)
                 model.relation_router.src_prototypes.copy_(prototypes)
+                model.relation_router.src_domain_center_inited.copy_(domain_valid)
+                model.relation_router.src_domain_centers.copy_(domain_centers)
+                anchor_valid, class_anchors = self._compute_class_relation_anchors(
+                    valid,
+                    prototypes,
+                    domain_centers,
+                )
+                model.set_class_relation_anchors(anchor_valid, class_anchors)
+                if self.classifier_init_from_anchors:
+                    model.maybe_init_classifier_from_anchors()
+                if self.target_head_init_from_source:
+                    model.maybe_init_target_classifier_from_source()
                 if model is self.net:
-                    self._update_source_class_ambiguity(valid, prototypes)
+                    self._update_source_class_ambiguity(valid, prototypes, domain_centers)
                 logger.info(
                     "DCPR source prototype refresh | proto_bs=%d single_pass "
                     "elapsed_min=%.2f amb_mean=%.3f amb_max=%.3f",
@@ -1045,7 +1416,7 @@ class DCPRAltSolver(BaseSolver):
         ambiguity_ramp: float,
         ema_decay: float,
     ):
-        src_imgs, src_labels, _ = src_batch
+        src_imgs, src_labels, src_dom = src_batch
         tgt_weak, tgt_strong = tgt_batch if tgt_batch is not None else (None, None)
 
         self._zero_grad(optimizer)
@@ -1054,6 +1425,8 @@ class DCPRAltSolver(BaseSolver):
         loss_pseudo = torch.zeros((), device=self.device, dtype=torch.float32)
         loss_im = torch.zeros((), device=self.device, dtype=torch.float32)
         loss_src_proto = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_src_adaptive = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_anchor = torch.zeros((), device=self.device, dtype=torch.float32)
         loss_ambiguity = torch.zeros((), device=self.device, dtype=torch.float32)
         conf_tgt = torch.zeros((), device=self.device, dtype=torch.float32)
         pseudo_selected = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -1061,16 +1434,27 @@ class DCPRAltSolver(BaseSolver):
         ambiguity_selected = torch.zeros((), device=self.device, dtype=torch.float32)
 
         with self._auto_cast():
-            logits_src, src_aux = self._forward_logits(self.net, x=src_imgs)
+            logits_src, src_aux = self._forward_logits(
+                self.net,
+                x=src_imgs,
+                domain_ids=src_dom,
+                use_target_logits=False,
+                classification_role="source",
+            )
             self._probe_amp_tensor(logits_src, "dcpr_alt/logits_src", warn_on_float32=False)
             loss_src = self.criterion_task(logits_src, src_labels)
             loss = loss_src
             if self.lambda_source_proto_ce > 0.0:
                 loss_src_proto = self.criterion_task(src_aux["proto_class_logits"], src_labels)
                 loss = loss + self.lambda_source_proto_ce * loss_src_proto
+            if self.lambda_source_adaptive_ce > 0.0:
+                loss_src_adaptive = self.criterion_task(src_aux["adaptive_class_logits"], src_labels)
+                loss = loss + self.lambda_source_adaptive_ce * loss_src_adaptive
+            if self.lambda_classifier_anchor > 0.0:
+                loss_anchor = self.net.classifier_anchor_loss()
+                loss = loss + self.lambda_classifier_anchor * loss_anchor
 
             if tgt_weak is not None and tgt_strong is not None:
-                logits_tgt, tgt_aux = self._forward_logits(self.net, x=tgt_strong)
                 with torch.no_grad():
                     with self._auto_cast():
                         conf_tgt, teacher_aux = self._teacher_guidance(tgt_weak)
@@ -1090,6 +1474,8 @@ class DCPRAltSolver(BaseSolver):
                                 threshold=self.target_prototype_threshold,
                                 momentum=self.target_prototype_momentum,
                             )
+
+                logits_tgt, tgt_aux = self._forward_logits(self.net, x=tgt_strong, use_target_center=True)
 
                 if self.lambda_relation_consistency > 0.0:
                     rel_weights = conf_tgt.pow(self.consistency_conf_power)
@@ -1138,6 +1524,8 @@ class DCPRAltSolver(BaseSolver):
         metrics = {
             "src": loss_src.detach().float(),
             "srcp": loss_src_proto.detach().float(),
+            "srca": loss_src_adaptive.detach().float(),
+            "anch": loss_anchor.detach().float(),
             "rel": loss_rel.detach().float(),
             "pseudo": loss_pseudo.detach().float(),
             "psel": pseudo_selected.detach().float(),
@@ -1163,7 +1551,7 @@ class DCPRAltSolver(BaseSolver):
         ambiguity_ramp: float,
         global_step: int,
     ):
-        metric_keys = ("src", "srcp", "rel", "pseudo", "psel", "im", "amb", "asel", "tpsel", "conf", "total")
+        metric_keys = ("src", "srcp", "srca", "anch", "rel", "pseudo", "psel", "im", "amb", "asel", "tpsel", "conf", "total")
         metric_sums = {
             key: torch.zeros((), device=self.device, dtype=torch.float32)
             for key in metric_keys
@@ -1228,11 +1616,12 @@ class DCPRAltSolver(BaseSolver):
         total_iters = self.total_epochs * epoch_steps
         self._total_iters = total_iters
         scheduler = self._build_scheduler(optimizer, total_iters)
+        self.register_training_state(optimizer=optimizer, scheduler=scheduler)
         self._setup_compiled_student_forward()
-        best_acc = float("-inf")
+        best_acc = self._best_metric
         uses_target_loader = self._uses_target_loader_in_training()
 
-        global_step = 0
+        global_step = self._training_global_step
         logger.info(
             "DCPR-ALT Training: epoch_steps=max source_steps=%d target_steps=%d "
             "epoch_steps=%d use_target=%s rel=domain_class lambda_rel=%.2f",
@@ -1243,13 +1632,22 @@ class DCPRAltSolver(BaseSolver):
             self.lambda_relation_consistency,
         )
 
-        for epoch in range(self.total_epochs):
+        for epoch in self._epoch_range(self.total_epochs):
             current_temperature = self._temperature_at_epoch(epoch + 1)
             self._set_relation_temperature(current_temperature)
 
             if self.refresh_source_prototypes_each_epoch or epoch == 0:
                 self._recompute_source_prototypes(self.net)
                 self._sync_relation_buffers_to_ema()
+                if epoch == 0:
+                    self._sync_classifier_initialization_to_ema()
+            if (
+                self.classification_structure == "decoupled"
+                and self.target_classifier_mode == "head"
+                and self.target_head_warmup_sync
+                and (epoch + 1) <= self.consistency_start_epoch
+            ):
+                self._sync_target_head_from_source()
 
             self.net.train()
             ramp = min(1.0, (epoch + 1) / max(1.0, self.ramp_denom))
@@ -1282,6 +1680,8 @@ class DCPRAltSolver(BaseSolver):
                 metrics={
                     "src": metrics["src"],
                     "srcp": metrics["srcp"],
+                    "srca": metrics["srca"],
+                    "anch": metrics["anch"],
                     "rel": metrics["rel"],
                     "pseudo": metrics["pseudo"],
                     "psel": (metrics["psel"], ".2f"),

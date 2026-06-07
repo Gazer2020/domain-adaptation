@@ -248,6 +248,7 @@ class DCFMSolver(BaseSolver):
             return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        self.register_training_state(optimizer=optimizer, scheduler=scheduler)
 
         # Beta distribution for mixup (PyTorch-based for reproducibility)
         beta_dist = torch.distributions.Beta(
@@ -255,13 +256,13 @@ class DCFMSolver(BaseSolver):
         )
 
         # Best model tracking
-        best_acc = float("-inf")
+        best_acc = self._best_metric
 
         logger.info(f"DCFM Training: {warmup_epochs} warmup + {max_epochs} joint epochs")
 
         # ===================== Stage 1: Warmup ===================== #
         logger.info("=== Stage 1: Source Warmup ===")
-        for epoch in range(warmup_epochs):
+        for epoch in self._epoch_range(warmup_epochs):
             self.net.train()
             meters = {k: AverageMeter() for k in ['task', 'domain', 'total']}
             tgt_iter = cycle(self.target_loader)
@@ -331,7 +332,7 @@ class DCFMSolver(BaseSolver):
 
         # ===================== Stage 2: Joint ===================== #
         logger.info("=== Stage 2: Joint Training with Feature Hallucination & IM ===")
-        for epoch in range(max_epochs):
+        for epoch in self._epoch_range(max_epochs, offset=warmup_epochs):
             self.net.train()
             meters = {k: AverageMeter() for k in ['task', 'domain', 'im', 'cf', 'total']}
             tgt_iter = cycle(self.target_loader)

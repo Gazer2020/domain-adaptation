@@ -216,10 +216,11 @@ class CADSolver(BaseSolver):
     def train(self):
         """Two-stage training: pretrain + adaptation."""
         self._build_optimizer()
+        self.register_training_state(optimizer=self.optimizer)
         
         pretrain_epochs = self.config.method.pretrain_epochs
         adapt_epochs = self.config.method.adapt_epochs
-        best_metric = float("-inf")
+        best_metric = self._best_metric
         
         # Stage 1: Pretrain on source
         logger.info(f"Stage 1: Pretraining for {pretrain_epochs} epochs...")
@@ -252,7 +253,7 @@ class CADSolver(BaseSolver):
         Train the feature extractor and classifier without gating losses.
         The gating module learns basic patterns but isn't explicitly supervised.
         """
-        for epoch in range(max_epochs):
+        for epoch in self._epoch_range(max_epochs):
             self._set_train_mode()
             loss_meter = AverageMeter()
             
@@ -283,6 +284,7 @@ class CADSolver(BaseSolver):
                 score_name="KnownAcc",
                 prefix="CAD Pretrain",
             )
+            self._maybe_save_training_checkpoint(epoch + 1)
 
     def _evaluate_known_accuracy(self):
         """
@@ -290,6 +292,7 @@ class CADSolver(BaseSolver):
         Used during pre-training to monitor source-like performance on target.
         """
         self._set_eval_mode()
+        self._synchronize_model_buffers()
         correct = 0
         total = 0
         
@@ -324,7 +327,7 @@ class CADSolver(BaseSolver):
         2. Structure loss: Enforce intra-class gate consistency
         3. Anomaly loss: Suppress target channels unused by source
         """
-        for epoch in range(max_epochs):
+        for epoch in self._epoch_range(max_epochs, offset=epoch_offset):
             self._set_train_mode()
             
             tgt_iter = cycle(self.target_loader)

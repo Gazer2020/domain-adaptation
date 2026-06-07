@@ -15,6 +15,8 @@ The project is organized around a few simple ideas:
 - Shared `BaseSolver` for runtime, evaluation, checkpointing, and device handling
 - Hydra config composition for datasets, methods, and performance options
 - Local-data friendly layout: datasets and LMDB caches are symlinked under `data/`
+- Full training-state resume with optimizer, scheduler, AMP, RNG, and method state
+- Multi-process distributed data parallel training for compatible solvers
 
 ## Repository Layout
 
@@ -26,17 +28,23 @@ src/
     dataset/              # dataset definitions and class splits
     method/               # method-specific hyperparameters
   datasets/
-    loader.py             # dataset construction, transforms, dataloaders
+    storage.py            # files/LMDB datasets and LMDB environment ownership
+    samplers.py           # multi-source batch samplers
+    transforms.py         # reusable augmentation components
+    loader.py             # dataloader construction and orchestration
   methods/
     registry.py           # solver registration and lookup
     base_solver.py        # shared solver contract
+    components.py         # focused cross-method training components
     *.py                  # concrete methods
   models/
     backbones.py          # torchvision backbone registry
     heads.py              # shared heads/modules
   utils/
     config.py             # config parsing and OmegaConf resolver helpers
+    distributed.py        # torch.distributed process and gradient synchronization
     runtime.py            # runtime setup, seeding, logging helpers
+    validation.py         # startup configuration validation
     utils.py              # lightweight generic helpers
 
 data/                     # local dataset symlinks and LMDB cache symlinks
@@ -44,7 +52,7 @@ results/                  # Hydra run outputs
 scripts/                  # local helper scripts
 ```
 
-Registered solvers are `cad`, `cosda`, `dare`, `dcfm`, `dcpr`, `factda`, `mic`, `ros`, `rtda`, `rvtc`, and `sourceonly`.
+Registered solvers are `cad`, `cosda`, `dare`, `dcfm`, `dcpr`, `dcpr_alt`, `factda`, `mic`, `ros`, `rtda`, `rvtc`, and `sourceonly`.
 
 ## Setup
 
@@ -101,6 +109,30 @@ python src/main.py method=dcpr performance.augmentation.target_tensor_v2=auto
 python src/main.py num_workers=8 performance.dataloader.num_workers_source=4
 ```
 
+Save a full training-state checkpoint every epoch and resume it later:
+
+```bash
+python src/main.py method=mic exp_name=mic_resume resume.save_every_epochs=1
+python src/main.py method=mic exp_name=mic_resume \
+  resume.path=checkpoints/mic_resume.resume.pth
+```
+
+The resume checkpoint is separate from the lightweight best-model checkpoint.
+It includes model, optimizer/scheduler, AMP scaler, epoch/global step, RNG state,
+and registered method-specific state.
+
+Compatible solvers can run with multiple processes:
+
+```bash
+torchrun --standalone --nproc-per-node=2 src/main.py \
+  method=mic exp_name=mic_2gpu distributed.enabled=true
+```
+
+Distributed training currently supports `sourceonly`, `mic`, `rvtc`, `factda`,
+`dcfm`, `ros`, and `cad`. Methods with global prototype or memory state
+(`cosda`, `rtda`, `dare`, `dcpr`, `dcpr_alt`) fail fast instead of silently
+changing their algorithm semantics.
+
 Hydra writes each run under:
 
 ```text
@@ -142,6 +174,7 @@ The recommended path is to inherit from [base_solver.py](src/methods/base_solver
 - device transfer helpers
 - autocast/grad-scaler utilities
 - evaluation/checkpoint helpers
+- resumable optimizer/scheduler registration
 - common runtime flags
 
 Method-level structure, logging, and checkpoint conventions are documented in [src/methods/README.md](src/methods/README.md).
@@ -171,5 +204,20 @@ Notable examples:
 - `performance.faiss_threads=1` for FAISS-based methods
 - `performance.augmentation.target_tensor_v2=auto`
 - dataloader workers default to `4/4/2` for source/target/test
+- `resume.save_every_epochs=0` keeps periodic resume checkpoints opt-in
+- `distributed.enabled=auto` activates only under `torchrun`
 
 These are easy to override per run through Hydra.
+
+## Development Checks
+
+Install the development dependency group and run the regression suite:
+
+```bash
+uv sync --group dev
+uv run --group dev pytest
+```
+
+The tests cover Hydra composition, runtime validation, DataLoader options,
+LMDB ownership, distributed samplers, augmentation components, full-state
+resume, and experiment provenance output.

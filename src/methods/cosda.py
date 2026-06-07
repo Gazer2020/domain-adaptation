@@ -429,6 +429,24 @@ class COSDASolver(BaseSolver):
         return memory_source_features, memory_source_labels, loss_exo_dict
 
 
+    def extra_training_state_dict(self):
+        state = super().extra_training_state_dict()
+        if getattr(self, "_memory_source_features", None) is not None:
+            state["memory_source_features"] = self._memory_source_features
+            state["memory_source_labels"] = self._memory_source_labels
+        return state
+
+    def load_extra_training_state_dict(self, state):
+        super().load_extra_training_state_dict(state)
+        features = state.get("memory_source_features")
+        labels = state.get("memory_source_labels")
+        self._memory_source_features = (
+            features.to(self.device) if features is not None else None
+        )
+        self._memory_source_labels = (
+            labels.to(self.device) if labels is not None else None
+        )
+
     def train(self):
         optimizer = optim.SGD(self._get_trainable_params())
         # op_copy logic
@@ -442,17 +460,30 @@ class COSDASolver(BaseSolver):
         len_target = len(self.target_loader)
         max_len = max(len_source, len_target)
         
-        memory_source_features, memory_source_labels = None, None
-        best_acc = float("-inf")
+        warm_up_epoch = int(self.config.method.warm_up_epoch)
+        memory_source_features = getattr(self, "_memory_source_features", None)
+        memory_source_labels = getattr(self, "_memory_source_labels", None)
+        if self._resume_epoch >= warm_up_epoch:
+            if memory_source_features is None:
+                memory_source_features, memory_source_labels = self.initalize_memory()
+                self._memory_source_features = memory_source_features
+                self._memory_source_labels = memory_source_labels
+            if self._resume_epoch == warm_up_epoch:
+                self._pending_training_state.pop("optimizer", None)
+        self.register_training_state(optimizer=optimizer)
+        best_acc = self._best_metric
         
-        for epoch in range(max_epochs):
-            if epoch == self.config.method.warm_up_epoch:
+        for epoch in self._epoch_range(max_epochs):
+            if epoch == warm_up_epoch and self._resume_epoch < warm_up_epoch:
                 optimizer = optim.SGD(self._get_trainable_params())
                 for param_group in optimizer.param_groups:
                     param_group['lr0'] = param_group['lr']
+                self.register_training_state(optimizer=optimizer)
                 memory_source_features, memory_source_labels = self.initalize_memory()
+                self._memory_source_features = memory_source_features
+                self._memory_source_labels = memory_source_labels
                     
-            if epoch >= self.config.method.warm_up_epoch:
+            if epoch >= warm_up_epoch:
                 all_proto, neg_proto, NUM_K = self.get_pseudo_label(new_epoch=True)
             self.net.train()
             total_loss_meter = AverageMeter()
@@ -471,12 +502,12 @@ class COSDASolver(BaseSolver):
                 
                 self._zero_grad(optimizer)
                 
-                if epoch < self.config.method.warm_up_epoch:
+                if epoch < warm_up_epoch:
                     current_stage_epoch = epoch
-                    max_stage_epochs = self.config.method.warm_up_epoch
+                    max_stage_epochs = warm_up_epoch
                 else:
-                    current_stage_epoch = epoch - self.config.method.warm_up_epoch
-                    max_stage_epochs = self.config.method.epochs - self.config.method.warm_up_epoch
+                    current_stage_epoch = epoch - warm_up_epoch
+                    max_stage_epochs = self.config.method.epochs - warm_up_epoch
                     
                 iter_idx = current_stage_epoch * max_len + batch_idx
                 max_iter = max_stage_epochs * max_len
@@ -492,7 +523,7 @@ class COSDASolver(BaseSolver):
                     loss_beta_s = self.forward_BETA_ce(v_s, y_s, intervention_s, int_v_s, int_y_s, target_s, domain='source')
                     loss_dict.update(loss_beta_s)
                 
-                if epoch >= self.config.method.warm_up_epoch:
+                if epoch >= warm_up_epoch:
                     # Target path
                     self.net.train()
                     with self._auto_cast():
@@ -519,6 +550,8 @@ class COSDASolver(BaseSolver):
                             memory_source_features, memory_source_labels, neg_proto, hard_label_bank1, 
                             target_s, train_s, features_target1, NUM_K
                         )
+                        self._memory_source_features = memory_source_features
+                        self._memory_source_labels = memory_source_labels
                         loss_dict.update(loss_align_t)
                     
                     loss_dict.update(loss_beta_t)

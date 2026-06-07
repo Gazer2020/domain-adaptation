@@ -194,8 +194,9 @@ class FACTDASolver(BaseSolver):
         epoch_steps = self._resolve_epoch_steps()
         lr_drop_epoch = max(1, int(round(0.8 * self.total_epochs)))
         scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[lr_drop_epoch], gamma=0.1)
+        self.register_training_state(optimizer=optimizer, scheduler=scheduler)
 
-        best_acc = float("-inf")
+        best_acc = self._best_metric
 
         logger.info(
             "%s training | epoch_steps_mode=%s source_steps=%d target_steps=%d epoch_steps=%d",
@@ -206,7 +207,7 @@ class FACTDASolver(BaseSolver):
             epoch_steps,
         )
 
-        for epoch in range(self.total_epochs):
+        for epoch in self._epoch_range(self.total_epochs):
             self._set_train_mode()
             src_iter = cycle(self.source_loader)
             tgt_iter = cycle(self.target_loader)

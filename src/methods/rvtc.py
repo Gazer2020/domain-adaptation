@@ -182,16 +182,17 @@ class RVTCSolver(BaseSolver):
             return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        self.register_training_state(optimizer=optimizer, scheduler=scheduler)
 
-        best_acc = float("-inf")
+        best_acc = self._best_metric
 
-        global_step = 0
+        global_step = self._training_global_step
         logger.info(
             f"RVTC V2: λ_kin={self.lambda_kin} λ_ent={self.lambda_ent} kin_on_source={self.kin_on_source} "
             f"freeze_backbone={freeze_backbone} | epochs={max_epochs}"
         )
 
-        for epoch in range(max_epochs):
+        for epoch in self._epoch_range(max_epochs):
             self.net.train()
             meters = {k: AverageMeter() for k in ["task", "kin_s", "kin_t", "ent", "total"]}
             tgt_iter = cycle(self.target_loader)

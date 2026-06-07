@@ -1,36 +1,38 @@
-import io
 import logging
 import math
 import os
-import pickle
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
 from torchvision import transforms
-from torch.utils.data import DataLoader, Dataset
-from PIL import Image, ImageFile, __version__ as PIL_VERSION
-import numpy as np
-from utils import IMAGENET_MEAN, IMAGENET_STD, get_device
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from PIL import ImageFile, __version__ as PIL_VERSION
+
+from datasets.samplers import (
+    StratifiedDomainBatchSampler,
+    UniformDomainBatchSampler,
+)
+from datasets.storage import (
+    DomainDataset,
+    LmdbDomainDataset,
+    MultiSourceDomainDataset,
+    resolve_lmdb_path,
+)
+from datasets.transforms import ColorSpaceToTensorStack, WeakStrongAugment
+from utils import (
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    get_device,
+    get_distributed_context,
+)
 from utils.config import is_truthy, resolve_auto_bool, resolve_int_or_auto
 
 logger = logging.getLogger(__name__)
 
 _PILLOW_RUNTIME_LOGGED = False
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-
-def _class_sort_key(name: str):
-    """
-    Sort class folder names with numeric awareness.
-
-    Example:
-      "0","1","2",...,"10" -> numeric order instead of lexicographic order.
-    """
-    s = str(name)
-    if s.isdigit():
-        return (0, int(s))
-    return (1, s.lower())
 
 
 def _log_pillow_runtime_once():
@@ -90,73 +92,6 @@ class _WorkerThreadLimiter:
             torch.set_num_interop_threads(1)
         except Exception:
             pass
-
-
-class ColorSpaceToTensorStack:
-    """
-    Convert an input PIL RGB image into multiple target color spaces, producing
-    a stacked tensor suitable for multi-view inference/training.
-
-    Output shape: [K, 3, H, W] where K=len(spaces)
-    """
-
-    def __init__(
-        self,
-        spaces: List[str],
-        mean: List[float],
-        std: List[float],
-        random_erasing_p: float = 0.0,
-    ):
-        if not spaces:
-            raise ValueError("spaces must be a non-empty list")
-
-        self.spaces = [str(s).lower() for s in spaces]
-        self.to_tensor = transforms.ToTensor()
-        self.normalize = transforms.Normalize(mean, std)
-        self.random_erasing = (
-            transforms.RandomErasing(p=float(random_erasing_p)) if random_erasing_p > 0 else None
-        )
-
-    def _convert(self, img: Image.Image, space: str) -> Image.Image:
-        # PIL color modes: LAB, HSV, YCbCr, YUV are supported as 8-bit images.
-        space = space.lower()
-        if space == "rgb":
-            return img.convert("RGB")
-        if space == "lab":
-            return img.convert("LAB")
-        if space == "hsv":
-            return img.convert("HSV")
-        if space == "ycbcr":
-            return img.convert("YCbCr")
-        if space == "yuv":
-            # PIL may not support "YUV" conversion mode reliably across versions.
-            # Convert RGB->YUV manually (BT.601-like), then keep 3 channels as RGB mode.
-            rgb = np.asarray(img.convert("RGB"), dtype=np.float32)
-            r = rgb[:, :, 0]
-            g = rgb[:, :, 1]
-            b = rgb[:, :, 2]
-            y = 0.299 * r + 0.587 * g + 0.114 * b
-            u = -0.14713 * r - 0.28886 * g + 0.436 * b + 128.0
-            v = 0.615 * r - 0.51499 * g - 0.10001 * b + 128.0
-            yuv = np.stack([y, u, v], axis=-1)
-            yuv = np.clip(yuv, 0.0, 255.0).astype(np.uint8)
-            return Image.fromarray(yuv, mode="RGB")
-        if space == "gray":
-            # Keep 3 channels so downstream code always sees [3,H,W].
-            return img.convert("L").convert("RGB")
-        raise ValueError(f"Unsupported color space: {space}")
-
-    def __call__(self, img: Image.Image) -> torch.Tensor:
-        views: List[torch.Tensor] = []
-        for s in self.spaces:
-            img_cs = self._convert(img, s)
-            x = self.to_tensor(img_cs)  # [3,H,W], float in [0,1]
-            x = self.normalize(x)
-            if self.random_erasing is not None:
-                # RandomErasing operates on [C,H,W] tensors.
-                x = self.random_erasing(x)
-            views.append(x)
-        return torch.stack(views, dim=0)
 
 
 def get_class_splits(config):
@@ -230,357 +165,6 @@ def build_class_mapping(src_classes: List[int], tgt_classes: List[int],
             tgt_mapping[c] = unknown_label
     
     return src_mapping, tgt_mapping, unknown_label
-
-
-class DomainDataset(Dataset):
-    """
-    Dataset for domain adaptation with support for class mapping.
-    
-    Args:
-        root: Path to domain directory containing class subdirectories
-        classes: List of original class indices to include
-        transform: Image transforms to apply
-        class_mapping: Dict mapping original class index -> new label
-    """
-    
-    def __init__(self, root: Path, classes: List[int], transform=None,
-                 class_mapping: Optional[Dict[int, int]] = None):
-        self.root = Path(root)
-        self.transform = transform
-        self.samples = []
-        self.classes = classes
-        self.class_mapping = class_mapping
-        self.class_names = []
-        
-        all_classes = sorted([p.name for p in root.iterdir() if p.is_dir()], key=_class_sort_key)
-        for c in classes:
-            self.class_names.append(all_classes[c])
-
-        for idx, orig_class in enumerate(classes):
-            cls_name = self.class_names[idx]
-            cls_dir = self.root / cls_name
-            
-            # Determine label
-            if class_mapping is not None:
-                label = class_mapping[orig_class]
-            else:
-                label = idx  # Fallback to sequential indexing
-
-            for file in cls_dir.iterdir():
-                if self._is_valid_file(file.name):
-                    self.samples.append((str(file), label))
-
-    def _is_valid_file(self, filename):
-        return filename.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tiff"))
-
-    def __getitem__(self, index):
-        path, label = self.samples[index]
-        img = Image.open(path).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
-        return img, label
-
-    def __len__(self):
-        return len(self.samples)
-
-
-class LmdbDomainDataset(Dataset):
-    """
-    LMDB-backed dataset with the same return contract as DomainDataset.
-
-    Each LMDB sample value is expected to be a pickled tuple:
-      (orig_class_index: int, image_bytes: bytes)
-
-    Metadata key `__meta__` stores:
-      - length: int
-      - class_names: List[str]
-      - indices_by_class: Dict[int, List[int]] (recommended)
-    """
-
-    _META_KEY = b"__meta__"
-    _ENV_CACHE = {}
-
-    def __init__(
-        self,
-        lmdb_path: Path,
-        classes: List[int],
-        transform=None,
-        class_mapping: Optional[Dict[int, int]] = None,
-    ):
-        self.lmdb_path = Path(lmdb_path)
-        self.transform = transform
-        self.classes = list(classes)
-        self.class_mapping = class_mapping
-        self._env = None
-
-        if not self.lmdb_path.exists():
-            raise FileNotFoundError(
-                f"LMDB path not found: {self.lmdb_path}. "
-                "Build it first or set performance.dataloader.storage_backend=files."
-            )
-
-        meta = self._read_meta()
-        self.class_names = list(meta.get("class_names", []))
-        self.length = int(meta.get("length", 0))
-        if len(self.class_names) == 0:
-            raise ValueError(f"Invalid LMDB metadata in {self.lmdb_path}: missing class_names")
-
-        for c in self.classes:
-            if c < 0 or c >= len(self.class_names):
-                raise ValueError(
-                    f"Class index {c} is out of range [0, {len(self.class_names)-1}] in LMDB {self.lmdb_path}"
-                )
-
-        self.samples: List[Tuple[int, int]] = []
-        local_label_by_orig: Dict[int, int] = {}
-        for idx, orig_class in enumerate(self.classes):
-            if self.class_mapping is not None:
-                local_label_by_orig[orig_class] = int(self.class_mapping[orig_class])
-            else:
-                local_label_by_orig[orig_class] = idx
-
-        indices_by_class = meta.get("indices_by_class", None)
-        if isinstance(indices_by_class, dict):
-            for orig_class in self.classes:
-                class_indices = indices_by_class.get(orig_class, indices_by_class.get(str(orig_class), []))
-                mapped_label = local_label_by_orig[orig_class]
-                for sample_idx in class_indices:
-                    self.samples.append((int(sample_idx), mapped_label))
-        else:
-            # Fallback for older LMDBs without indices_by_class metadata.
-            env = self._open_env()
-            with env.begin(write=False) as txn:
-                for sample_idx in range(self.length):
-                    key = f"{sample_idx:08d}".encode("ascii")
-                    packed = txn.get(key)
-                    if packed is None:
-                        continue
-                    orig_class, _ = pickle.loads(packed)
-                    orig_class = int(orig_class)
-                    if orig_class in local_label_by_orig:
-                        self.samples.append((sample_idx, local_label_by_orig[orig_class]))
-
-    def _open_env(self):
-        if self._env is not None:
-            return self._env
-        cache_key = str(self.lmdb_path.resolve())
-        cached_env = self._ENV_CACHE.get(cache_key, None)
-        if cached_env is not None:
-            self._env = cached_env
-            return self._env
-        try:
-            import lmdb
-        except ImportError as e:
-            raise ImportError(
-                "LMDB backend requested but `lmdb` is not installed. "
-                "Install dependency `lmdb` or set performance.dataloader.storage_backend=files."
-            ) from e
-
-        self._env = lmdb.open(
-            str(self.lmdb_path),
-            readonly=True,
-            lock=False,
-            readahead=True,
-            meminit=False,
-            max_readers=512,
-            subdir=self.lmdb_path.is_dir(),
-        )
-        self._ENV_CACHE[cache_key] = self._env
-        return self._env
-
-    def _read_meta(self) -> Dict[str, object]:
-        env = self._open_env()
-        with env.begin(write=False) as txn:
-            raw = txn.get(self._META_KEY)
-            if raw is None:
-                raise ValueError(f"LMDB {self.lmdb_path} is missing metadata key '__meta__'")
-            meta = pickle.loads(raw)
-            if not isinstance(meta, dict):
-                raise ValueError(f"LMDB metadata at {self.lmdb_path} must be a dict")
-            return meta
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state["_env"] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._env = None
-
-    def __getitem__(self, index):
-        sample_idx, label = self.samples[index]
-        env = self._open_env()
-        key = f"{sample_idx:08d}".encode("ascii")
-        with env.begin(write=False) as txn:
-            packed = txn.get(key)
-        if packed is None:
-            raise IndexError(f"Missing sample key {sample_idx} in LMDB {self.lmdb_path}")
-
-        _, img_bytes = pickle.loads(packed)
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
-        return img, label
-
-    def __len__(self):
-        return len(self.samples)
-
-
-def _resolve_lmdb_path(domain_path: Path, lmdb_root: Optional[Path]) -> Path:
-    if lmdb_root is None:
-        return domain_path.with_suffix(".lmdb")
-    return (lmdb_root / f"{domain_path.name}.lmdb").resolve()
-
-
-class MultiSourceDomainDataset(Dataset):
-    """
-    Wrap multiple DomainDataset objects and return (img, label, domain_id).
-
-    This dataset is meant for MSDA training where each source domain has an
-    explicit domain id in [0..S-1].
-    """
-
-    def __init__(self, datasets: List[DomainDataset]):
-        if not datasets:
-            raise ValueError("datasets must be a non-empty list")
-        self.datasets = datasets
-        self._lengths = [len(d) for d in datasets]
-        self._offsets = [0]
-        for n in self._lengths[:-1]:
-            self._offsets.append(self._offsets[-1] + n)
-        self._total = sum(self._lengths)
-
-    def __len__(self):
-        return self._total
-
-    def __getitem__(self, index):
-        if index < 0:
-            index = self._total + index
-        if index < 0 or index >= self._total:
-            raise IndexError("index out of range")
-        # Find which dataset this index falls into
-        # (linear scan is fine for small S; S is typically <= 4)
-        for dom_id, (off, n) in enumerate(zip(self._offsets, self._lengths)):
-            if off <= index < off + n:
-                img, label = self.datasets[dom_id][index - off]
-                return img, label, dom_id
-        raise RuntimeError("Failed to map index to a dataset")
-
-
-class _UniformDomainBatchSampler(torch.utils.data.Sampler[List[int]]):
-    """
-    Batch sampler that yields batches with uniform domain contribution.
-
-    Implementation detail:
-    - Domains are visited in a shuffled round-robin order (uniform over steps).
-    - Within each domain, indices are sampled without replacement via a random permutation,
-      and when exhausted, the domain reshuffles and continues.
-    """
-
-    def __init__(self, domain_sizes: List[int], batch_size: int, steps_per_epoch: int, drop_last: bool = True):
-        if batch_size <= 0:
-            raise ValueError("batch_size must be > 0")
-        if steps_per_epoch <= 0:
-            raise ValueError("steps_per_epoch must be > 0")
-        if any(n <= 0 for n in domain_sizes):
-            raise ValueError("All domains must have at least 1 sample")
-        self.domain_sizes = domain_sizes
-        self.batch_size = int(batch_size)
-        self.steps_per_epoch = int(steps_per_epoch)
-        self.drop_last = bool(drop_last)
-
-        # Precompute offsets into the concatenated MultiSourceDomainDataset index space
-        self.offsets = [0]
-        for n in domain_sizes[:-1]:
-            self.offsets.append(self.offsets[-1] + n)
-
-    def __iter__(self):
-        g = torch.Generator()
-        # Ensure different per-epoch shuffles. Without this, a fresh Generator()
-        # can repeat identical permutations every epoch.
-        g.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
-        num_domains = len(self.domain_sizes)
-        # Per-domain cursors into a shuffled permutation
-        perms = [torch.randperm(n, generator=g).tolist() for n in self.domain_sizes]
-        cursors = [0 for _ in range(num_domains)]
-
-        domain_order = torch.randperm(num_domains, generator=g).tolist()
-        for step in range(self.steps_per_epoch):
-            dom = domain_order[step % num_domains]
-            n = self.domain_sizes[dom]
-            off = self.offsets[dom]
-            cur = cursors[dom]
-
-            # Refill permutation if not enough for a full batch
-            if cur + self.batch_size > n:
-                perms[dom] = torch.randperm(n, generator=g).tolist()
-                cur = 0
-
-            batch_local = perms[dom][cur : cur + self.batch_size]
-            cursors[dom] = cur + self.batch_size
-            yield [off + i for i in batch_local]
-
-    def __len__(self):
-        return self.steps_per_epoch
-
-
-class _StratifiedDomainBatchSampler(torch.utils.data.Sampler[List[int]]):
-    """
-    Batch sampler that mixes samples from ALL source domains in every batch.
-
-    Each batch allocates batch_size // num_domains samples per domain (with
-    remainder distributed to the first domains). This gives the model exposure
-    to all domains in every gradient step and enables cross-source interactions.
-    """
-
-    def __init__(self, domain_sizes: List[int], batch_size: int, steps_per_epoch: int, drop_last: bool = True):
-        if batch_size <= 0:
-            raise ValueError("batch_size must be > 0")
-        if steps_per_epoch <= 0:
-            raise ValueError("steps_per_epoch must be > 0")
-        if any(n <= 0 for n in domain_sizes):
-            raise ValueError("All domains must have at least 1 sample")
-        self.domain_sizes = domain_sizes
-        self.num_domains = len(domain_sizes)
-        self.batch_size = int(batch_size)
-        self.steps_per_epoch = int(steps_per_epoch)
-        self.drop_last = bool(drop_last)
-
-        self.offsets = [0]
-        for n in domain_sizes[:-1]:
-            self.offsets.append(self.offsets[-1] + n)
-
-        per_dom = self.batch_size // self.num_domains
-        remainder = self.batch_size % self.num_domains
-        self.per_domain_counts = [per_dom + (1 if d < remainder else 0) for d in range(self.num_domains)]
-
-    def __iter__(self):
-        g = torch.Generator()
-        # Ensure different per-epoch shuffles. Without this, a fresh Generator()
-        # can repeat identical permutations every epoch.
-        g.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
-        perms = [torch.randperm(n, generator=g).tolist() for n in self.domain_sizes]
-        cursors = [0] * self.num_domains
-
-        for _ in range(self.steps_per_epoch):
-            batch = []
-            for dom in range(self.num_domains):
-                need = self.per_domain_counts[dom]
-                n = self.domain_sizes[dom]
-                off = self.offsets[dom]
-                cur = cursors[dom]
-
-                if cur + need > n:
-                    perms[dom] = torch.randperm(n, generator=g).tolist()
-                    cur = 0
-
-                batch.extend(off + perms[dom][j] for j in range(cur, cur + need))
-                cursors[dom] = cur + need
-            yield batch
-
-    def __len__(self):
-        return self.steps_per_epoch
 
 
 def get_dataloader(config):
@@ -676,7 +260,8 @@ def get_dataloader(config):
     )
     # Only pin memory when CUDA is actually the selected device.
     device_str = getattr(config, "device", "auto")
-    is_cuda_device = get_device(device_str) == "cuda"
+    is_cuda_device = get_device(device_str).startswith("cuda")
+    distributed = get_distributed_context()
     pin_memory_cfg = getattr(perf_cfg, "pin_memory", "auto") if perf_cfg is not None else "auto"
     pin_memory = is_cuda_device if str(pin_memory_cfg).lower() == "auto" else is_truthy(pin_memory_cfg)
     non_blocking_transfer = (
@@ -940,14 +525,20 @@ def get_dataloader(config):
     strong_aug_enabled = is_truthy(getattr(config.method, "strong_aug", False))
     target_transform = train_transform
 
-    target_tensor_v2_methods = {"dcpr", "dcpr_alt"}
-    target_tensor_v2_auto = is_cuda_device and method_name in target_tensor_v2_methods
-    target_tensor_v2_enabled = resolve_auto_bool(target_tensor_v2_cfg, target_tensor_v2_auto)
-    if target_tensor_v2_enabled and method_name not in target_tensor_v2_methods:
+    target_aug_backend = str(
+        getattr(config.method, "target_aug_backend", "dataset")
+    ).strip().lower()
+    tensor_backend_requested = target_aug_backend == "tensor_v2"
+    target_tensor_v2_auto = is_cuda_device and tensor_backend_requested
+    target_tensor_v2_enabled = resolve_auto_bool(
+        target_tensor_v2_cfg,
+        target_tensor_v2_auto,
+    )
+    if target_tensor_v2_enabled and not tensor_backend_requested:
         logger.warning(
-            "performance.augmentation.target_tensor_v2=True is currently wired for methods=%s only; "
-            "falling back to dataset weak/strong transforms for method=%s.",
-            sorted(target_tensor_v2_methods),
+            "performance.augmentation.target_tensor_v2=True requires "
+            "method.target_aug_backend=tensor_v2; falling back to dataset transforms "
+            "for method=%s.",
             method_name or "<unknown>",
         )
         target_tensor_v2_enabled = False
@@ -980,14 +571,6 @@ def get_dataloader(config):
                 method_name or "<unknown>",
             )
         else:
-            class WeakStrongAugment:
-                def __init__(self, weak, strong):
-                    self.weak = weak
-                    self.strong = strong
-
-                def __call__(self, x):
-                    return self.weak(x), self.strong(x)
-
             # Standard Weak
             if use_color_space:
                 weak_aug = transforms.Compose(
@@ -1065,15 +648,16 @@ def get_dataloader(config):
             target_transform = WeakStrongAugment(weak_aug, strong_aug)
 
     logger.info(
-        "Target augmentation runtime | strong_aug=%s tensor_v2=%s color_space=%s",
+        "Target augmentation runtime | strong_aug=%s backend=%s tensor_v2=%s color_space=%s",
         bool(strong_aug_enabled),
+        target_aug_backend,
         bool(target_tensor_v2_enabled),
         bool(use_color_space),
     )
 
     def _build_domain_dataset(domain_path: Path, classes: List[int], transform, class_mapping: Optional[Dict[int, int]]):
         if storage_backend == "lmdb":
-            lmdb_path = _resolve_lmdb_path(domain_path, lmdb_root)
+            lmdb_path = resolve_lmdb_path(domain_path, lmdb_root)
             return LmdbDomainDataset(
                 lmdb_path,
                 classes,
@@ -1126,12 +710,15 @@ def get_dataloader(config):
         steps_per_epoch = sum(domain_sizes) // batch_size
         steps_per_epoch = max(1, int(steps_per_epoch))
         stratified = getattr(config.method, "stratified_batch", False)
-        sampler_cls = _StratifiedDomainBatchSampler if stratified else _UniformDomainBatchSampler
+        sampler_cls = StratifiedDomainBatchSampler if stratified else UniformDomainBatchSampler
         batch_sampler = sampler_cls(
             domain_sizes=domain_sizes,
             batch_size=batch_size,
             steps_per_epoch=steps_per_epoch,
             drop_last=True,
+            rank=distributed.rank,
+            num_replicas=distributed.world_size,
+            seed=int(config.get("seed", 42)),
         )
         source_loader = DataLoader(
             source_dataset,
@@ -1139,17 +726,43 @@ def get_dataloader(config):
             **source_loader_kwargs,
         )
     else:
+        source_sampler = (
+            DistributedSampler(
+                source_dataset,
+                num_replicas=distributed.world_size,
+                rank=distributed.rank,
+                shuffle=True,
+                seed=int(config.get("seed", 42)),
+                drop_last=True,
+            )
+            if distributed.enabled
+            else None
+        )
         source_loader = DataLoader(
             source_dataset,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=source_sampler is None,
+            sampler=source_sampler,
             drop_last=True,
             **source_loader_kwargs,
         )
+    target_sampler = (
+        DistributedSampler(
+            target_dataset,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+            shuffle=True,
+            seed=int(config.get("seed", 42)) + 1,
+            drop_last=True,
+        )
+        if distributed.enabled
+        else None
+    )
     target_loader = DataLoader(
         target_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=target_sampler is None,
+        sampler=target_sampler,
         drop_last=True,
         **target_loader_kwargs,
     )

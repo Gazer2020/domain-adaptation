@@ -110,6 +110,16 @@ class OptimWithSheduler:
         self.optimizer.step()
         self.global_step += 1
 
+    def state_dict(self):
+        return {
+            "optimizer": self.optimizer.state_dict(),
+            "global_step": self.global_step,
+        }
+
+    def load_state_dict(self, state):
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.global_step = float(state.get("global_step", 0.0))
+
 
 class OptimizerManager:
     def __init__(self, optims):
@@ -118,12 +128,11 @@ class OptimizerManager:
         for op in self.optims:
             op.zero_grad()
     def __exit__(self, exceptionType, exception, exceptionTraceback):
-        for op in self.optims:
-            op.step()
+        if exceptionType is None:
+            for op in self.optims:
+                op.step()
         self.optims = None
-        if exceptionTraceback:
-            return False
-        return True
+        return False
 
 # ---------------- Network Modules ----------------
 
@@ -379,6 +388,21 @@ class RTDASolver(BaseSolver):
         
         return final_preds
 
+    def extra_training_state_dict(self):
+        state = super().extra_training_state_dict()
+        if hasattr(self, "nomatch"):
+            state["nomatch"] = self.nomatch
+        if hasattr(self, "all_centroids"):
+            state["src_centroids"] = self.all_centroids.src_ctrs
+            state["tgt_centroids"] = self.all_centroids.tgt_ctrs
+        return state
+
+    def load_extra_training_state_dict(self, state):
+        super().load_extra_training_state_dict(state)
+        self._resume_nomatch = state.get("nomatch")
+        self._resume_src_centroids = state.get("src_centroids")
+        self._resume_tgt_centroids = state.get("tgt_centroids")
+
     def train(self):
         max_epochs = self.config.method.epochs
         warmiter = self.config.method.warm_up_epoch
@@ -394,7 +418,14 @@ class RTDASolver(BaseSolver):
         max_iter = max_epochs * max_len
         
         self.all_centroids = Centroids(class_num=self.shared_classes, dim=self.shared_classes, device=self.device)
-        self._fast_initial_classifier_weight(self.source_loader, self.target_loader)
+        if self._resume_epoch > 0 and getattr(self, "_resume_nomatch", None) is not None:
+            self.nomatch = self._resume_nomatch.to(self.device)
+            if self._resume_src_centroids is not None:
+                self.all_centroids.src_ctrs.copy_(self._resume_src_centroids.to(self.device))
+            if self._resume_tgt_centroids is not None:
+                self.all_centroids.tgt_ctrs.copy_(self._resume_tgt_centroids.to(self.device))
+        else:
+            self._fast_initial_classifier_weight(self.source_loader, self.target_loader)
         
         scheduler = lambda step, initial_lr: inverseDecaySheduler(step, initial_lr, gamma=10, power=0.75, max_iter=max_iter)
         
@@ -419,10 +450,16 @@ class RTDASolver(BaseSolver):
             ),
             scheduler,
         )
+        self.register_training_state(
+            classifier_optimizer=optimizer_cls,
+            feature_optimizer=optimizer_feature_extractor,
+            discriminator_optimizer=optimizer_discriminator,
+        )
         
-        best_hos = float("-inf")
+        best_hos = self._best_metric
+        gmm = None
 
-        for epoch in range(max_epochs):
+        for epoch in self._epoch_range(max_epochs):
             self._set_train_mode()
             
             src_iter = cycle(self.source_loader)
@@ -455,7 +492,7 @@ class RTDASolver(BaseSolver):
                     kltarget = torch.nn.functional.kl_div((nn.Softmax(-1)(fc_target[:, :self.shared_classes])).log(), s_ctds[pseudo_t_label], reduction='none').sum(1).detach()
                     kltarget = torch.where(torch.isinf(kltarget), torch.full_like(kltarget, 10), kltarget)
 
-                    if epoch <= 1:
+                    if epoch <= 1 or gmm is None:
                         gmm = GaussianMixture(n_components=3, covariance_type='full').fit(to_np(kltarget)[:, None])
                     
                     known_cluster = np.argmin(gmm.means_)
@@ -520,6 +557,7 @@ class RTDASolver(BaseSolver):
             acc = self.evaluate()
             if acc > best_hos:
                 best_hos = acc
+            self._training_global_step = int(optimizer_cls.global_step)
             self._maybe_save_best(acc, epoch + 1)
             self._log_epoch_summary(
                 epoch + 1,
@@ -583,6 +621,7 @@ class RTDASolver(BaseSolver):
                 gmm = BayesianGaussianMixture(n_components=4, max_iter=800).fit(ProbRecorder['kl'][:, None])
             else:
                 gmm = BayesianGaussianMixture(n_components=2, max_iter=800).fit(ProbRecorder['kl'][:, None])
+            self._maybe_save_training_checkpoint(epoch + 1)
         if self._load_best_checkpoint_if_available():
             self._log_best_checkpoint_loaded("Score")
         self._log_training_complete(best_score=best_hos, score_name="Score")

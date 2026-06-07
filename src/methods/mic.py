@@ -114,15 +114,16 @@ class MICSolver(BaseSolver):
     def train(self):
         """Training loop with MIC consistency loss."""
         self._build_optimizer()
+        self.register_training_state(optimizer=self.optimizer)
         
         max_epochs = self.config.method.epochs
         lambda_mic = self.config.method.get("lambda_mic", 0.5)
         ema_momentum = self.config.method.get("momentum", 0.999)
 
         logger.info("%s training | epochs=%d", self._solver_display_name(), max_epochs)
-        best_acc = float("-inf")
+        best_acc = self._best_metric
 
-        for epoch in range(max_epochs):
+        for epoch in self._epoch_range(max_epochs):
             self._set_train_mode()
 
             tgt_iter = cycle(self.target_loader)

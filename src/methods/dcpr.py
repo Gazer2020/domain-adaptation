@@ -28,10 +28,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torchvision.transforms import InterpolationMode
-from torchvision.transforms import v2 as transforms_v2
 
 from methods.base_solver import BaseSolver
+from methods.components import TargetViewBuilder, linear_ema_decay, update_ema_model
 from methods.registry import register_solver
 from models.backbones import get_backbone
 from utils import CudaBatchPrefetcher, cycle
@@ -71,14 +70,6 @@ def sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
     out = (z - tau).clamp_min(0.0)
     out = out.reshape(orig_shape).transpose(dim, -1)
     return out
-
-
-def _unwrap_weak_strong_from_maybe_tuple(tgt_imgs):
-    if isinstance(tgt_imgs, (tuple, list)) and len(tgt_imgs) >= 2:
-        return tgt_imgs[0], tgt_imgs[1]
-    if isinstance(tgt_imgs, (tuple, list)) and len(tgt_imgs) == 1:
-        return tgt_imgs[0], tgt_imgs[0]
-    return tgt_imgs, tgt_imgs
 
 
 def _resolve_ambiguity_reciprocal_mode(value) -> str:
@@ -523,15 +514,18 @@ class DCPRSolver(BaseSolver):
 
         self._forward_logits_student = self.net.forward_relation_logits
         self._student_forward_compiled = False
-        self._target_tensor_aug_enabled = False
-        self._target_weak_aug = None
-        self._target_strong_aug = None
         self._src_prefetch_stream = None
         self._tgt_prefetch_stream = None
         if self.cuda_batch_prefetch and self.device.type == "cuda":
             self._src_prefetch_stream = torch.cuda.Stream()
             self._tgt_prefetch_stream = torch.cuda.Stream()
-        self._setup_target_tensor_augment()
+        self._target_view_builder = TargetViewBuilder(
+            config=self.config,
+            device=self.device,
+            to_device=self._to_device,
+            logger=logger,
+            display_name="DCPR",
+        )
 
         logger.info(
             "DCPR mainline: bottleneck=%d temp=%.2f->%.2f conf_topk=%d "
@@ -600,96 +594,8 @@ class DCPRSolver(BaseSolver):
         )
         self._student_forward_compiled = True
 
-    def _setup_target_tensor_augment(self):
-        perf_cfg = getattr(self.config, "performance", None)
-        aug_cfg = getattr(perf_cfg, "augmentation", None) if perf_cfg is not None else None
-        target_tensor_v2_cfg = getattr(aug_cfg, "target_tensor_v2", "auto") if aug_cfg is not None else "auto"
-        enabled = self._resolve_auto_bool(
-            target_tensor_v2_cfg,
-            auto_value=(self.device.type == "cuda"),
-        )
-        if not enabled:
-            return
-        if not self._is_truthy(getattr(self.config.method, "strong_aug", False)):
-            logger.warning(
-                "target_tensor_v2 requested, but method.strong_aug=False. "
-                "Falling back to dataloader transforms."
-            )
-            return
-        color_space_cfg = getattr(self.config.method, "color_space", None)
-        if color_space_cfg is not None and self._is_truthy(getattr(color_space_cfg, "enabled", False)):
-            logger.warning(
-                "target_tensor_v2 requested with color_space.enabled=True, which is unsupported. "
-                "Falling back to dataloader transforms."
-            )
-            return
-
-        target_aug_cfg = getattr(self.config.method, "target_aug", None)
-        randaugment_num_ops = (
-            int(getattr(target_aug_cfg, "randaugment_num_ops", 2))
-            if target_aug_cfg is not None
-            else 2
-        )
-        randaugment_magnitude = (
-            int(getattr(target_aug_cfg, "randaugment_magnitude", 10))
-            if target_aug_cfg is not None
-            else 10
-        )
-
-        mean = [0.485, 0.456, 0.406]
-        std = [0.229, 0.224, 0.225]
-        self._target_weak_aug = transforms_v2.Compose(
-            [
-                transforms_v2.RandomCrop(224),
-                transforms_v2.RandomHorizontalFlip(),
-                transforms_v2.ToDtype(torch.float32, scale=True),
-                transforms_v2.Normalize(mean, std),
-            ]
-        )
-        self._target_strong_aug = transforms_v2.Compose(
-            [
-                transforms_v2.RandomCrop(224),
-                transforms_v2.RandomHorizontalFlip(),
-                transforms_v2.RandAugment(
-                    num_ops=randaugment_num_ops,
-                    magnitude=randaugment_magnitude,
-                    interpolation=InterpolationMode.BILINEAR,
-                ),
-                transforms_v2.ToDtype(torch.float32, scale=True),
-                transforms_v2.Normalize(mean, std),
-            ]
-        )
-        self._target_tensor_aug_enabled = True
-        logger.info(
-            "DCPR target tensor augmentation enabled (v2, GPU-capable): "
-            "weak=RandomCrop+HFlip, strong=RandomCrop+HFlip+RandAugment(%d,%d)",
-            randaugment_num_ops,
-            randaugment_magnitude,
-        )
-
-    def _to_uint8_image_tensor(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype == torch.uint8:
-            return x
-        if torch.is_floating_point(x):
-            if x.max() <= 1.0 and x.min() >= 0.0:
-                return (x * 255.0).round().clamp(0.0, 255.0).to(torch.uint8)
-            return x.round().clamp(0.0, 255.0).to(torch.uint8)
-        return x.clamp(0, 255).to(torch.uint8)
-
     def _prepare_target_views(self, tgt_imgs):
-        if isinstance(tgt_imgs, (tuple, list)) and len(tgt_imgs) >= 2:
-            tgt_weak, tgt_strong = tgt_imgs[0], tgt_imgs[1]
-            return self._to_device(tgt_weak), self._to_device(tgt_strong)
-
-        if not self._target_tensor_aug_enabled:
-            tgt_weak, tgt_strong = _unwrap_weak_strong_from_maybe_tuple(tgt_imgs)
-            return self._to_device(tgt_weak), self._to_device(tgt_strong)
-
-        base = self._to_device(tgt_imgs)
-        base = self._to_uint8_image_tensor(base)
-        tgt_weak = self._target_weak_aug(base)
-        tgt_strong = self._target_strong_aug(base)
-        return tgt_weak, tgt_strong
+        return self._target_view_builder.prepare(tgt_imgs)
 
     def _load_source_batch_to_device(self, src_batch):
         src_imgs, src_labels, src_dom = src_batch
@@ -706,14 +612,15 @@ class DCPRSolver(BaseSolver):
 
     @torch.no_grad()
     def _update_ema(self, decay: float):
-        for p_ema, p_student in zip(self.ema_net.parameters(), self.net.parameters()):
-            p_ema.data.mul_(decay).add_(p_student.data, alpha=1.0 - decay)
-        for b_ema, b_student in zip(self.ema_net.buffers(), self.net.buffers()):
-            b_ema.data.copy_(b_student.data)
+        update_ema_model(self.ema_net, self.net, decay)
 
     def _ema_decay_at(self, step: int, total_steps: int) -> float:
-        progress = min(1.0, step / max(1, total_steps))
-        return self.ema_decay_start + (self.ema_decay_end - self.ema_decay_start) * progress
+        return linear_ema_decay(
+            step,
+            total_steps,
+            self.ema_decay_start,
+            self.ema_decay_end,
+        )
 
     @staticmethod
     def _normalize_distribution(x: torch.Tensor) -> torch.Tensor:
@@ -1181,11 +1088,12 @@ class DCPRSolver(BaseSolver):
         epoch_steps = self._resolve_epoch_steps()
         total_iters = self.total_epochs * epoch_steps
         scheduler = self._build_scheduler(optimizer, total_iters)
+        self.register_training_state(optimizer=optimizer, scheduler=scheduler)
         self._setup_compiled_student_forward()
-        best_acc = float("-inf")
+        best_acc = self._best_metric
         uses_target_loader = self._uses_target_loader_in_training()
 
-        global_step = 0
+        global_step = self._training_global_step
         logger.info(
             "DCPR Training(mainline): epoch_steps=max source_steps=%d target_steps=%d "
             "epoch_steps=%d use_target=%s",
@@ -1195,7 +1103,7 @@ class DCPRSolver(BaseSolver):
             str(uses_target_loader),
         )
 
-        for epoch in range(self.total_epochs):
+        for epoch in self._epoch_range(self.total_epochs):
             current_temperature = self._temperature_at_epoch(epoch + 1)
             self._set_relation_temperature(current_temperature)
 

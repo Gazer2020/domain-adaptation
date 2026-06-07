@@ -326,13 +326,7 @@ class DARESolver(BaseSolver):
 
         logits = model.classifier(h_shared)
         zeros_delta = torch.zeros_like(logits)
-        proto_context = torch.zeros(
-            h_shared.size(0),
-            self.num_classes,
-            model.feat_dim,
-            device=h_shared.device,
-            dtype=h_shared.dtype,
-        )
+        proto_context = self._plain_proto_context(model, h_shared)
         relation_logits = torch.zeros(
             h_shared.size(0),
             self.num_classes,
@@ -353,6 +347,22 @@ class DARESolver(BaseSolver):
             "h_shared": h_shared,
         }
         return logits, aux
+
+    def _plain_proto_context(self, model: DARENetwork, h_shared: torch.Tensor) -> torch.Tensor:
+        proto_mask = model.src_proto_inited.transpose(0, 1)  # [C, D]
+        valid_counts = proto_mask.sum(dim=1).clamp_min(1).to(model.src_prototypes.dtype)
+        proto_sum = (
+            model.src_prototypes
+            * model.src_proto_inited.unsqueeze(-1).to(model.src_prototypes.dtype)
+        ).sum(dim=0)
+        class_proto = proto_sum / valid_counts.unsqueeze(-1)
+        valid_classes = proto_mask.any(dim=1)
+        class_proto = torch.where(
+            valid_classes.unsqueeze(-1),
+            class_proto,
+            torch.zeros_like(class_proto),
+        )
+        return class_proto.to(dtype=h_shared.dtype).unsqueeze(0).expand(h_shared.size(0), -1, -1)
 
     def _set_eval_mode(self):
         self.net.eval()
@@ -506,9 +516,10 @@ class DARESolver(BaseSolver):
             return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        best_acc = float("-inf")
+        self.register_training_state(optimizer=optimizer, scheduler=scheduler)
+        best_acc = self._best_metric
 
-        global_step = 0
+        global_step = self._training_global_step
         logger.info(
             "DARE Training: relation-conditioned class-aware FiLM | epoch_steps_mode=%s "
             "source_steps=%d target_steps=%d epoch_steps=%d",
@@ -518,8 +529,12 @@ class DARESolver(BaseSolver):
             epoch_steps,
         )
 
-        for epoch in range(self.total_epochs):
-            if self.enable_relation_forward and (self.refresh_source_prototypes_each_epoch or epoch == 0):
+        needs_source_prototypes = self.enable_relation_forward or (
+            self.enable_ema_pseudo and self.enable_proto_loss
+        )
+
+        for epoch in self._epoch_range(self.total_epochs):
+            if needs_source_prototypes and (self.refresh_source_prototypes_each_epoch or epoch == 0):
                 self._recompute_source_prototypes(self.net)
                 self.ema_net.src_prototypes.copy_(self.net.src_prototypes)
                 self.ema_net.src_proto_inited.copy_(self.net.src_proto_inited)
@@ -580,7 +595,7 @@ class DARESolver(BaseSolver):
                             q_tgt.detach(),
                             weights=pseudo_loss_weights,
                         )
-                        if self.enable_relation_forward and self.enable_proto_loss:
+                        if self.enable_proto_loss:
                             loss_proto = self._target_proto_alignment_loss(
                                 tgt_h_shared,
                                 tgt_aux["proto_context"],

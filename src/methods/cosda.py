@@ -1,5 +1,4 @@
 import logging
-import gc
 import numpy as np
 import faiss
 import torch
@@ -11,7 +10,7 @@ from torch.distributions.normal import Normal
 from methods.registry import register_solver
 from methods.base_solver import BaseSolver
 from models.backbones import get_backbone
-from utils import AverageMeter, cycle
+from utils import AverageMeter, configure_faiss_runtime, cycle
 
 logger = logging.getLogger(__name__)
 
@@ -247,6 +246,7 @@ def MO(mean_source_up1, features_target1, hard_label_bank, class_num):
 @register_solver("cosda")
 class COSDASolver(BaseSolver):
     def build_model(self):
+        faiss_threads = configure_faiss_runtime(self.config)
         backbone_name = self.config.method.get("backbone", "resnet50")
         
         # self.num_classes already includes +1 from base_solver for OSDA setting
@@ -263,6 +263,7 @@ class COSDASolver(BaseSolver):
         ).to(self.device)
         self._net_forward = self.net
         self._backbone_forward = self.net.backbone_layer
+        logger.info("COSDA FAISS runtime | threads=%d", faiss_threads)
         if self.compile_enabled:
             self._net_forward = self._compile_module(self.net, "cosda.net")
             self._backbone_forward = self._compile_module(self.net.backbone_layer, "cosda.backbone")
@@ -409,7 +410,7 @@ class COSDASolver(BaseSolver):
         self.net.train()
         loss_exo_dict = {}
         
-        batch_size = self.config.method.batch_size
+        batch_size = int(self.config.batch_size)
         memory_source_features = memory_source_features[batch_size:]
         memory_source_labels = memory_source_labels[batch_size:]
         

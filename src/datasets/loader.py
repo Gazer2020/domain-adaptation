@@ -9,14 +9,15 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
-from PIL import Image, __version__ as PIL_VERSION
+from PIL import Image, ImageFile, __version__ as PIL_VERSION
 import numpy as np
-from utils import get_device
+from utils import IMAGENET_MEAN, IMAGENET_STD, get_device
 from utils.config import is_truthy, resolve_auto_bool, resolve_int_or_auto
 
 logger = logging.getLogger(__name__)
 
 _PILLOW_RUNTIME_LOGGED = False
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
 def _class_sort_key(name: str):
@@ -859,8 +860,8 @@ def get_dataloader(config):
                 )
             ]
 
-        mean = list(getattr(color_space_cfg, "mean", [0.485, 0.456, 0.406]))
-        std = list(getattr(color_space_cfg, "std", [0.229, 0.224, 0.225]))
+        mean = list(getattr(color_space_cfg, "mean", IMAGENET_MEAN))
+        std = list(getattr(color_space_cfg, "std", IMAGENET_STD))
 
     if strong_train_aug:
         jitter_brightness = float(getattr(source_aug_cfg, "brightness", 0.4)) if source_aug_cfg is not None else 0.4
@@ -907,7 +908,7 @@ def get_dataloader(config):
                 geom_train
                 + [
                     transforms.ToTensor(),
-                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
                     transforms.RandomErasing(p=0.25),
                 ]
             )
@@ -916,7 +917,7 @@ def get_dataloader(config):
                 geom_train
                 + [
                     transforms.ToTensor(),
-                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
                 ]
             )
 
@@ -931,7 +932,7 @@ def get_dataloader(config):
             geom_test
             + [
                 transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
             ]
         )
     
@@ -1006,9 +1007,7 @@ def get_dataloader(config):
                         transforms.RandomCrop(224),
                         transforms.RandomHorizontalFlip(),
                         transforms.ToTensor(),
-                        transforms.Normalize(
-                            [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-                        ),
+                        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
                     ]
                 )
 
@@ -1059,9 +1058,7 @@ def get_dataloader(config):
                             magnitude=target_randaugment_mag,
                         ),
                         transforms.ToTensor(),
-                        transforms.Normalize(
-                            [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
-                        ),
+                        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
                     ]
                 )
 

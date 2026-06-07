@@ -14,6 +14,17 @@ import torch
 from utils.config import cfg_get, is_truthy
 
 
+def configure_faiss_runtime(cfg) -> int:
+    """Apply the shared FAISS CPU thread limit and return the resolved value."""
+    perf = cfg_get(cfg, "performance", {})
+    threads = max(1, int(cfg_get(perf, "faiss_threads", 1)))
+
+    import faiss
+
+    faiss.omp_set_num_threads(threads)
+    return threads
+
+
 def set_seed(seed: int, deterministic: bool = False, benchmark: bool = True) -> None:
     """Set Python, NumPy, and Torch RNG state with consistent backend flags."""
     random.seed(seed)

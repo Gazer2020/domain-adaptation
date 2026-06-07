@@ -10,7 +10,6 @@ method:
   momentum: 0.9
   weight_decay: 0.001
   epochs: 60
-  batch_size: 16
   
   embed_feat_dim: 256
   bn_type: 0

@@ -22,6 +22,7 @@ performance:
   channels_last: false  # validated default: safer than current per-batch channels_last conversion path
   non_blocking_transfer: true
   cuda_batch_prefetch: auto  # auto/true/false; overlap H2D copies with compute on CUDA
+  faiss_threads: 1  # shared CPU thread limit for FAISS-based methods
   zero_grad_set_to_none: true
   amp:
     enabled: auto  # auto, true, false

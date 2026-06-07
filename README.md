@@ -168,6 +168,7 @@ The shared defaults in [config.yaml](src/configs/config.yaml) are intended to be
 Notable examples:
 - `performance.compile.enabled=false`
 - `performance.channels_last=false`
+- `performance.faiss_threads=1` for FAISS-based methods
 - `performance.augmentation.target_tensor_v2=auto`
 - dataloader workers default to `4/4/2` for source/target/test
 

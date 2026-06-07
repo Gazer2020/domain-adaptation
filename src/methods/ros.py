@@ -57,13 +57,15 @@ class RotationSolver(BaseSolver):
     def _build_rotation_optimizer(self):
         """Build optimizer for rotation pretraining stage."""
         base_lr = self.config.method.lr
+        beta1 = float(self.config.method.get("rotation_beta1", 0.9))
+        beta2 = float(self.config.method.get("rotation_beta2", 0.9))
         self.rot_optimizer = optim.Adam(
             list(self.feature_extractor.parameters()) +
             list(self.rotation_head.parameters()),
             lr=base_lr,
-            betas=(0.9, 0.9),
-            eps=1e-08,
-            weight_decay=5e-4,
+            betas=(beta1, beta2),
+            eps=float(self.config.method.get("rotation_eps", 1e-8)),
+            weight_decay=float(self.config.method.get("rotation_weight_decay", 5e-4)),
         )
 
     def _build_semantic_optimizer(self):
@@ -81,8 +83,9 @@ class RotationSolver(BaseSolver):
         ]
         self.sem_optimizer = optim.SGD(
             params,
-            momentum=0.9,
-            weight_decay=1e-4,
+            momentum=float(self.config.method.get("semantic_momentum", 0.9)),
+            weight_decay=float(self.config.method.get("semantic_weight_decay", 1e-4)),
+            nesterov=self._is_truthy(self.config.method.get("semantic_nesterov", False)),
         )
 
     def _apply_rotation(self, imgs):
@@ -97,11 +100,16 @@ class RotationSolver(BaseSolver):
             Labels: 0=0°, 1=90°, 2=180°, 3=270°
         """
         batch_size = imgs.size(0)
-        rot_labels = torch.randint(0, 4, (batch_size,), device=self.device)
-        rot_imgs = torch.stack([
-            torch.rot90(imgs[i], k=rot_labels[i], dims=[-2, -1])
-            for i in range(batch_size)
-        ])
+        rot_labels = torch.randint(0, 4, (batch_size,), device=imgs.device)
+        rot_imgs = torch.empty_like(imgs)
+        for rotation in range(4):
+            selected = rot_labels == rotation
+            if bool(selected.any()):
+                rot_imgs[selected] = torch.rot90(
+                    imgs[selected],
+                    k=rotation,
+                    dims=(-2, -1),
+                )
         return rot_imgs, rot_labels
 
     def train(self):

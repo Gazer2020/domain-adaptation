@@ -1,23 +1,16 @@
-import os
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
 import logging
-import copy
 import numpy as np
 import faiss
-faiss.omp_set_num_threads(1)
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.autograd.variable import *
 from scipy.optimize import linear_sum_assignment
 from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 
 from methods.registry import register_solver
 from methods.base_solver import BaseSolver
 from models.backbones import get_backbone
-from utils import AverageMeter, cycle
+from utils import AverageMeter, configure_faiss_runtime, cycle
 
 logger = logging.getLogger(__name__)
 
@@ -282,6 +275,7 @@ class LargeAdversarialNetwork(AdversarialNetwork):
 @register_solver("rtda")
 class RTDASolver(BaseSolver):
     def build_model(self):
+        faiss_threads = configure_faiss_runtime(self.config)
         self.shared_classes = self.class_info["num_classes"]
         self.all_classes = self.shared_classes + 2  # 1 unknown + 1 virtual cluster handling
         
@@ -298,6 +292,7 @@ class RTDASolver(BaseSolver):
         # self.net logic to support forward_for_eval easily
         self.net = nn.Sequential(self.feature_extractor, self.cls).to(self.device)
         self.discriminator = LargeAdversarialNetwork(256).to(self.device)
+        logger.info("RTDA FAISS runtime | threads=%d", faiss_threads)
 
     def forward_for_eval(self, imgs):
         # Override BaseSolver's forward_for_eval
@@ -389,6 +384,10 @@ class RTDASolver(BaseSolver):
         warmiter = self.config.method.warm_up_epoch
         K_cluster = self.config.method.K_cluster
         learning_rate = self.config.method.lr
+        momentum = float(self.config.method.get("momentum", 0.9))
+        weight_decay = float(self.config.method.get("weight_decay", 5e-4))
+        nesterov = self._is_truthy(self.config.method.get("nesterov", True))
+        head_lr_mult = float(self.config.method.get("head_lr_mult", 10.0))
         
         # Limit len to smaller of the two loops or large bounds
         max_len = max(len(self.source_loader), len(self.target_loader))
@@ -399,9 +398,27 @@ class RTDASolver(BaseSolver):
         
         scheduler = lambda step, initial_lr: inverseDecaySheduler(step, initial_lr, gamma=10, power=0.75, max_iter=max_iter)
         
-        optimizer_feature_extractor = OptimWithSheduler(optim.SGD(self.feature_extractor.parameters(), lr=learning_rate, weight_decay=5e-4, momentum=0.9, nesterov=True), scheduler)
-        optimizer_cls = OptimWithSheduler(optim.SGD(self.cls.parameters(), lr=learning_rate * 10, weight_decay=5e-4, momentum=0.9, nesterov=True), scheduler)
-        optimizer_discriminator = OptimWithSheduler(optim.SGD(self.discriminator.parameters(), lr=learning_rate * 10, weight_decay=5e-4, momentum=0.9, nesterov=True), scheduler)
+        optimizer_kwargs = {
+            "weight_decay": weight_decay,
+            "momentum": momentum,
+            "nesterov": nesterov,
+        }
+        optimizer_feature_extractor = OptimWithSheduler(
+            optim.SGD(self.feature_extractor.parameters(), lr=learning_rate, **optimizer_kwargs),
+            scheduler,
+        )
+        optimizer_cls = OptimWithSheduler(
+            optim.SGD(self.cls.parameters(), lr=learning_rate * head_lr_mult, **optimizer_kwargs),
+            scheduler,
+        )
+        optimizer_discriminator = OptimWithSheduler(
+            optim.SGD(
+                self.discriminator.parameters(),
+                lr=learning_rate * head_lr_mult,
+                **optimizer_kwargs,
+            ),
+            scheduler,
+        )
         
         best_hos = float("-inf")
 

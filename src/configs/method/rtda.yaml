@@ -9,9 +9,10 @@ method:
   lr: 0.00005
   momentum: 0.9
   weight_decay: 0.0005
+  nesterov: true
+  head_lr_mult: 10.0
   
   epochs: 70
-  batch_size: 64
   
   warm_up_epoch: 3
   

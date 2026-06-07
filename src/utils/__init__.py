@@ -10,8 +10,10 @@ from .config import (
     resolve_auto_bool,
     resolve_int_or_auto,
 )
+from .constants import IMAGENET_MEAN, IMAGENET_STD
 from .runtime import (
     CudaBatchPrefetcher,
+    configure_faiss_runtime,
     configure_torch_runtime,
     log_dataset_summary,
     log_runtime_summary,
@@ -22,7 +24,10 @@ from .utils import AverageMeter, cycle, get_device
 __all__ = [
     "AverageMeter",
     "CudaBatchPrefetcher",
+    "IMAGENET_MEAN",
+    "IMAGENET_STD",
     "cfg_get",
+    "configure_faiss_runtime",
     "configure_torch_runtime",
     "cycle",
     "get_device",

@@ -3,6 +3,16 @@ lr: 0.001
 epochs: 10
 backbone: resnet18
 semantic_hidden_dim: 256
+feature_lr_mult: 0.1
+
+rotation_beta1: 0.9
+rotation_beta2: 0.9
+rotation_eps: 1.0e-8
+rotation_weight_decay: 0.0005
+
+semantic_momentum: 0.9
+semantic_weight_decay: 0.0001
+semantic_nesterov: false
 
 setting: csda
 supported_settings: [csda]

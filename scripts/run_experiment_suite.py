@@ -38,7 +38,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime, timezone
+import hashlib
+from importlib.metadata import PackageNotFoundError, version
 import json
+import platform
 import re
 import signal
 import shlex
@@ -137,6 +141,64 @@ def load_spec(path: Path) -> dict:
     return spec
 
 
+def _git_output(*args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def collect_provenance(spec_path: Path, common: list[str]) -> dict[str, object]:
+    """Collect reproducibility metadata without modifying the worktree."""
+    resolved_spec = spec_path.resolve()
+    spec_bytes = resolved_spec.read_bytes()
+    lock_path = ROOT / "uv.lock"
+    status = _git_output("status", "--short")
+    tracked_diff = _git_output("diff", "--binary", "HEAD")
+    try:
+        torch_version = version("torch")
+    except PackageNotFoundError:
+        torch_version = "not-installed"
+
+    return {
+        "collected_at_utc": datetime.now(timezone.utc).isoformat(),
+        "git_commit": _git_output("rev-parse", "HEAD") or "unknown",
+        "git_dirty": bool(status),
+        "git_status": status.splitlines(),
+        "tracked_diff_sha256": (
+            hashlib.sha256(tracked_diff.encode("utf-8")).hexdigest()
+            if tracked_diff
+            else None
+        ),
+        "spec_path": str(resolved_spec),
+        "spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
+        "uv_lock_sha256": (
+            hashlib.sha256(lock_path.read_bytes()).hexdigest()
+            if lock_path.exists()
+            else None
+        ),
+        "common_overrides": list(common),
+        "launcher_command": shlex.join(sys.argv),
+        "python_version": platform.python_version(),
+        "python_executable": sys.executable,
+        "torch_version": torch_version,
+        "platform": platform.platform(),
+    }
+
+
+def write_provenance(out_dir: Path, provenance: dict[str, object]) -> None:
+    path = out_dir / "provenance.json"
+    path.write_text(
+        json.dumps(provenance, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+
 def select_groups(spec: dict, groups_arg: str) -> list[str]:
     value = str(groups_arg).strip().lower()
     if value in {"", "all"}:
@@ -155,7 +217,13 @@ def read_rows(summary_csv: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def write_summary(suite_name: str, out_dir: Path, rows: list[dict], summary_lines: list[str]) -> None:
+def write_summary(
+    suite_name: str,
+    out_dir: Path,
+    rows: list[dict],
+    summary_lines: list[str],
+    provenance: dict[str, object] | None = None,
+) -> None:
     fields = ["suite", "group", "id", "name", "purpose", "exp_name", "best_acc", "last_acc", "minutes"]
     summary_csv = out_dir / "summary.csv"
     summary_md = out_dir / "summary.md"
@@ -167,6 +235,14 @@ def write_summary(suite_name: str, out_dir: Path, rows: list[dict], summary_line
 
     with summary_md.open("w", encoding="utf-8") as f:
         f.write(f"# {suite_name}\n\n")
+        if provenance is not None:
+            f.write("## Provenance\n\n")
+            f.write(f"- Git commit: `{provenance['git_commit']}`\n")
+            f.write(f"- Dirty worktree: `{provenance['git_dirty']}`\n")
+            f.write(f"- Spec SHA-256: `{provenance['spec_sha256']}`\n")
+            f.write(f"- Python: `{provenance['python_version']}`\n")
+            f.write(f"- PyTorch: `{provenance['torch_version']}`\n")
+            f.write("- Full metadata: `provenance.json`\n\n")
         for line in summary_lines:
             f.write(f"{line}\n")
         if summary_lines:
@@ -500,12 +576,14 @@ def run_suite_body(args: argparse.Namespace, spec: dict, groups: list[str]) -> N
     suite_prefix = spec["suite_prefix"]
     summary_lines = list(spec.get("summary_lines", []))
     common = list(spec["common"])
+    provenance = collect_provenance(Path(args.spec), common)
 
     print(f"Start suite prefix={suite_prefix} groups={groups}", flush=True)
     for group in groups:
         suite_name = f"{suite_prefix}_{group}"
         out_dir = ROOT / "results" / suite_name
         out_dir.mkdir(parents=True, exist_ok=True)
+        write_provenance(out_dir, provenance)
         suite_log = out_dir / "suite.log"
         rows = read_rows(out_dir / "summary.csv") if args.resume else []
         completed = {row["id"] for row in rows}
@@ -540,7 +618,13 @@ def run_suite_body(args: argparse.Namespace, spec: dict, groups: list[str]) -> N
                 with suite_log.open("a", encoding="utf-8") as log:
                     log.write(f"\nContinuing after failed run: {exc}\n")
             rows.append(row)
-            write_summary(suite_name, out_dir, rows, summary_lines)
+            write_summary(
+                suite_name,
+                out_dir,
+                rows,
+                summary_lines,
+                provenance=provenance,
+            )
             if row["best_acc"] != "":
                 maybe_notify_completed_run(args, suite_name, row, out_dir)
 
@@ -552,7 +636,7 @@ def run_suite(args: argparse.Namespace, spec: dict) -> None:
     status = "success"
     error = None
     caught_exc = None
-    should_shutdown = args.shutdown
+    should_shutdown = False
     try:
         run_suite_body(args, spec, groups)
     except KeyboardInterrupt as exc:
@@ -571,7 +655,7 @@ def run_suite(args: argparse.Namespace, spec: dict) -> None:
         else:
             status = "failed"
             error = str(exc)
-            should_shutdown = args.shutdown
+            should_shutdown = False
     finally:
         maybe_notify_feishu(
             args=args,
@@ -581,6 +665,7 @@ def run_suite(args: argparse.Namespace, spec: dict) -> None:
             started_at=started_at,
             error=error,
         )
+        should_shutdown = should_shutdown or (args.shutdown and status == "success")
     if should_shutdown:
         print(f"All requested runs finished. Calling shutdown via shell: {args.shutdown_cmd}", flush=True)
         subprocess.run(["bash", "-lc", args.shutdown_cmd], check=False, cwd=ROOT)

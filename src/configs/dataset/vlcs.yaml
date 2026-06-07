@@ -1,0 +1,19 @@
+name: VLCS
+root: data/vlcs
+
+# Default domains
+source: Caltech101
+sources: []
+target: LabelMe
+
+# VLCS has 5 classes: bird, car, chair, dog, person
+num_classes: 5
+
+splits:
+  csda:
+    source: ${range:0-4}
+    target: ${range:0-4}
+
+  msda:
+    source: ${range:0-4}
+    target: ${range:0-4}

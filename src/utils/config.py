@@ -60,6 +60,13 @@ def resolve_auto_bool(value, auto_value: bool) -> bool:
     return is_truthy(value)
 
 
+def resolve_optional_auto_bool(value) -> bool | None:
+    """Resolve a bool-like value while preserving ``auto`` as ``None``."""
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return None
+    return is_truthy(value)
+
+
 def resolve_int_or_auto(value, auto_value: int) -> int:
     """Resolve integer config values that may also be the string ``auto``."""
     if isinstance(value, str) and value.strip().lower() == "auto":

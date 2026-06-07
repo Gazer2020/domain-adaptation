@@ -50,12 +50,24 @@ def configure_torch_runtime(cfg) -> dict[str, object]:
 
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision(matmul_precision)
+    tf32_api = "unavailable"
     if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-        torch.backends.cudnn.allow_tf32 = allow_tf32
+        precision = "tf32" if allow_tf32 else "ieee"
+        cudnn_conv = getattr(torch.backends.cudnn, "conv", None)
+        if hasattr(torch.backends.cuda.matmul, "fp32_precision") and hasattr(
+            cudnn_conv, "fp32_precision"
+        ):
+            torch.backends.cuda.matmul.fp32_precision = precision
+            cudnn_conv.fp32_precision = precision
+            tf32_api = "fp32_precision"
+        else:
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+            torch.backends.cudnn.allow_tf32 = allow_tf32
+            tf32_api = "allow_tf32"
 
     return {
         "allow_tf32": allow_tf32,
+        "tf32_api": tf32_api,
         "matmul_precision": matmul_precision,
         "deterministic": deterministic,
         "benchmark": benchmark and (not deterministic),
@@ -65,11 +77,13 @@ def configure_torch_runtime(cfg) -> dict[str, object]:
 def log_runtime_summary(logger: logging.Logger, runtime_cfg: dict[str, object], seed: int) -> None:
     """Emit a compact summary of the active runtime defaults."""
     logger.info(
-        "Runtime configured | seed=%s deterministic=%s benchmark=%s allow_tf32=%s matmul_precision=%s",
+        "Runtime configured | seed=%s deterministic=%s benchmark=%s allow_tf32=%s "
+        "tf32_api=%s matmul_precision=%s",
         seed,
         runtime_cfg["deterministic"],
         runtime_cfg["benchmark"],
         runtime_cfg["allow_tf32"],
+        runtime_cfg["tf32_api"],
         runtime_cfg["matmul_precision"],
     )
 

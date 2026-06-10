@@ -5,7 +5,7 @@ from omegaconf import OmegaConf
 
 from methods.base_solver import BaseSolver
 from utils.config import resolve_optional_auto_bool
-from utils.runtime import configure_torch_runtime
+from utils.runtime import configure_torch_runtime, shutdown_dataloader_workers
 
 
 class _CompileTestSolver(BaseSolver):
@@ -65,3 +65,23 @@ def test_compile_auto_dynamic_uses_pytorch_default(monkeypatch):
     assert solver._compile_callable(fn, "test") is fn
     assert "dynamic" not in captured
     assert captured["fullgraph"] is False
+
+
+def test_shutdown_dataloader_workers_releases_persistent_iterator():
+    class _Iterator:
+        def __init__(self):
+            self.shutdown = False
+
+        def _shutdown_workers(self):
+            self.shutdown = True
+
+    class _Loader:
+        def __init__(self):
+            self._iterator = _Iterator()
+
+    loader = _Loader()
+    iterator = loader._iterator
+    shutdown_dataloader_workers([loader])
+
+    assert iterator.shutdown is True
+    assert loader._iterator is None

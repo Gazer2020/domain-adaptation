@@ -14,6 +14,18 @@ import torch
 from utils.config import cfg_get, is_truthy
 
 
+def shutdown_dataloader_workers(loaders) -> None:
+    """Release persistent DataLoader iterators before interpreter shutdown."""
+    for loader in loaders or ():
+        iterator = getattr(loader, "_iterator", None)
+        if iterator is None:
+            continue
+        shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown_workers):
+            shutdown_workers()
+        loader._iterator = None
+
+
 def configure_faiss_runtime(cfg) -> int:
     """Apply the shared FAISS CPU thread limit and return the resolved value."""
     perf = cfg_get(cfg, "performance", {})
@@ -174,3 +186,12 @@ class CudaBatchPrefetcher:
 
     def close(self) -> None:
         self._next_batch = None
+        iterator = self.iterator
+        self.iterator = None
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close()
+            return
+        shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+        if callable(shutdown_workers):
+            shutdown_workers()

@@ -20,7 +20,7 @@ import torch.optim as optim
 from methods.base_solver import BaseSolver
 from methods.registry import register_solver
 from models.backbones import get_backbone
-from utils import AverageMeter, cycle
+from utils import GpuLossAccumulator, cycle
 
 
 logger = logging.getLogger(__name__)
@@ -214,10 +214,7 @@ class FACTDASolver(BaseSolver):
             ramp = _sigmoid_rampup(epoch + 1.0, self.consistency_warmup_epochs)
             beta = self.lambda_consistency * ramp
 
-            meters = {
-                key: AverageMeter()
-                for key in ["src", "src_cons", "tgt_cons", "tgt_ent", "total", "beta"]
-            }
+            acc_meter = GpuLossAccumulator(device=self.device)
 
             for _ in range(epoch_steps):
                 src_batch = next(src_iter)
@@ -286,30 +283,32 @@ class FACTDASolver(BaseSolver):
                     self._optimizer_step_with_optional_clip(total_loss, optimizer)
                 self._update_teacher_ema()
 
-                meters["src"].update(loss_src.item())
-                meters["src_cons"].update(loss_src_cons.item())
-                meters["tgt_cons"].update(loss_tgt_cons.item())
-                meters["tgt_ent"].update(loss_tgt_ent.item())
-                meters["total"].update(total_loss.item())
-                meters["beta"].update(beta)
+                acc_meter.update("src", loss_src)
+                acc_meter.update("src_cons", loss_src_cons)
+                acc_meter.update("tgt_cons", loss_tgt_cons)
+                acc_meter.update("tgt_ent", loss_tgt_ent)
+                acc_meter.update("total", total_loss)
+                acc_meter.update("beta", beta)
+                acc_meter.step()
 
             scheduler.step()
-            acc = self.evaluate()
-            if acc > best_acc:
-                best_acc = acc
-            self._maybe_save_best(acc, epoch + 1)
+            acc_val = self.evaluate()
+            if acc_val > best_acc:
+                best_acc = acc_val
+            self._maybe_save_best(acc_val, epoch + 1)
+            computed = acc_meter.compute()
             self._log_epoch_summary(
                 epoch + 1,
                 self.total_epochs,
                 metrics={
-                    "src": meters["src"].avg,
-                    "src_cons": meters["src_cons"].avg,
-                    "tgt_cons": meters["tgt_cons"].avg,
-                    "tgt_ent": meters["tgt_ent"].avg,
-                    "total": meters["total"].avg,
+                    "src": computed.get("src", 0),
+                    "src_cons": computed.get("src_cons", 0),
+                    "tgt_cons": computed.get("tgt_cons", 0),
+                    "tgt_ent": computed.get("tgt_ent", 0),
+                    "total": computed.get("total", 0),
                 },
-                extras={"beta": (meters["beta"].avg, ".3f")},
-                score=acc,
+                extras={"beta": (computed.get("beta", 0), ".3f")},
+                score=acc_val,
                 best_score=best_acc,
                 score_name="Acc",
             )

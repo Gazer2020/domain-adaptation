@@ -1,18 +1,17 @@
 """
-DCPR: Domain-Class Prototype Relation for Multi-Source Domain Adaptation.
+DCPR: domain-class prototype relation adaptation.
 
-Mainline from the implementation:
-- Refresh source-domain class prototypes from the full source set each epoch.
-- Classify by similarity to those prototypes, aggregating same-class evidence
-  across source domains.
-- Use softmax to route each predicted class through the closest source-domain
-  prototypes.
-- Build a per-domain, off-diagonal class-confusion profile from source
-  classifier probabilities.
-- Adapt target data with EMA teacher consistency on strong/weak views, matching
-  both prototype-node mass and routed confusion profiles.
-- Anneal the relation temperature after consistency starts so early routing is
-  smoother and late logits are sharper.
+Source supervision uses a cosine classifier head (adaptive_logits) with CE loss.
+Target adaptation uses EMA consistency over the domain-class prototype relation
+graph, with the teacher producing domain-class node mass distributions that the
+student is trained to match on strongly-augmented views.
+
+Architecture:
+- Backbone features -> LayerNorm -> domain-relative prototype relation
+- One cosine classifier is shared by source and target
+- Prototypes affect only the domain-class relation, never class logits
+- Target-centre EMA places target features in their own relative coordinates
+- Classifier-margin ranks emphasize ambiguous classes inside the relation loss
 """
 
 import copy
@@ -20,7 +19,7 @@ import logging
 import math
 import time
 from contextlib import contextmanager
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -52,46 +51,8 @@ def soft_prob_cross_entropy(
     return losses.mean()
 
 
-def sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Sparsemax over `dim` with the same shape as softmax outputs."""
-    if logits.numel() == 0:
-        return logits
-
-    z = logits.transpose(dim, -1)
-    orig_shape = z.shape
-    z = z.reshape(-1, orig_shape[-1])
-
-    z_sorted, _ = torch.sort(z, dim=-1, descending=True)
-    z_cumsum = z_sorted.cumsum(dim=-1)
-    ks = torch.arange(1, z.size(-1) + 1, device=z.device, dtype=z.dtype).unsqueeze(0)
-    support = 1 + ks * z_sorted > z_cumsum
-    support_size = support.sum(dim=-1, keepdim=True).clamp_min(1)
-    tau = (z_cumsum.gather(-1, support_size - 1) - 1.0) / support_size.to(z.dtype)
-    out = (z - tau).clamp_min(0.0)
-    out = out.reshape(orig_shape).transpose(dim, -1)
-    return out
-
-
-def _resolve_ambiguity_reciprocal_mode(value) -> str:
-    if isinstance(value, bool):
-        return "geometric" if value else "none"
-    lowered = str(value).strip().lower()
-    if lowered in {"1", "true", "yes", "on", "sqrt", "geometric", "geom"}:
-        return "geometric"
-    if lowered in {"0", "false", "no", "off", "none", ""}:
-        return "none"
-    if lowered in {"mean", "avg", "average", "arithmetic", "sym_mean"}:
-        return "mean"
-    if lowered in {"harmonic", "hmean", "sym_harmonic"}:
-        return "harmonic"
-    raise ValueError(
-        f"Unsupported DCPR ambiguity_reciprocal={value}. "
-        "Expected none, geometric, mean, or harmonic."
-    )
-
-
 class PrototypeRelationRouter(nn.Module):
-    """Parse prototype-routed class, domain, and confusion relations."""
+    """Class-conditioned routing over source domain-class prototypes."""
 
     def __init__(
         self,
@@ -99,20 +60,15 @@ class PrototypeRelationRouter(nn.Module):
         num_classes: int,
         num_source_domains: int,
         relation_temperature: float = 0.10,
-        routing_mode: str = "softmax",
-        routing_scope: str = "class",
-        ambiguity_source: str = "domain_class",
-        ambiguity_reciprocal="harmonic",
+        relation_space_mode: str = "standard",
     ):
         super().__init__()
         self.feat_dim = int(feat_dim)
         self.num_classes = int(num_classes)
         self.num_source_domains = int(num_source_domains)
-        self.confusion_topk = 4
-        self.routing_mode = str(routing_mode).lower()
-        self.routing_scope = str(routing_scope).lower()
-        self.ambiguity_source = str(ambiguity_source).lower()
-        self.ambiguity_reciprocal = _resolve_ambiguity_reciprocal_mode(ambiguity_reciprocal)
+        self.relation_space_mode = str(relation_space_mode).strip().lower()
+        if self.relation_space_mode not in {"standard", "domain_relative"}:
+            raise ValueError("relation_space_mode must be 'standard' or 'domain_relative'")
         self.register_buffer(
             "relation_temperature",
             torch.tensor(max(1e-6, float(relation_temperature)), dtype=torch.float32),
@@ -130,8 +86,13 @@ class PrototypeRelationRouter(nn.Module):
             persistent=True,
         )
         self.register_buffer(
-            "src_classifier_confusion",
-            torch.zeros(self.num_source_domains, self.num_classes, self.num_classes),
+            "src_domain_centers",
+            torch.zeros(self.num_source_domains, self.feat_dim),
+            persistent=True,
+        )
+        self.register_buffer(
+            "src_domain_center_inited",
+            torch.zeros(self.num_source_domains, dtype=torch.bool),
             persistent=True,
         )
 
@@ -143,91 +104,57 @@ class PrototypeRelationRouter(nn.Module):
     def reset_source_prototypes(self):
         self.src_prototypes.zero_()
         self.src_proto_inited.zero_()
-        self.src_classifier_confusion.zero_()
+        self.src_domain_centers.zero_()
+        self.src_domain_center_inited.zero_()
 
-    def _apply_routing(
-        self,
-        logits: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        safe_logits = logits.masked_fill(~valid_mask, -1e4)
-        if self.routing_mode == "softmax":
-            weights = torch.softmax(safe_logits, dim=-1)
-        elif self.routing_mode == "uniform":
-            weights = valid_mask.float()
-        elif self.routing_mode in {"hard", "hardmax", "argmax"}:
-            best = safe_logits.argmax(dim=-1, keepdim=True)
-            weights = torch.zeros_like(logits).scatter_(-1, best, 1.0)
-        elif self.routing_mode == "sparsemax":
-            weights = sparsemax(safe_logits, dim=-1)
-        else:
-            raise ValueError(
-                f"Unsupported DCPR routing_mode={self.routing_mode}. "
-                "Expected sparsemax, softmax, uniform, or hardmax."
-            )
-        weights = weights * valid_mask.float()
-        return weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-
-    def _classifier_confusion_weights(self) -> torch.Tensor:
-        scores = self.src_classifier_confusion
-        mask = self.src_proto_inited
-        d, c, _ = scores.shape
-
-        if c <= 1:
-            return torch.zeros(d, c, c, device=scores.device, dtype=scores.dtype)
-
-        valid_pair = mask.unsqueeze(2) & mask.unsqueeze(1)
-        eye = torch.eye(c, device=scores.device, dtype=torch.bool).unsqueeze(0)
-        keep_mask = valid_pair & (~eye)
-
-        if self.ambiguity_source == "uniform":
-            weights = torch.where(keep_mask, torch.ones_like(scores), torch.zeros_like(scores))
-            return weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        if self.ambiguity_source == "global":
-            valid_rows = mask.float().sum(dim=0).clamp_min(1.0).view(c, 1)
-            global_scores = (scores * mask.unsqueeze(-1).float()).sum(dim=0) / valid_rows
-            scores = global_scores.unsqueeze(0).expand(d, c, c)
-        elif self.ambiguity_source in {"domain_class", "random"}:
-            pass
-        else:
-            raise ValueError(
-                f"Unsupported DCPR ambiguity_source={self.ambiguity_source}. "
-                "Expected domain_class, global, uniform, or random."
-            )
-
-        if self.ambiguity_reciprocal != "none":
-            reverse_scores = scores.transpose(1, 2)
-            scores = scores.clamp_min(0.0)
-            reverse_scores = reverse_scores.clamp_min(0.0)
-            if self.ambiguity_reciprocal == "geometric":
-                scores = (scores * reverse_scores).sqrt()
-            elif self.ambiguity_reciprocal == "mean":
-                scores = 0.5 * (scores + reverse_scores)
-            elif self.ambiguity_reciprocal == "harmonic":
-                scores = (2.0 * scores * reverse_scores) / (scores + reverse_scores).clamp_min(1e-8)
-            else:
-                raise ValueError(
-                    f"Unsupported DCPR ambiguity_reciprocal={self.ambiguity_reciprocal}. "
-                    "Expected none, geometric, mean, or harmonic."
-                )
-
-        if self.confusion_topk > 0 and self.confusion_topk < (c - 1):
-            topk = min(self.confusion_topk, c - 1)
-            safe_scores = scores.masked_fill(~keep_mask, -1e4)
-            topi = safe_scores.topk(topk, dim=-1).indices
-            topk_mask = torch.zeros_like(keep_mask)
-            topk_mask.scatter_(-1, topi, True)
-            keep_mask = keep_mask & topk_mask
-
-        weights = torch.where(keep_mask, scores, torch.zeros_like(scores))
-        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        valid_row = keep_mask.any(dim=-1)
-        return torch.where(valid_row.unsqueeze(-1), weights, torch.zeros_like(weights))
-
-    def parse(self, h_relation: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Return class logits plus sparse source-domain routing statistics."""
+    def source_relation_prototypes(self) -> torch.Tensor:
         proto = self.src_prototypes
+        if self.relation_space_mode != "domain_relative":
+            return proto
+        centers = self.src_domain_centers.unsqueeze(1)
+        valid_centers = self.src_domain_center_inited.view(-1, 1, 1)
+        return torch.where(valid_centers, proto - centers, proto)
+
+    def center_features(
+        self,
+        h_relation: torch.Tensor,
+        *,
+        domain_ids: Optional[torch.Tensor] = None,
+        sample_center: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.relation_space_mode != "domain_relative":
+            return h_relation
+        if sample_center is not None:
+            center = sample_center.to(device=h_relation.device, dtype=h_relation.dtype)
+            if center.ndim == 1:
+                center = center.unsqueeze(0)
+            return h_relation - center
+        if domain_ids is not None:
+            domain_ids = domain_ids.to(device=h_relation.device).long().clamp(0, self.num_source_domains - 1)
+            centers = self.src_domain_centers.to(device=h_relation.device, dtype=h_relation.dtype)[domain_ids]
+            valid = self.src_domain_center_inited.to(device=h_relation.device)[domain_ids].unsqueeze(1)
+            return h_relation - torch.where(valid, centers, torch.zeros_like(centers))
+        valid = self.src_domain_center_inited.to(device=h_relation.device)
+        if bool(valid.any()):
+            center = self.src_domain_centers.to(device=h_relation.device, dtype=h_relation.dtype)[valid].mean(dim=0)
+            return h_relation - center.unsqueeze(0)
+        return h_relation
+
+    def parse(
+        self,
+        h_relation: torch.Tensor,
+        *,
+        domain_ids: Optional[torch.Tensor] = None,
+        sample_center: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Return source-domain routing statistics for each class."""
+        proto = self.source_relation_prototypes()
         mask = self.src_proto_inited
+        h_relation = self.center_features(
+            h_relation,
+            domain_ids=domain_ids,
+            sample_center=sample_center,
+        )
 
         proto_n = F.normalize(proto, dim=-1)
         h_n = F.normalize(h_relation, dim=-1)
@@ -236,56 +163,26 @@ class PrototypeRelationRouter(nn.Module):
         node_logits_bdc = node_logits_bdc / self.relation_temperature.to(dtype=node_logits_bdc.dtype)
         node_logits_bdc = node_logits_bdc.masked_fill(~mask.unsqueeze(0), -1e4)
 
-        # Class evidence is the log-sum-exp over source-domain prototypes that
-        # share the same class label.
-        class_logits_rel = torch.logsumexp(node_logits_bdc, dim=1)
         valid_classes = mask.any(dim=0)
+        class_logits_rel = torch.logsumexp(node_logits_bdc, dim=1)
         class_logits_rel = class_logits_rel.masked_fill(~valid_classes.unsqueeze(0), -1e4)
 
-        # For each candidate class, route through the source domains with
-        # active prototype support.
         domain_logits = node_logits_bdc.permute(0, 2, 1).contiguous()
         domain_mask = mask.transpose(0, 1).unsqueeze(0)
-        if self.routing_scope == "instance":
-            domain_valid = mask.any(dim=1).unsqueeze(0)
-            instance_domain_logits = torch.logsumexp(node_logits_bdc, dim=2)
-            instance_weights = self._apply_routing(instance_domain_logits, domain_valid)
-            domain_weights = instance_weights.unsqueeze(1).expand(-1, self.num_classes, -1)
-            domain_weights = domain_weights * domain_mask.float()
-            domain_weights = domain_weights / domain_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        elif self.routing_scope == "class":
-            domain_logits = domain_logits.masked_fill(~domain_mask, -1e4)
-            domain_weights = self._apply_routing(domain_logits, domain_mask)
-        elif self.routing_scope in {"none", "off", "shared"}:
-            domain_weights = domain_mask.float().expand(domain_logits.size(0), -1, -1)
-            domain_weights = domain_weights / domain_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        else:
-            raise ValueError(
-                f"Unsupported DCPR routing_scope={self.routing_scope}. "
-                "Expected class, instance, or none."
-            )
+        domain_logits = domain_logits.masked_fill(~domain_mask, -1e4)
+        domain_weights = torch.softmax(domain_logits, dim=-1) * domain_mask.float()
+        domain_weights = domain_weights / domain_weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         domain_weights = torch.where(
             valid_classes.unsqueeze(0).unsqueeze(-1),
             domain_weights,
             torch.full_like(domain_weights, 1.0 / float(max(1, self.num_source_domains))),
         )
 
-        # The routed source-domain mixture selects a class-confusion profile
-        # conditioned on where this sample is closest in prototype space.
-        confusion_dck = self._classifier_confusion_weights()
-        confusion_per_class = torch.einsum("bcd,dck->bck", domain_weights, confusion_dck)
-        confusion_per_class = torch.where(
-            valid_classes.unsqueeze(0).unsqueeze(-1),
-            confusion_per_class,
-            torch.zeros_like(confusion_per_class),
-        )
-
         return {
             "class_logits_rel": class_logits_rel,
-            "domain_logits": domain_logits,
             "domain_weights": domain_weights,
-            "confusion_per_class": confusion_per_class,
             "valid_classes": valid_classes,
+            "h_relation": h_relation,
         }
 
 
@@ -296,12 +193,10 @@ class DCPRNetwork(nn.Module):
         num_classes: int,
         num_source_domains: int,
         *,
-        bottleneck_dim: int = 256,
+        bottleneck_dim: int = 0,
         relation_temperature: float = 0.10,
-        routing_mode: str = "softmax",
-        routing_scope: str = "class",
-        ambiguity_source: str = "domain_class",
-        ambiguity_reciprocal="harmonic",
+        adaptive_head_scale: float = 10.0,
+        relation_space_mode: str = "domain_relative",
     ):
         super().__init__()
 
@@ -330,16 +225,26 @@ class DCPRNetwork(nn.Module):
 
         self.feature_norm = nn.LayerNorm(self.feat_dim)
         self.relation_feat_dim = self.feat_dim
+        self.adaptive_head_scale = float(adaptive_head_scale)
+        self.relation_space_mode = str(relation_space_mode).strip().lower()
 
         self.relation_router = PrototypeRelationRouter(
             feat_dim=self.relation_feat_dim,
             num_classes=self.num_classes,
             num_source_domains=self.num_source_domains,
             relation_temperature=relation_temperature,
-            routing_mode=routing_mode,
-            routing_scope=routing_scope,
-            ambiguity_source=ambiguity_source,
-            ambiguity_reciprocal=ambiguity_reciprocal,
+            relation_space_mode=self.relation_space_mode,
+        )
+        self.adaptive_classifier = nn.Linear(self.relation_feat_dim, self.num_classes, bias=False)
+        self.register_buffer(
+            "target_center",
+            torch.zeros(self.relation_feat_dim),
+            persistent=True,
+        )
+        self.register_buffer(
+            "target_center_inited",
+            torch.tensor(False, dtype=torch.bool),
+            persistent=True,
         )
 
     def extract_relation_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -368,33 +273,56 @@ class DCPRNetwork(nn.Module):
     def reset_source_prototypes(self):
         self.relation_router.reset_source_prototypes()
 
+    @torch.no_grad()
+    def update_target_center(self, h_shared: torch.Tensor, momentum: float):
+        if self.relation_space_mode != "domain_relative" or h_shared.numel() == 0:
+            return
+        batch_center = h_shared.detach().mean(dim=0).to(dtype=self.target_center.dtype)
+        momentum = min(0.9999, max(0.0, float(momentum)))
+        if bool(self.target_center_inited):
+            self.target_center.mul_(momentum).add_(batch_center, alpha=1.0 - momentum)
+        else:
+            self.target_center.copy_(batch_center)
+            self.target_center_inited.fill_(True)
+
+    def _target_sample_center(self, h_shared: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.relation_space_mode != "domain_relative" or not bool(self.target_center_inited):
+            return None
+        return self.target_center.to(device=h_shared.device, dtype=h_shared.dtype)
+
+    def _adaptive_logits(self, h_shared: torch.Tensor) -> torch.Tensor:
+        h_n = F.normalize(h_shared, dim=-1)
+        w_n = F.normalize(self.adaptive_classifier.weight, dim=-1)
+        return F.linear(h_n, w_n) * self.adaptive_head_scale
+
     def forward_relation_logits(
         self,
         x: Optional[torch.Tensor] = None,
         h_shared: Optional[torch.Tensor] = None,
+        domain_ids: Optional[torch.Tensor] = None,
+        use_target_center: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         h_shared = self._encode_shared(x=x, h_shared=h_shared)
-        relations = self.relation_router.parse(h_shared)
-        class_logits = relations["class_logits_rel"].masked_fill(
-            ~relations["valid_classes"].unsqueeze(0), -1e4
+        sample_center = self._target_sample_center(h_shared) if use_target_center else None
+        relations = self.relation_router.parse(
+            h_shared,
+            domain_ids=domain_ids,
+            sample_center=sample_center,
         )
+        class_logits = self._adaptive_logits(h_shared)
+        class_logits = class_logits.masked_fill(~relations["valid_classes"].unsqueeze(0), -1e4)
         class_probs = torch.softmax(class_logits, dim=1)
+        prototype_class_probs = torch.softmax(relations["class_logits_rel"], dim=1)
         domain_weights = relations["domain_weights"]
         node_mass = class_probs.unsqueeze(-1) * domain_weights
-
-        confusion_per_class = relations["confusion_per_class"]
-        confusion_profile = torch.einsum("bc,bck->bk", class_probs, confusion_per_class)
-        confusion_profile = confusion_profile / confusion_profile.sum(dim=1, keepdim=True).clamp_min(1e-8)
-
         aux = {
-            "h_relation": h_shared,
+            "h_shared": h_shared,
+            "h_relation": relations["h_relation"],
             "class_logits": class_logits,
             "class_probs": class_probs,
-            "domain_logits": relations["domain_logits"],
+            "prototype_class_probs": prototype_class_probs,
             "domain_weights": domain_weights,
             "node_mass": node_mass,
-            "confusion_per_class": confusion_per_class,
-            "confusion_profile": confusion_profile,
             "valid_classes": relations["valid_classes"],
         }
         return class_logits, aux
@@ -419,7 +347,7 @@ class DCPRSolver(BaseSolver):
         self.num_source_domains = len(sources)
 
         for key, cast, default in [
-            ("bottleneck_dim", int, 256),
+            ("bottleneck_dim", int, 0),
             ("consistency_conf_power", float, 2.0),
             ("consistency_start_epoch", int, 5),
             ("grad_clip", float, 5.0),
@@ -427,37 +355,22 @@ class DCPRSolver(BaseSolver):
             ("ema_decay_start", float, 0.996),
             ("ema_decay_end", float, 0.9995),
             ("label_smoothing", float, 0.05),
+            ("target_center_momentum", float, 0.98),
         ]:
             setattr(self, key, cast(m.get(key, default)))
 
-        self.prototype_granularity = str(m.get("prototype_granularity", "domain_class")).lower()
-        self.routing_mode = str(m.get("routing_mode", "softmax")).lower()
-        self.routing_scope = str(m.get("routing_scope", "class")).lower()
-        self.support_consistency_target = str(
-            m.get("support_consistency_target", "node_mass")
-        ).lower()
-        self.ambiguity_source = str(m.get("ambiguity_source", "domain_class")).lower()
-        self.ambiguity_reciprocal = _resolve_ambiguity_reciprocal_mode(
-            m.get("ambiguity_reciprocal", "harmonic")
-        )
-        self.use_ambiguity_consistency = self._is_truthy(m.get("ambiguity_consistency", True))
         self.lambda_relation_consistency = float(m.get("lambda_relation_consistency", 0.40))
-        self.lambda_rel_consistency_node = float(m.get("lambda_rel_consistency_node", 0.25))
-        self.lambda_rel_consistency_conf = float(m.get("lambda_rel_consistency_conf", 1.0))
-
-        if self.prototype_granularity in {"class", "shared", "shared_class"}:
-            if self.routing_scope == "class":
-                logger.info(
-                    "DCPR shared-class prototype graph uses routing_scope=none "
-                    "instead of class-wise source routing."
-                )
-                self.routing_scope = "none"
-            if self.ambiguity_source == "domain_class":
-                logger.info(
-                    "DCPR shared-class prototype graph uses ambiguity_source=global "
-                    "because there are no domain-class nodes."
-                )
-                self.ambiguity_source = "global"
+        self.consistency_target = str(m.get("consistency_target", "relation")).strip().lower()
+        if self.consistency_target not in {"relation", "classification", "class_only"}:
+            raise ValueError(
+                "method.consistency_target must be 'relation', 'classification', "
+                "or 'class_only'"
+            )
+        self.relation_space_mode = str(m.get("relation_space_mode", "domain_relative")).strip().lower()
+        if self.relation_space_mode not in {"standard", "domain_relative"}:
+            raise ValueError("method.relation_space_mode must be 'standard' or 'domain_relative'")
+        self.adaptive_head_scale = float(m.get("adaptive_head_scale", 10.0))
+        self.ambiguity_relation_boost = float(m.get("ambiguity_relation_boost", 0.5))
 
         self.total_epochs = int(m.get("epochs", 20))
         self.ramp_denom = float(m.get("ramp_denom", 16.0))
@@ -480,7 +393,6 @@ class DCPRSolver(BaseSolver):
         self.temperature_start = float(m.get("temperature_start", 0.15))
         self.temperature_end = float(m.get("temperature_end", 0.10))
         self.relation_temperature = self.temperature_start
-        self.confusion_topk = 4
         self.refresh_source_prototypes_each_epoch = True
 
         self.criterion_task = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
@@ -502,11 +414,10 @@ class DCPRSolver(BaseSolver):
             num_source_domains=self.num_source_domains,
             bottleneck_dim=self.bottleneck_dim,
             relation_temperature=self.relation_temperature,
-            routing_mode=self.routing_mode,
-            routing_scope=self.routing_scope,
-            ambiguity_source=self.ambiguity_source,
-            ambiguity_reciprocal=self.ambiguity_reciprocal,
+            adaptive_head_scale=self.adaptive_head_scale,
+            relation_space_mode=self.relation_space_mode,
         ).to(self.device)
+        self.class_ambiguity_weights = torch.zeros(self.num_classes, device=self.device)
 
         self.ema_net = copy.deepcopy(self.net)
         for param in self.ema_net.parameters():
@@ -528,37 +439,26 @@ class DCPRSolver(BaseSolver):
         )
 
         logger.info(
-            "DCPR mainline: bottleneck=%d temp=%.2f->%.2f conf_topk=%d "
-            "routing=%s/%s proto=%s amb_src=%s amb_recip=%s support=%s amb_cons=%s "
-            "rel_space_dim=%d lambda_rel_cons=%.2f "
-            "rel_w(node/conf)=%.2f/%.2f proto=full_eval proto_bs=%d proto_prefetch=%s "
+            "DCPR: bottleneck=%d rel_space=%s rel_dim=%d temp=%.2f->%.2f "
+            "lambda_rel=%.2f target=%s head_scale=%.1f amb_boost=%.2f proto_bs=%d "
             "ramp_start=%d ramp_denom=%.1f prefetch=%s",
             self.bottleneck_dim,
+            self.relation_space_mode,
+            self.net.relation_feat_dim,
             self.temperature_start,
             self.temperature_end,
-            self.confusion_topk,
-            self.routing_mode,
-            self.routing_scope,
-            self.prototype_granularity,
-            self.ambiguity_source,
-            str(self.ambiguity_reciprocal),
-            self.support_consistency_target,
-            str(self.use_ambiguity_consistency),
-            self.net.relation_feat_dim,
             self.lambda_relation_consistency,
-            self.lambda_rel_consistency_node,
-            self.lambda_rel_consistency_conf,
+            self.consistency_target,
+            self.adaptive_head_scale,
+            self.ambiguity_relation_boost,
             self.prototype_batch_size,
-            str(self.prototype_cuda_prefetch),
             self.consistency_start_epoch,
             self.ramp_denom,
             str(self.cuda_batch_prefetch),
         )
 
     def _uses_target_loader_in_training(self) -> bool:
-        uses_support = self.support_consistency_target not in {"", "none", "off", "false"}
-        uses_ambiguity = bool(self.use_ambiguity_consistency)
-        return self.lambda_relation_consistency > 0.0 and (uses_support or uses_ambiguity)
+        return self.lambda_relation_consistency > 0.0
 
     def _temperature_at_epoch(self, epoch_number: int) -> float:
         if self.temperature_start == self.temperature_end:
@@ -580,10 +480,19 @@ class DCPRSolver(BaseSolver):
         *,
         x: Optional[torch.Tensor] = None,
         h_shared: Optional[torch.Tensor] = None,
+        domain_ids: Optional[torch.Tensor] = None,
+        use_target_center: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if model is self.net:
-            return self._forward_logits_student(x, h_shared)
-        return model.forward_relation_logits(x=x, h_shared=h_shared)
+            return self._forward_logits_student(
+                x, h_shared, domain_ids, use_target_center,
+            )
+        return model.forward_relation_logits(
+            x=x,
+            h_shared=h_shared,
+            domain_ids=domain_ids,
+            use_target_center=use_target_center,
+        )
 
     def _setup_compiled_student_forward(self):
         if self._student_forward_compiled:
@@ -628,84 +537,93 @@ class DCPRSolver(BaseSolver):
             return x
         return x / x.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
+    def _domain_class_relation(self, aux: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Target relation over class and source-domain prototype nodes."""
+        return self._normalize_distribution(aux["node_mass"].flatten(1))
+
+    def _consistency_distribution(self, aux: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if self.consistency_target == "relation":
+            return self._domain_class_relation(aux)
+        if self.consistency_target == "classification":
+            return aux["class_probs"]
+        if self.consistency_target == "class_only":
+            return aux["prototype_class_probs"]
+        raise ValueError(f"Unsupported consistency target: {self.consistency_target}")
+
     def _relation_consistency_loss(
         self,
         student_aux: Dict[str, torch.Tensor],
         teacher_aux: Dict[str, torch.Tensor],
         weights: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Match teacher/student target relations, not just class marginals."""
-        support_losses = []
-        if self.support_consistency_target in {"node", "node_mass", "m", "prototype", "support"}:
-            student_node = self._normalize_distribution(student_aux["node_mass"].flatten(1))
-            teacher_node = self._normalize_distribution(teacher_aux["node_mass"].flatten(1))
-            support_losses.append(soft_prob_cross_entropy(student_node, teacher_node, weights=weights))
-        elif self.support_consistency_target in {"class", "class_probs", "prob", "probs", "pi"}:
-            support_losses.append(
-                soft_prob_cross_entropy(
-                    self._normalize_distribution(student_aux["class_probs"]),
-                    self._normalize_distribution(teacher_aux["class_probs"]),
-                    weights=weights,
-                )
-            )
-        elif self.support_consistency_target in {"both", "node_class", "m_pi"}:
-            student_node = self._normalize_distribution(student_aux["node_mass"].flatten(1))
-            teacher_node = self._normalize_distribution(teacher_aux["node_mass"].flatten(1))
-            support_losses.append(soft_prob_cross_entropy(student_node, teacher_node, weights=weights))
-            support_losses.append(
-                soft_prob_cross_entropy(
-                    self._normalize_distribution(student_aux["class_probs"]),
-                    self._normalize_distribution(teacher_aux["class_probs"]),
-                    weights=weights,
-                )
-            )
-        elif self.support_consistency_target in {"", "none", "off", "false"}:
-            pass
-        else:
-            raise ValueError(
-                f"Unsupported DCPR support_consistency_target={self.support_consistency_target}. "
-                "Expected node_mass, class_probs, both, or none."
-            )
+    ) -> torch.Tensor:
+        """Match the configured teacher/student target distribution."""
+        student_distribution = self._consistency_distribution(student_aux)
+        teacher_distribution = self._consistency_distribution(teacher_aux)
+        return soft_prob_cross_entropy(
+            student_distribution,
+            teacher_distribution,
+            weights=weights,
+        )
 
-        if support_losses:
-            node_loss = torch.stack(support_losses).mean()
-        else:
-            node_loss = torch.zeros((), device=weights.device, dtype=torch.float32)
-
-        if self.use_ambiguity_consistency:
-            conf_loss = soft_prob_cross_entropy(
-                self._normalize_distribution(student_aux["confusion_profile"]),
-                self._normalize_distribution(teacher_aux["confusion_profile"]),
-                weights=weights,
-            )
-        else:
-            conf_loss = torch.zeros((), device=weights.device, dtype=torch.float32)
-        return node_loss, conf_loss
+    def _ambiguity_sample_weights(self, class_probs: torch.Tensor) -> torch.Tensor:
+        if self.ambiguity_relation_boost <= 0.0:
+            return torch.ones(class_probs.size(0), device=class_probs.device, dtype=class_probs.dtype)
+        ambiguity = self.class_ambiguity_weights.to(
+            device=class_probs.device,
+            dtype=class_probs.dtype,
+        )
+        expected_ambiguity = (class_probs * ambiguity.unsqueeze(0)).sum(dim=1)
+        centered_ambiguity = 2.0 * expected_ambiguity - 1.0
+        return (1.0 + self.ambiguity_relation_boost * centered_ambiguity).clamp_min(1e-3)
 
     @torch.no_grad()
     def _teacher_guidance(self, tgt_weak: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         self.ema_net.eval()
-        _, aux = self._forward_logits(self.ema_net, x=tgt_weak)
-        conf = aux["class_probs"].max(dim=1).values.detach()
+        h_shared = self.ema_net._encode_shared(x=tgt_weak)
+        self.net.update_target_center(h_shared, momentum=self.target_center_momentum)
+        self.ema_net.update_target_center(h_shared, momentum=self.target_center_momentum)
+        _, aux = self._forward_logits(
+            self.ema_net,
+            h_shared=h_shared,
+            use_target_center=True,
+        )
+        classifier_probs = aux["class_probs"]
+        node_mass = classifier_probs.unsqueeze(-1) * aux["domain_weights"]
+        weight_class_probs = (
+            aux["prototype_class_probs"]
+            if self.consistency_target == "class_only"
+            else classifier_probs
+        )
+        conf = weight_class_probs.max(dim=1).values.detach()
         guide = {
-            "class_probs": aux["class_probs"].detach(),
-            "node_mass": aux["node_mass"].detach(),
-            "confusion_profile": aux["confusion_profile"].detach(),
+            "class_probs": weight_class_probs.detach(),
+            "prototype_class_probs": aux["prototype_class_probs"].detach(),
+            "domain_weights": aux["domain_weights"].detach(),
+            "node_mass": node_mass.detach(),
         }
         return conf, guide
 
     def forward_for_eval(self, imgs: torch.Tensor) -> torch.Tensor:
-        self.ema_net.eval()
+        model = self.ema_net
+        model.eval()
         if isinstance(imgs, (tuple, list)):
             imgs = imgs[0]
         with torch.no_grad():
-            logits, _ = self._forward_logits(self.ema_net, x=imgs)
+            logits, _ = self._forward_logits(
+                model,
+                x=imgs,
+                use_target_center=True,
+            )
             return logits
 
     @torch.no_grad()
     def _sync_relation_buffers_to_ema(self):
-        for name in ["src_prototypes", "src_proto_inited", "src_classifier_confusion"]:
+        for name in ["src_prototypes", "src_proto_inited", "src_domain_centers", "src_domain_center_inited"]:
             getattr(self.ema_net.relation_router, name).copy_(getattr(self.net.relation_router, name))
+
+    @torch.no_grad()
+    def _sync_classifier_initialization_to_ema(self):
+        self.ema_net.adaptive_classifier.weight.copy_(self.net.adaptive_classifier.weight)
 
     def _build_optimizer(self):
         base_lr = float(self.config.method.lr)
@@ -713,6 +631,7 @@ class DCPRSolver(BaseSolver):
             {"params": list(self.net.backbone.parameters()), "lr": base_lr * 0.1},
             {"params": list(self.net.bottleneck.parameters()), "lr": base_lr},
             {"params": list(self.net.feature_norm.parameters()), "lr": base_lr},
+            {"params": list(self.net.adaptive_classifier.parameters()), "lr": base_lr},
             {"params": list(self.net.relation_router.parameters()), "lr": base_lr},
         ]
         param_groups = [group for group in param_groups if len(group["params"]) > 0]
@@ -794,7 +713,9 @@ class DCPRSolver(BaseSolver):
             "pin_memory": bool(getattr(self.source_loader, "pin_memory", False)),
         }
         if kwargs["num_workers"] > 0:
-            kwargs["persistent_workers"] = self.prototype_persistent_workers
+            # This loader is recreated for each prototype refresh, so persistent
+            # workers would outlive the temporary loader and delay process exit.
+            kwargs["persistent_workers"] = False
             kwargs["prefetch_factor"] = self.prototype_prefetch_factor
         return DataLoader(self.source_loader.dataset, **kwargs)
 
@@ -823,7 +744,7 @@ class DCPRSolver(BaseSolver):
             prefetcher.close()
 
     def _compute_source_prototypes(self, model: DCPRNetwork, prototype_loader):
-        """Single-pass: compute per-class prototypes and classifier confusion."""
+        """Single-pass source prototype refresh."""
         feat_sums = torch.zeros(
             self.num_source_domains,
             self.num_classes,
@@ -835,15 +756,17 @@ class DCPRSolver(BaseSolver):
             self.num_classes,
             device=self.device,
         )
-        confusion = torch.zeros(
+        domain_sums = torch.zeros(
             self.num_source_domains,
-            self.num_classes,
-            self.num_classes,
+            model.relation_feat_dim,
+            device=self.device,
+        )
+        domain_counts = torch.zeros(
+            self.num_source_domains,
             device=self.device,
         )
         feat_sums_flat = feat_sums.view(-1, model.relation_feat_dim)
         counts_flat = counts.view(-1)
-        confusion_flat = confusion.view(-1, self.num_classes)
 
         for src_imgs, src_labels, src_dom in prototype_loader:
             src_imgs = self._to_device(src_imgs)
@@ -853,8 +776,6 @@ class DCPRSolver(BaseSolver):
             with self._auto_cast():
                 h = model.extract_relation_features(src_imgs)
                 h_shared = model.normalize_relation_features(h)
-                logits, _ = self._forward_logits(model, h_shared=h_shared)
-                probs = torch.softmax(logits, dim=1)
 
             flat_index = src_dom.long() * self.num_classes + src_labels.long()
             # Sort by flat_index so index_add_ writes are coalesced on CUDA.
@@ -863,71 +784,28 @@ class DCPRSolver(BaseSolver):
             feat_sums_flat.index_add_(0, flat_index_sorted, h_shared[order])
             ones = torch.ones(flat_index_sorted.size(0), dtype=counts_flat.dtype, device=self.device)
             counts_flat.index_add_(0, flat_index_sorted, ones)
-            confusion_flat.index_add_(0, flat_index_sorted, probs[order])
+            domain_order = src_dom.long().argsort()
+            domain_sorted = src_dom.long()[domain_order]
+            domain_sums.index_add_(0, domain_sorted, h_shared[domain_order])
+            domain_counts.index_add_(
+                0,
+                domain_sorted,
+                torch.ones(domain_sorted.size(0), dtype=domain_counts.dtype, device=self.device),
+            )
 
         valid = counts > 0
         safe_counts = counts.clamp_min(1.0).unsqueeze(-1)
         prototypes = feat_sums / safe_counts
         prototypes = torch.where(valid.unsqueeze(-1), prototypes, torch.zeros_like(prototypes))
+        domain_valid = domain_counts > 0
+        domain_centers = domain_sums / domain_counts.clamp_min(1.0).unsqueeze(1)
+        domain_centers = torch.where(
+            domain_valid.unsqueeze(1),
+            domain_centers,
+            torch.zeros_like(domain_centers),
+        )
 
-        eye = torch.eye(self.num_classes, device=self.device).unsqueeze(0)
-        confusion_scores = confusion * (1.0 - eye)
-        confusion = confusion_scores / confusion_scores.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        confusion = torch.where(valid.unsqueeze(-1), confusion, torch.zeros_like(confusion))
-
-        if self.prototype_granularity in {"class", "shared", "shared_class"}:
-            class_counts = counts.sum(dim=0)
-            class_feat_sums = feat_sums.sum(dim=0)
-            class_valid = class_counts > 0
-            class_prototypes = class_feat_sums / class_counts.clamp_min(1.0).unsqueeze(-1)
-            class_prototypes = torch.where(
-                class_valid.unsqueeze(-1),
-                class_prototypes,
-                torch.zeros_like(class_prototypes),
-            )
-            shared_prototypes = torch.zeros_like(prototypes)
-            shared_valid = torch.zeros_like(valid)
-            shared_prototypes[0] = class_prototypes
-            shared_valid[0] = class_valid
-
-            class_confusion_scores = confusion_scores.sum(dim=0)
-            class_confusion = (
-                class_confusion_scores
-                / class_confusion_scores.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-            )
-            class_confusion = torch.where(
-                class_valid.unsqueeze(-1),
-                class_confusion,
-                torch.zeros_like(class_confusion),
-            )
-            shared_confusion = torch.zeros_like(confusion)
-            shared_confusion[0] = class_confusion
-
-            prototypes = shared_prototypes
-            valid = shared_valid
-            confusion = shared_confusion
-        elif self.prototype_granularity == "domain_class":
-            pass
-        else:
-            raise ValueError(
-                f"Unsupported DCPR prototype_granularity={self.prototype_granularity}. "
-                "Expected domain_class or shared_class."
-            )
-
-        if self.ambiguity_source == "random":
-            random_scores = torch.rand_like(confusion)
-            random_scores = random_scores * (1.0 - eye)
-            confusion = torch.where(valid.unsqueeze(-1), random_scores, torch.zeros_like(random_scores))
-            confusion = confusion / confusion.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        elif self.ambiguity_source in {"domain_class", "global", "uniform"}:
-            pass
-        else:
-            raise ValueError(
-                f"Unsupported DCPR ambiguity_source={self.ambiguity_source}. "
-                "Expected domain_class, global, uniform, or random."
-            )
-
-        return valid, prototypes, confusion
+        return valid, prototypes, domain_valid, domain_centers
 
     def _recompute_source_prototypes(self, model: DCPRNetwork):
         with torch.inference_mode():
@@ -937,21 +815,66 @@ class DCPRSolver(BaseSolver):
             with self._prototype_source_iter() as prototype_loader:
                 batch_iter = self._iter_prototype_source_batches(prototype_loader)
                 started_at = time.time()
-                valid, prototypes, confusion = self._compute_source_prototypes(model, batch_iter)
+                valid, prototypes, domain_valid, domain_centers = self._compute_source_prototypes(model, batch_iter)
                 elapsed_minutes = (time.time() - started_at) / 60.0
 
                 model.reset_source_prototypes()
                 model.relation_router.src_proto_inited.copy_(valid)
                 model.relation_router.src_prototypes.copy_(prototypes)
-                model.relation_router.src_classifier_confusion.copy_(confusion)
+                model.relation_router.src_domain_center_inited.copy_(domain_valid)
+                model.relation_router.src_domain_centers.copy_(domain_centers)
+                self._update_class_ambiguity(model, valid, prototypes)
                 logger.info(
                     "DCPR source prototype refresh | proto_bs=%d single_pass "
-                    "elapsed_min=%.2f",
+                    "elapsed_min=%.2f amb_mean=%.3f amb_max=%.3f",
                     self.prototype_batch_size,
                     elapsed_minutes,
+                    float(self.class_ambiguity_weights.mean().item()),
+                    float(self.class_ambiguity_weights.max().item()),
                 )
 
             model.train(was_training)
+
+    @torch.no_grad()
+    def _update_class_ambiguity(
+        self,
+        model: DCPRNetwork,
+        valid: torch.Tensor,
+        prototypes: torch.Tensor,
+    ):
+        weights = valid.float().unsqueeze(-1)
+        class_counts = weights.sum(dim=0).clamp_min(1.0)
+        class_proto = (prototypes * weights).sum(dim=0) / class_counts
+        class_valid = valid.any(dim=0)
+        valid_indices = class_valid.nonzero(as_tuple=False).flatten()
+        ambiguity = torch.zeros(self.num_classes, device=prototypes.device)
+
+        if valid_indices.numel() > 1:
+            logits = model._adaptive_logits(class_proto[valid_indices])
+            logits = logits[:, valid_indices]
+            row = torch.arange(valid_indices.numel(), device=prototypes.device)
+            correct = logits[row, row]
+            wrong_logits = logits.clone()
+            wrong_logits[row, row] = -torch.inf
+            margins = correct - wrong_logits.max(dim=1).values
+
+            # Lowest classifier margin is most ambiguous. Rank normalization
+            # keeps the weighting scale stable as the class count changes.
+            order = margins.argsort(descending=False, stable=True)
+            ranked = torch.linspace(
+                1.0,
+                0.0,
+                steps=valid_indices.numel(),
+                device=prototypes.device,
+                dtype=prototypes.dtype,
+            )
+            valid_ambiguity = torch.empty_like(ranked)
+            valid_ambiguity[order] = ranked
+            ambiguity[valid_indices] = valid_ambiguity
+
+        self.class_ambiguity_weights.copy_(
+            torch.where(class_valid, ambiguity, torch.zeros_like(ambiguity))
+        )
 
     def _train_step(
         self,
@@ -959,57 +882,57 @@ class DCPRSolver(BaseSolver):
         scheduler,
         src_batch,
         tgt_batch,
-        ramp: float,
-        consistency_ramp: float,
-        global_step: int,
-        total_iters: int,
+        relation_ramp: float,
+        ema_decay: float,
     ):
-        src_imgs, src_labels, _ = src_batch
+        src_imgs, src_labels, src_dom = src_batch
         tgt_weak, tgt_strong = tgt_batch if tgt_batch is not None else (None, None)
 
         self._zero_grad(optimizer)
 
-        loss_rnode = torch.zeros((), device=self.device, dtype=torch.float32)
-        loss_rconf = torch.zeros((), device=self.device, dtype=torch.float32)
+        loss_rel = torch.zeros((), device=self.device, dtype=torch.float32)
         conf_tgt = torch.zeros((), device=self.device, dtype=torch.float32)
 
         with self._auto_cast():
-            logits_src, _ = self._forward_logits(self.net, x=src_imgs)
+            logits_src, _ = self._forward_logits(
+                self.net, x=src_imgs, domain_ids=src_dom,
+            )
             self._probe_amp_tensor(logits_src, "dcpr/logits_src", warn_on_float32=False)
             loss_src = self.criterion_task(logits_src, src_labels)
             loss = loss_src
 
             if tgt_weak is not None and tgt_strong is not None:
-                _, tgt_aux = self._forward_logits(self.net, x=tgt_strong)
                 with torch.no_grad():
                     with self._auto_cast():
                         conf_tgt, teacher_aux = self._teacher_guidance(tgt_weak)
 
-                rel_weights = conf_tgt.pow(self.consistency_conf_power)
-                loss_rnode, loss_rconf = self._relation_consistency_loss(
-                    tgt_aux,
-                    teacher_aux,
-                    rel_weights,
+                _, tgt_aux = self._forward_logits(
+                    self.net,
+                    x=tgt_strong,
+                    use_target_center=True,
                 )
-                consistency_loss = self.lambda_relation_consistency * (
-                    self.lambda_rel_consistency_node * loss_rnode
-                    + self.lambda_rel_consistency_conf * loss_rconf
-                )
-                loss = loss + ramp * consistency_ramp * consistency_loss
+
+                if self.lambda_relation_consistency > 0.0:
+                    rel_weights = conf_tgt.pow(self.consistency_conf_power)
+                    rel_weights = rel_weights * self._ambiguity_sample_weights(
+                        teacher_aux["class_probs"]
+                    )
+                    loss_rel = self._relation_consistency_loss(
+                        tgt_aux,
+                        teacher_aux,
+                        rel_weights,
+                    )
+                    loss = loss + relation_ramp * self.lambda_relation_consistency * loss_rel
 
         self._optimizer_step_with_optional_clip(
-            loss,
-            optimizer,
-            clip_params=self.net.parameters(),
-            clip_max_norm=self.grad_clip,
+            loss, optimizer, clip_params=self.net.parameters(), clip_max_norm=self.grad_clip,
         )
         scheduler.step()
-        self._update_ema(self._ema_decay_at(global_step, total_iters))
+        self._update_ema(ema_decay)
 
         metrics = {
             "src": loss_src.detach().float(),
-            "rnode": loss_rnode.detach().float(),
-            "rconf": loss_rconf.detach().float(),
+            "rel": loss_rel.detach().float(),
             "conf": conf_tgt.detach().mean().float() if conf_tgt.ndim > 0 else conf_tgt.detach().float(),
             "total": loss.detach().float(),
         }
@@ -1021,16 +944,11 @@ class DCPRSolver(BaseSolver):
         scheduler,
         epoch_steps: int,
         uses_target_loader: bool,
-        ramp: float,
-        consistency_ramp: float,
+        relation_ramp: float,
         global_step: int,
-        total_iters: int,
     ):
-        metric_keys = ("src", "rnode", "rconf", "conf", "total")
-        metric_sums = {
-            key: torch.zeros((), device=self.device, dtype=torch.float32)
-            for key in metric_keys
-        }
+        metric_keys = ("src", "rel", "conf", "total")
+        metric_sums = {key: torch.zeros((), device=self.device, dtype=torch.float32) for key in metric_keys}
 
         src_prefetcher, tgt_prefetcher = self._create_prefetchers(uses_target_loader)
 
@@ -1038,14 +956,10 @@ class DCPRSolver(BaseSolver):
             src_batch = src_prefetcher.pop()
             tgt_batch = tgt_prefetcher.pop() if tgt_prefetcher is not None else None
             step_metrics = self._train_step(
-                optimizer=optimizer,
-                scheduler=scheduler,
-                src_batch=src_batch,
-                tgt_batch=tgt_batch,
-                ramp=ramp,
-                consistency_ramp=consistency_ramp,
-                global_step=global_step,
-                total_iters=total_iters,
+                optimizer=optimizer, scheduler=scheduler,
+                src_batch=src_batch, tgt_batch=tgt_batch,
+                relation_ramp=relation_ramp,
+                ema_decay=self._ema_decay_at(global_step, self._total_iters),
             )
             global_step += 1
             for key, value in step_metrics.items():
@@ -1061,11 +975,7 @@ class DCPRSolver(BaseSolver):
 
     def save_checkpoint(self, path):
         self._save_named_modules_checkpoint(
-            path,
-            modules={
-                "student": self.net,
-                "ema": self.ema_net,
-            },
+            path, modules={"student": self.net, "ema": self.ema_net},
         )
 
     def load_checkpoint(self, path):
@@ -1082,11 +992,21 @@ class DCPRSolver(BaseSolver):
             self.relation_temperature = float(self.ema_net.relation_router.relation_temperature.item())
         logger.info("%s checkpoint loaded from %s", self._solver_display_name(), path)
 
+    def extra_training_state_dict(self) -> dict[str, Any]:
+        return {
+            "relation_temperature": self.relation_temperature,
+        }
+
+    def load_extra_training_state_dict(self, state: Mapping[str, Any]) -> None:
+        if "relation_temperature" in state:
+            self._set_relation_temperature(float(state["relation_temperature"]))
+
     def train(self):
         self._save_start_epoch = int(self.save_ckpt_after_epoch)
         optimizer = self._build_optimizer()
         epoch_steps = self._resolve_epoch_steps()
         total_iters = self.total_epochs * epoch_steps
+        self._total_iters = total_iters
         scheduler = self._build_scheduler(optimizer, total_iters)
         self.register_training_state(optimizer=optimizer, scheduler=scheduler)
         self._setup_compiled_student_forward()
@@ -1095,12 +1015,11 @@ class DCPRSolver(BaseSolver):
 
         global_step = self._training_global_step
         logger.info(
-            "DCPR Training(mainline): epoch_steps=max source_steps=%d target_steps=%d "
-            "epoch_steps=%d use_target=%s",
-            len(self.source_loader),
-            len(self.target_loader),
-            epoch_steps,
-            str(uses_target_loader),
+            "DCPR Training: source_steps=%d target_steps=%d epoch_steps=%d "
+            "use_target=%s lambda_rel=%.2f rel_space=%s",
+            len(self.source_loader), len(self.target_loader),
+            epoch_steps, str(uses_target_loader),
+            self.lambda_relation_consistency, self.relation_space_mode,
         )
 
         for epoch in self._epoch_range(self.total_epochs):
@@ -1110,19 +1029,17 @@ class DCPRSolver(BaseSolver):
             if self.refresh_source_prototypes_each_epoch or epoch == 0:
                 self._recompute_source_prototypes(self.net)
                 self._sync_relation_buffers_to_ema()
+                if epoch == 0:
+                    self._sync_classifier_initialization_to_ema()
 
             self.net.train()
             ramp = min(1.0, (epoch + 1) / max(1.0, self.ramp_denom))
             consistency_ramp = 1.0 if (epoch + 1) >= self.consistency_start_epoch else 0.0
             metrics, global_step = self._run_train_epoch(
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch_steps=epoch_steps,
-                uses_target_loader=uses_target_loader,
-                ramp=ramp,
-                consistency_ramp=consistency_ramp,
+                optimizer=optimizer, scheduler=scheduler,
+                epoch_steps=epoch_steps, uses_target_loader=uses_target_loader,
+                relation_ramp=ramp * consistency_ramp,
                 global_step=global_step,
-                total_iters=total_iters,
             )
 
             acc = self.evaluate()
@@ -1131,12 +1048,10 @@ class DCPRSolver(BaseSolver):
             self._maybe_save_best(acc, epoch + 1)
 
             self._log_epoch_summary(
-                epoch + 1,
-                self.total_epochs,
+                epoch + 1, self.total_epochs,
                 metrics={
                     "src": metrics["src"],
-                    "rnode": metrics["rnode"],
-                    "rconf": metrics["rconf"],
+                    "rel": metrics["rel"],
                     "conf": (metrics["conf"], ".3f"),
                     "total": metrics["total"],
                 },
@@ -1145,9 +1060,7 @@ class DCPRSolver(BaseSolver):
                     "crmp": (consistency_ramp, ".2f"),
                     "tmp": (current_temperature, ".3f"),
                 },
-                score=acc,
-                best_score=best_acc,
-                score_name="Acc",
+                score=acc, best_score=best_acc, score_name="Acc",
             )
 
         if self._load_best_checkpoint_if_available():

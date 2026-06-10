@@ -10,7 +10,7 @@ from sklearn.mixture import GaussianMixture, BayesianGaussianMixture
 from methods.registry import register_solver
 from methods.base_solver import BaseSolver
 from models.backbones import get_backbone
-from utils import AverageMeter, configure_faiss_runtime, cycle
+from utils import GpuLossAccumulator, configure_faiss_runtime, cycle
 
 logger = logging.getLogger(__name__)
 
@@ -465,7 +465,7 @@ class RTDASolver(BaseSolver):
             src_iter = cycle(self.source_loader)
             tgt_iter = cycle(self.target_loader)
             
-            loss_meter = AverageMeter()
+            acc_meter = GpuLossAccumulator(device=self.device)
             
             with Accumulator(['pred_s', 'pred_t', 'label_s', 'kl', 'fss', 'ftt']) as ProbRecorder:
                 for i in range(max_len):
@@ -551,7 +551,8 @@ class RTDASolver(BaseSolver):
                             loss = ce + 0.01 * virtual_ce + 0.3 * adv_loss + entropy + ce_ep 
                         loss.backward()
                         
-                    loss_meter.update(loss.item())
+                    acc_meter.update("loss", loss)
+                    acc_meter.step()
 
             # Evaluate at the end of epoch
             acc = self.evaluate()
@@ -562,7 +563,7 @@ class RTDASolver(BaseSolver):
             self._log_epoch_summary(
                 epoch + 1,
                 max_epochs,
-                metrics={"loss": loss_meter.avg},
+                metrics=acc_meter.compute(),
                 score=acc,
                 best_score=best_hos,
                 score_name="Score",

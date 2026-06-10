@@ -52,7 +52,7 @@ results/                  # Hydra run outputs
 scripts/                  # local helper scripts
 ```
 
-Registered solvers are `cad`, `cosda`, `dare`, `dcfm`, `dcpr`, `dcpr_alt`, `factda`, `mic`, `ros`, `rtda`, `rvtc`, and `sourceonly`.
+Registered solvers are `cad`, `cosda`, `dare`, `dcfm`, `dcpr`, `factda`, `mic`, `ros`, `rtda`, `rvtc`, and `sourceonly`.
 
 ## Setup
 
@@ -101,6 +101,23 @@ MSDA example:
 python src/main.py dataset=image-clef method=dcpr dataset.sources='[b,c,i]' dataset.target=p exp_name=dcpr_imageclef_bci_to_p
 ```
 
+### DCPR
+
+DCPR uses one shared cosine classifier for source supervision and target
+prediction. Source domain-class prototypes define the target relation
+distribution matched between an EMA teacher's weak view and the student's
+strong view. Classifier-margin ranks upweight ambiguous classes without adding
+another target loss.
+
+The default config is the full method. Its retained ablations are:
+- A1: set `method.lambda_relation_consistency=0`
+- A2: set `method.ambiguity_relation_boost=0`
+- A4: set `method.consistency_target=classification` and disable ambiguity
+- A5: set `method.consistency_target=class_only`
+
+`method.bottleneck_dim=0` uses normalized backbone features directly; a positive
+value enables the same objective with a learned bottleneck.
+
 Useful override examples:
 
 ```bash
@@ -130,7 +147,7 @@ torchrun --standalone --nproc-per-node=2 src/main.py \
 
 Distributed training currently supports `sourceonly`, `mic`, `rvtc`, `factda`,
 `dcfm`, `ros`, and `cad`. Methods with global prototype or memory state
-(`cosda`, `rtda`, `dare`, `dcpr`, `dcpr_alt`) fail fast instead of silently
+(`cosda`, `rtda`, `dare`, `dcpr`) fail fast instead of silently
 changing their algorithm semantics.
 
 Hydra writes each run under:

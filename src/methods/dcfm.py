@@ -30,7 +30,7 @@ import torch.optim as optim
 from methods.base_solver import BaseSolver
 from methods.registry import register_solver
 from models.backbones import get_backbone
-from utils import AverageMeter, cycle
+from utils import GpuLossAccumulator, cycle
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +264,7 @@ class DCFMSolver(BaseSolver):
         logger.info("=== Stage 1: Source Warmup ===")
         for epoch in self._epoch_range(warmup_epochs):
             self.net.train()
-            meters = {k: AverageMeter() for k in ['task', 'domain', 'total']}
+            acc_meter = GpuLossAccumulator(device=self.device)
             tgt_iter = cycle(self.target_loader)
 
             for src_imgs, src_labels in self.source_loader:
@@ -308,23 +308,20 @@ class DCFMSolver(BaseSolver):
                 )
                 scheduler.step()
 
-                meters['task'].update(loss_task.item())
-                meters['domain'].update(loss_domain.item())
-                meters['total'].update(loss.item())
+                acc_meter.update("task", loss_task)
+                acc_meter.update("domain", loss_domain)
+                acc_meter.update("total", loss)
+                acc_meter.step()
 
-            acc = self.evaluate()
-            if acc > best_acc:
-                best_acc = acc
-            self._maybe_save_best(acc, epoch + 1)
+            acc_val = self.evaluate()
+            if acc_val > best_acc:
+                best_acc = acc_val
+            self._maybe_save_best(acc_val, epoch + 1)
             self._log_epoch_summary(
                 epoch + 1,
                 warmup_epochs,
-                metrics={
-                    "task": meters["task"].avg,
-                    "dom": meters["domain"].avg,
-                    "total": meters["total"].avg,
-                },
-                score=acc,
+                metrics=acc_meter.compute(),
+                score=acc_val,
                 best_score=best_acc,
                 score_name="Acc",
                 prefix="DCFM Warmup",
@@ -334,7 +331,7 @@ class DCFMSolver(BaseSolver):
         logger.info("=== Stage 2: Joint Training with Feature Hallucination & IM ===")
         for epoch in self._epoch_range(max_epochs, offset=warmup_epochs):
             self.net.train()
-            meters = {k: AverageMeter() for k in ['task', 'domain', 'im', 'cf', 'total']}
+            acc_meter = GpuLossAccumulator(device=self.device)
             tgt_iter = cycle(self.target_loader)
 
             # Gradually ramp up IM and CF loss to prevent early disruption
@@ -423,28 +420,23 @@ class DCFMSolver(BaseSolver):
                 )
                 scheduler.step()
 
-                meters['task'].update(loss_task.item())
-                meters['domain'].update(loss_domain.item())
-                meters['im'].update(loss_im.item())
-                meters['cf'].update(loss_cf.item())
-                meters['total'].update(loss.item())
+                acc_meter.update("task", loss_task)
+                acc_meter.update("domain", loss_domain)
+                acc_meter.update("im", loss_im)
+                acc_meter.update("cf", loss_cf)
+                acc_meter.update("total", loss)
+                acc_meter.step()
 
-            acc = self.evaluate()
-            if acc > best_acc:
-                best_acc = acc
-            self._maybe_save_best(acc, warmup_epochs + epoch + 1)
+            acc_val = self.evaluate()
+            if acc_val > best_acc:
+                best_acc = acc_val
+            self._maybe_save_best(acc_val, warmup_epochs + epoch + 1)
             self._log_epoch_summary(
                 epoch + 1,
                 max_epochs,
-                metrics={
-                    "task": (meters["task"].avg, ".3f"),
-                    "dom": (meters["domain"].avg, ".3f"),
-                    "im": (meters["im"].avg, ".3f"),
-                    "cf": (meters["cf"].avg, ".3f"),
-                    "total": (meters["total"].avg, ".3f"),
-                },
+                metrics=acc_meter.compute(),
                 extras={"rmp": (ramp, ".2f")},
-                score=acc,
+                score=acc_val,
                 best_score=best_acc,
                 score_name="Acc",
                 prefix="DCFM Joint",

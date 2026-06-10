@@ -10,7 +10,7 @@ from torch.distributions.normal import Normal
 from methods.registry import register_solver
 from methods.base_solver import BaseSolver
 from models.backbones import get_backbone
-from utils import AverageMeter, configure_faiss_runtime, cycle
+from utils import GpuLossAccumulator, configure_faiss_runtime, cycle
 
 logger = logging.getLogger(__name__)
 
@@ -486,7 +486,7 @@ class COSDASolver(BaseSolver):
             if epoch >= warm_up_epoch:
                 all_proto, neg_proto, NUM_K = self.get_pseudo_label(new_epoch=True)
             self.net.train()
-            total_loss_meter = AverageMeter()
+            acc_meter = GpuLossAccumulator(device=self.device)
             
             src_iter = cycle(self.source_loader)
             tgt_iter = cycle(self.target_loader)
@@ -559,7 +559,8 @@ class COSDASolver(BaseSolver):
                 loss_all = sum(loss for loss in loss_dict.values())
                 self._optimizer_step_with_optional_clip(loss_all, optimizer)
                 
-                total_loss_meter.update(loss_all.item())
+                acc_meter.update("loss", loss_all)
+                acc_meter.step()
                 
             acc = self.evaluate()
             if acc > best_acc:
@@ -568,7 +569,7 @@ class COSDASolver(BaseSolver):
             self._log_epoch_summary(
                 epoch + 1,
                 max_epochs,
-                metrics={"loss": total_loss_meter.avg},
+                metrics=acc_meter.compute(),
                 score=acc,
                 best_score=best_acc,
                 score_name="Score",

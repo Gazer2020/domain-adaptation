@@ -24,7 +24,7 @@ import torch.optim as optim
 from methods.base_solver import BaseSolver
 from methods.registry import register_solver
 from models.backbones import get_backbone
-from utils import AverageMeter, cycle
+from utils import GpuLossAccumulator, cycle
 
 logger = logging.getLogger(__name__)
 
@@ -540,10 +540,7 @@ class DARESolver(BaseSolver):
                 self.ema_net.src_proto_inited.copy_(self.net.src_proto_inited)
 
             self.net.train()
-            meters = {
-                key: AverageMeter()
-                for key in ["task", "rel", "proto", "pseudo", "conf", "pwt", "rmax", "dlogit", "total"]
-            }
+            acc_meter = GpuLossAccumulator(device=self.device)
             src_iter = cycle(self.source_loader)
             tgt_iter = cycle(self.target_loader)
             ramp = min(1.0, (epoch + 1) / max(1.0, self.ramp_denom))
@@ -632,41 +629,43 @@ class DARESolver(BaseSolver):
                         torch.arange(src_labels.size(0), device=self.device),
                         src_labels,
                     ]
-                    rmax_value = src_true_rel.max(dim=1).values.mean().item()
+                    rmax_value = src_true_rel.max(dim=1).values.mean().detach()
                 else:
                     rmax_value = 0.0
-                meters["task"].update(loss_task.item())
-                meters["rel"].update(loss_rel.item())
-                meters["proto"].update(loss_proto.item())
-                meters["pseudo"].update(loss_pseudo.item())
-                meters["conf"].update(conf_tgt.mean().item())
-                meters["pwt"].update(pseudo_loss_weights.mean().item())
-                meters["rmax"].update(rmax_value)
-                meters["dlogit"].update(tgt_aux["delta_logits"].abs().mean().item())
-                meters["total"].update(loss.item())
+                acc_meter.update("task", loss_task)
+                acc_meter.update("rel", loss_rel)
+                acc_meter.update("proto", loss_proto)
+                acc_meter.update("pseudo", loss_pseudo)
+                acc_meter.update("conf", conf_tgt.mean())
+                acc_meter.update("pwt", pseudo_loss_weights.mean())
+                acc_meter.update("rmax", rmax_value)
+                acc_meter.update("dlogit", tgt_aux["delta_logits"].abs().mean())
+                acc_meter.update("total", loss)
+                acc_meter.step()
 
-            acc = self.evaluate()
-            if acc > best_acc:
-                best_acc = acc
+            acc_val = self.evaluate()
+            if acc_val > best_acc:
+                best_acc = acc_val
             if epoch + 1 > self.save_ckpt_after_epoch:
-                self._maybe_save_best(acc, epoch + 1)
+                self._maybe_save_best(acc_val, epoch + 1)
 
+            computed = acc_meter.compute()
             self._log_epoch_summary(
                 epoch + 1,
                 self.total_epochs,
                 metrics={
-                    "task": meters["task"].avg,
-                    "rel": meters["rel"].avg,
-                    "proto": meters["proto"].avg,
-                    "pseudo": meters["pseudo"].avg,
-                    "qconf": (meters["conf"].avg, ".3f"),
-                    "pwt": (meters["pwt"].avg, ".3f"),
-                    "rmax": (meters["rmax"].avg, ".3f"),
-                    "dlogit": meters["dlogit"].avg,
-                    "total": meters["total"].avg,
+                    "task": computed.get("task", 0),
+                    "rel": computed.get("rel", 0),
+                    "proto": computed.get("proto", 0),
+                    "pseudo": computed.get("pseudo", 0),
+                    "qconf": (computed.get("conf", 0), ".3f"),
+                    "pwt": (computed.get("pwt", 0), ".3f"),
+                    "rmax": (computed.get("rmax", 0), ".3f"),
+                    "dlogit": computed.get("dlogit", 0),
+                    "total": computed.get("total", 0),
                 },
                 extras={"rmp": (ramp, ".2f")},
-                score=acc,
+                score=acc_val,
                 best_score=best_acc,
                 score_name="Acc",
             )

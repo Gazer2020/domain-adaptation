@@ -19,7 +19,7 @@ from torchvision.models import ResNet50_Weights, resnet50
 from methods.base_solver import BaseSolver
 from methods.registry import register_solver
 from models.rvtc_head import KinematicHeadV2
-from utils import AverageMeter, cycle
+from utils import GpuLossAccumulator, cycle
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +194,7 @@ class RVTCSolver(BaseSolver):
 
         for epoch in self._epoch_range(max_epochs):
             self.net.train()
-            meters = {k: AverageMeter() for k in ["task", "kin_s", "kin_t", "ent", "total"]}
+            acc_meter = GpuLossAccumulator(device=self.device)
             tgt_iter = cycle(self.target_loader)
             w_kin = min(1.0, (epoch + 1) / self.kin_ramp_denom) * self.lambda_kin
             w_ent = min(1.0, (epoch + 1) / self.ent_ramp_denom) * self.lambda_ent
@@ -208,6 +208,10 @@ class RVTCSolver(BaseSolver):
 
                 self._zero_grad(optimizer)
 
+                kin_t_val = 0.0
+                kin_s_val = 0.0
+                ent_t_val = 0.0
+
                 with self._auto_cast():
                     logits_s, kin_s = self.net(src_imgs, is_source=True, return_kinematic=True)
                     logits_t, kin_t = self.net(tgt_imgs, is_source=False, return_kinematic=True)
@@ -217,22 +221,15 @@ class RVTCSolver(BaseSolver):
 
                     if w_kin > 0:
                         loss = loss + w_kin * kin_t
-                        meters["kin_t"].update(kin_t.item())
+                        kin_t_val = kin_t.detach()
                         if self.kin_on_source:
                             loss = loss + w_kin * kin_s
-                            meters["kin_s"].update(kin_s.item())
-                        else:
-                            meters["kin_s"].update(0.0)
-                    else:
-                        meters["kin_t"].update(0.0)
-                        meters["kin_s"].update(0.0)
+                            kin_s_val = kin_s.detach()
 
                     if w_ent > 0:
                         ent_t = _entropy_minimization(logits_t)
                         loss = loss + w_ent * ent_t
-                        meters["ent"].update(ent_t.item())
-                    else:
-                        meters["ent"].update(0.0)
+                        ent_t_val = ent_t.detach()
 
                 self._optimizer_step_with_optional_clip(
                     loss,
@@ -243,27 +240,26 @@ class RVTCSolver(BaseSolver):
                 scheduler.step()
                 global_step += 1
 
-                meters["task"].update(loss_task.item())
-                meters["total"].update(loss.item())
+                acc_meter.update("kin_t", kin_t_val)
+                acc_meter.update("kin_s", kin_s_val)
+                acc_meter.update("ent", ent_t_val)
+                acc_meter.update("task", loss_task)
+                acc_meter.update("total", loss)
+                acc_meter.step()
 
-            acc = self.evaluate()
-            if acc > best_acc:
-                best_acc = acc
-            self._maybe_save_best(acc, epoch + 1)
+            acc_val = self.evaluate()
+            if acc_val > best_acc:
+                best_acc = acc_val
+            self._maybe_save_best(acc_val, epoch + 1)
             self._log_epoch_summary(
                 epoch + 1,
                 max_epochs,
-                metrics={
-                    "task": meters["task"].avg,
-                    "kin_s": meters["kin_s"].avg,
-                    "kin_t": meters["kin_t"].avg,
-                    "ent": meters["ent"].avg,
-                },
+                metrics=acc_meter.compute(),
                 extras={
                     "w_kin": w_kin,
                     "w_ent": w_ent,
                 },
-                score=acc,
+                score=acc_val,
                 best_score=best_acc,
                 score_name="Acc",
             )

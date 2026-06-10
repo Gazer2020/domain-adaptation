@@ -895,11 +895,11 @@ class SourceOnlySolver(BaseSolver):
     def train(self):
         """Train on source domain only."""
         import torch.optim as optim
-        from utils import AverageMeter
-        
+        from utils import GpuLossAccumulator
+
         max_epochs = self.config.method.epochs
         lr = self.config.method.lr
-        
+
         optimizer = optim.SGD(
             self.net.parameters(),
             lr=lr,
@@ -907,14 +907,14 @@ class SourceOnlySolver(BaseSolver):
             weight_decay=5e-4
         )
         self.register_training_state(optimizer=optimizer)
-        
+
         logger.info("%s training | epochs=%d", self._solver_display_name(), max_epochs)
         best_acc = self._best_metric
-        
+
         for epoch in self._epoch_range(max_epochs):
             self.net.train()
-            loss_meter = AverageMeter()
-            
+            acc = GpuLossAccumulator(device=self.device)
+
             for batch in self.source_loader:
                 if isinstance(batch, (tuple, list)) and len(batch) >= 2:
                     src_imgs, src_labels = batch[0], batch[1]
@@ -922,24 +922,25 @@ class SourceOnlySolver(BaseSolver):
                     raise ValueError("Source-only solver expects source batches to provide at least images and labels")
                 src_imgs = self._to_device(src_imgs)
                 src_labels = self._to_device(src_labels)
-                
+
                 self._zero_grad(optimizer)
                 with self._auto_cast():
                     logits = self.net(src_imgs)
                     loss = self.criterion(logits, src_labels)
                 self._optimizer_step_with_optional_clip(loss, optimizer)
-                
-                loss_meter.update(loss.item())
-            
-            acc = self.evaluate()
-            if acc > best_acc:
-                best_acc = acc
-            self._maybe_save_best(acc, epoch + 1)
+
+                acc.update("loss", loss)
+                acc.step()
+
+            acc_val = self.evaluate()
+            if acc_val > best_acc:
+                best_acc = acc_val
+            self._maybe_save_best(acc_val, epoch + 1)
             self._log_epoch_summary(
                 epoch + 1,
                 max_epochs,
-                metrics={"loss": loss_meter.avg},
-                score=acc,
+                metrics=acc.compute(),
+                score=acc_val,
                 best_score=best_acc,
                 score_name="Acc",
             )

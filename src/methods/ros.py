@@ -15,7 +15,7 @@ from methods.registry import register_solver
 from methods.base_solver import BaseSolver
 from models.backbones import get_backbone
 from models.heads import RotationHead, SemanticHead
-from utils import AverageMeter, cycle
+from utils import GpuLossAccumulator, cycle
 
 
 logger = logging.getLogger(__name__)
@@ -141,9 +141,9 @@ class RotationSolver(BaseSolver):
             self.feature_extractor.train()
             self.rotation_head.train()
 
-            loss_meter = AverageMeter()
+            acc_meter = GpuLossAccumulator(device=self.device)
             target_iter = cycle(self.target_loader)
-            
+
             for src_imgs, _ in self.source_loader:
                 self._zero_grad(self.rot_optimizer)
 
@@ -161,18 +161,19 @@ class RotationSolver(BaseSolver):
                     loss = self.criterion(rot_preds, rot_labels)
                 self._optimizer_step_with_optional_clip(loss, self.rot_optimizer)
 
-                loss_meter.update(loss.item())
+                acc_meter.update("loss", loss)
+                acc_meter.step()
 
-            acc = self.evaluate()
+            acc_val = self.evaluate()
             global_epoch += 1
-            if acc > best_acc:
-                best_acc = acc
-            self._maybe_save_best(acc, global_epoch)
+            if acc_val > best_acc:
+                best_acc = acc_val
+            self._maybe_save_best(acc_val, global_epoch)
             self._log_epoch_summary(
                 epoch + 1,
                 max_epochs,
-                metrics={"loss": loss_meter.avg},
-                score=acc,
+                metrics=acc_meter.compute(),
+                score=acc_val,
                 best_score=best_acc,
                 score_name="Acc",
                 prefix="ROS Rotation",
@@ -197,8 +198,8 @@ class RotationSolver(BaseSolver):
             self.feature_extractor.train()
             self.semantic_head.train()
 
-            loss_meter = AverageMeter()
-            
+            acc_meter = GpuLossAccumulator(device=self.device)
+
             for src_imgs, src_labels in self.source_loader:
                 self._zero_grad(self.sem_optimizer)
 
@@ -212,18 +213,19 @@ class RotationSolver(BaseSolver):
                     loss = self.criterion(sem_preds, src_labels)
                 self._optimizer_step_with_optional_clip(loss, self.sem_optimizer)
 
-                loss_meter.update(loss.item())
+                acc_meter.update("loss", loss)
+                acc_meter.step()
 
-            acc = self.evaluate()
+            acc_val = self.evaluate()
             global_epoch += 1
-            if acc > best_acc:
-                best_acc = acc
-            self._maybe_save_best(acc, global_epoch)
+            if acc_val > best_acc:
+                best_acc = acc_val
+            self._maybe_save_best(acc_val, global_epoch)
             self._log_epoch_summary(
                 epoch + 1,
                 max_epochs,
-                metrics={"loss": loss_meter.avg},
-                score=acc,
+                metrics=acc_meter.compute(),
+                score=acc_val,
                 best_score=best_acc,
                 score_name="Acc",
                 prefix="ROS Semantic",

@@ -14,7 +14,7 @@ import torch.optim as optim
 from methods.registry import register_solver
 from methods.base_solver import BaseSolver
 from models.backbones import get_backbone
-from utils import AverageMeter, cycle
+from utils import GpuLossAccumulator, cycle
 
 
 logger = logging.getLogger(__name__)
@@ -127,9 +127,7 @@ class MICSolver(BaseSolver):
             self._set_train_mode()
 
             tgt_iter = cycle(self.target_loader)
-            sem_loss_meter = AverageMeter()
-            mic_loss_meter = AverageMeter()
-            tot_loss_meter = AverageMeter()
+            acc_meter = GpuLossAccumulator(device=self.device)
 
             for src_imgs, src_labels in self.source_loader:
                 tgt_imgs, _ = next(tgt_iter)
@@ -156,23 +154,20 @@ class MICSolver(BaseSolver):
                 # Update teacher model with EMA
                 self._update_teacher_ema(ema_momentum)
 
-                sem_loss_meter.update(sem_loss.item())
-                mic_loss_meter.update(mic_loss.item())
-                tot_loss_meter.update(loss.item())
+                acc_meter.update("sem", sem_loss)
+                acc_meter.update("mic", mic_loss)
+                acc_meter.update("total", loss)
+                acc_meter.step()
 
-            acc = self.evaluate()
-            if acc > best_acc:
-                best_acc = acc
-            self._maybe_save_best(acc, epoch + 1)
+            acc_val = self.evaluate()
+            if acc_val > best_acc:
+                best_acc = acc_val
+            self._maybe_save_best(acc_val, epoch + 1)
             self._log_epoch_summary(
                 epoch + 1,
                 max_epochs,
-                metrics={
-                    "sem": sem_loss_meter.avg,
-                    "mic": mic_loss_meter.avg,
-                    "total": tot_loss_meter.avg,
-                },
-                score=acc,
+                metrics=acc_meter.compute(),
+                score=acc_val,
                 best_score=best_acc,
                 score_name="Acc",
             )

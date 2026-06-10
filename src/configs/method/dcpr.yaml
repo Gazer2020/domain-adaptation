@@ -6,28 +6,47 @@ supported_settings: [msda]
 backbone: resnet50
 epochs: 20
 lr: 0.01
-
-temperature_start: 0.15
-temperature_end: 0.10
-prototype_granularity: domain_class
-routing_mode: softmax
-routing_scope: class
-ambiguity_source: domain_class
-ambiguity_reciprocal: harmonic
-support_consistency_target: node_mass
-ambiguity_consistency: true
-consistency_start_epoch: 5
-ramp_denom: 16.0
+# Dataset-level representation choice. Set to 0 to use normalized backbone
+# features directly, or a positive width (typically 256) to enable the
+# Linear-BN-ReLU-Dropout bottleneck. This does not change the DCPR objective.
+bottleneck_dim: 0
+label_smoothing: 0.05
 save_ckpt_after_epoch: 15
+scheduler_t_max_epochs: null
+
+# Relation space:
+# - standard: compare features to absolute source domain-class prototypes.
+# - domain_relative: compare features to source class directions after
+#   subtracting each domain center. Recommended for visually distinct target
+#   domains (e.g. Clipart in Office-Home) to remove domain-level visual offsets.
+relation_space_mode: domain_relative
+
+temperature_start: 0.20
+temperature_end: 0.15
+lambda_relation_consistency: 0.15
+# relation: align the full class x source-domain relation.
+# classification (A4): align probabilities from the shared cosine classifier.
+# class_only (A5): align class probabilities induced only by source prototypes.
+# A1 sets lambda_relation_consistency=0; A2 sets ambiguity_relation_boost=0.
+consistency_target: relation
+consistency_start_epoch: 5
+consistency_conf_power: 1.0
+ramp_denom: 28.0
+grad_clip: 5.0
+ema_decay_start: 0.996
+ema_decay_end: 0.9995
+
+adaptive_head_scale: 10.0
+target_center_momentum: 0.98
+ambiguity_relation_boost: 0.50
 
 strong_aug: true
 target_aug_backend: tensor_v2
 strong_train_aug: true
 stratified_batch: true
+target_aug:
+  randaugment_num_ops: 2
+  randaugment_magnitude: 10
 
-# Source-eval batch size used only when refreshing source prototypes
-# and source classifier-confusion statistics.
+# Source-eval batch size used only when refreshing source prototypes.
 prototype_batch_size: 256
-prototype_prefetch_factor: 4
-prototype_persistent_workers: true
-prototype_cuda_prefetch: auto

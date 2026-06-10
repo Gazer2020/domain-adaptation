@@ -23,7 +23,6 @@ _SOLVER_MODULES = {
     "dare": "methods.dare",
     "rvtc": "methods.rvtc",
     "dcpr": "methods.dcpr",
-    "dcpr_alt": "methods.dcpr_alt",
 }
 
 

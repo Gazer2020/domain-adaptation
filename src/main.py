@@ -19,6 +19,7 @@ from utils import (
     log_runtime_summary,
     register_resolvers,
     set_seed,
+    shutdown_dataloader_workers,
     validate_config,
 )
 
@@ -38,6 +39,7 @@ def main(cfg: DictConfig):
     validate_config(cfg, available_solvers=available_solvers)
 
     distributed = initialize_distributed(cfg)
+    loaders = ()
     try:
         if distributed.enabled and distributed.backend == "nccl":
             with open_dict(cfg):
@@ -90,6 +92,7 @@ def main(cfg: DictConfig):
                     f"(current save_start_epoch={getattr(solver, '_save_start_epoch', 'N/A')})."
                 )
     finally:
+        shutdown_dataloader_workers(loaders)
         cleanup_distributed()
 
 

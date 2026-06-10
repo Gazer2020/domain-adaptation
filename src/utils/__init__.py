@@ -29,12 +29,14 @@ from .runtime import (
     log_dataset_summary,
     log_runtime_summary,
     set_seed,
+    shutdown_dataloader_workers,
 )
-from .utils import AverageMeter, cycle, get_device
+from .utils import AverageMeter, GpuLossAccumulator, cycle, get_device
 from .validation import validate_config
 
 __all__ = [
     "AverageMeter",
+    "GpuLossAccumulator",
     "CudaBatchPrefetcher",
     "IMAGENET_MEAN",
     "IMAGENET_STD",
@@ -59,6 +61,7 @@ __all__ = [
     "resolve_int_or_auto",
     "resolve_optional_auto_bool",
     "set_seed",
+    "shutdown_dataloader_workers",
     "synchronize_optimizer_gradients",
     "validate_config",
 ]

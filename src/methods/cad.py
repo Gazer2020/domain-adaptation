@@ -24,7 +24,7 @@ from methods.registry import register_solver
 from methods.base_solver import BaseSolver
 from models.backbones import get_backbone
 from models.heads import ChannelGatingModule, SemanticHead
-from utils import AverageMeter, cycle
+from utils import GpuLossAccumulator, cycle
 
 
 logger = logging.getLogger(__name__)
@@ -255,31 +255,32 @@ class CADSolver(BaseSolver):
         """
         for epoch in self._epoch_range(max_epochs):
             self._set_train_mode()
-            loss_meter = AverageMeter()
-            
+            acc_meter = GpuLossAccumulator(device=self.device)
+
             for src_imgs, src_labels in self.source_loader:
                 src_imgs = self._to_device(src_imgs)
                 src_labels = self._to_device(src_labels)
-                
+
                 self._zero_grad(self.optimizer)
-                
+
                 # Forward with gating
                 with self._auto_cast():
                     logits, _, _, _ = self._forward_with_gating(src_imgs)
-                
+
                     # Cross-entropy loss only
                     loss = self.criterion(logits, src_labels)
-                
+
                 self._optimizer_step_with_optional_clip(loss, self.optimizer)
-                
-                loss_meter.update(loss.item())
-            
+
+                acc_meter.update("loss", loss)
+                acc_meter.step()
+
             # Evaluate known accuracy only during pretrain
             known_acc = self._evaluate_known_accuracy()
             self._log_epoch_summary(
                 epoch + 1,
                 max_epochs,
-                metrics={"loss": loss_meter.avg},
+                metrics=acc_meter.compute(),
                 score=known_acc,
                 score_name="KnownAcc",
                 prefix="CAD Pretrain",
@@ -331,28 +332,27 @@ class CADSolver(BaseSolver):
             self._set_train_mode()
             
             tgt_iter = cycle(self.target_loader)
-            cls_loss_meter = AverageMeter()
-            struct_loss_meter = AverageMeter()
-            anomaly_loss_meter = AverageMeter()
-            
+            acc_meter = GpuLossAccumulator(device=self.device)
+
             for src_imgs, src_labels in self.source_loader:
                 tgt_imgs, _ = next(tgt_iter)
-                
+
                 src_imgs = self._to_device(src_imgs)
                 src_labels = self._to_device(src_labels)
                 tgt_imgs = self._to_device(tgt_imgs)
-                
+
                 self._zero_grad(self.optimizer)
-                
+
                 with self._auto_cast():
                     loss, loss_dict = self._compute_total_loss_terms(src_imgs, src_labels, tgt_imgs)
-                
+
                 self._optimizer_step_with_optional_clip(loss, self.optimizer)
-                
-                cls_loss_meter.update(loss_dict["cls"])
-                struct_loss_meter.update(loss_dict["struct"])
-                anomaly_loss_meter.update(loss_dict["anom"])
-            
+
+                acc_meter.update("cls", loss_dict["cls"])
+                acc_meter.update("struct", loss_dict["struct"])
+                acc_meter.update("anom", loss_dict["anom"])
+                acc_meter.step()
+
             hos = self.evaluate()
             global_epoch = epoch_offset + epoch + 1
             if hos > best_metric:
@@ -361,11 +361,7 @@ class CADSolver(BaseSolver):
             self._log_epoch_summary(
                 epoch + 1,
                 max_epochs,
-                metrics={
-                    "cls": cls_loss_meter.avg,
-                    "struct": struct_loss_meter.avg,
-                    "anom": anomaly_loss_meter.avg,
-                },
+                metrics=acc_meter.compute(),
                 score=hos,
                 best_score=best_metric,
                 score_name="Score",
@@ -403,9 +399,9 @@ class CADSolver(BaseSolver):
         loss = cls_loss + lambda_structure * structure_loss + lambda_anomaly * anomaly_loss
         
         loss_dict = {
-            "cls": cls_loss.item(),
-            "struct": structure_loss.item(),
-            "anom": anomaly_loss.item()
+            "cls": cls_loss.detach(),
+            "struct": structure_loss.detach(),
+            "anom": anomaly_loss.detach(),
         }
         
         return loss, loss_dict

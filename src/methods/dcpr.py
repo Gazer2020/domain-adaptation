@@ -15,12 +15,18 @@ Architecture:
 """
 
 import copy
+import csv
+import json
 import logging
 import math
+import shutil
 import time
+from collections import defaultdict
 from contextlib import contextmanager
-from typing import Any, Dict, Mapping, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,6 +55,357 @@ def soft_prob_cross_entropy(
         weights = weights.detach()
         return (losses * weights).sum() / weights.sum().clamp_min(1e-6)
     return losses.mean()
+
+
+def _select_routing_indices(
+    class_probs: torch.Tensor,
+    routing_weights: torch.Tensor,
+    num_samples: int,
+    candidate_classes: int,
+) -> list[int]:
+    """Select samples whose top candidate classes route most differently."""
+    if class_probs.ndim != 2 or routing_weights.ndim != 3:
+        raise ValueError("Expected class_probs [N,C] and routing_weights [N,C,K].")
+    if class_probs.size(0) != routing_weights.size(0):
+        raise ValueError("Probability and routing batches must have the same size.")
+
+    topk = min(max(2, int(candidate_classes)), class_probs.size(1))
+    top_classes = class_probs.topk(topk, dim=1).indices
+    scores = []
+    for index in range(class_probs.size(0)):
+        routes = routing_weights[index, top_classes[index]]
+        diversity = torch.cdist(routes, routes, p=1).max().item() * 0.5
+        scores.append((diversity, index, int(top_classes[index, 0].item())))
+
+    selected = []
+    used_predictions = set()
+    for _score, index, prediction in sorted(scores, reverse=True):
+        if prediction in used_predictions:
+            continue
+        selected.append(index)
+        used_predictions.add(prediction)
+        if len(selected) >= num_samples:
+            return selected
+    for _score, index, _prediction in sorted(scores, reverse=True):
+        if index not in selected:
+            selected.append(index)
+        if len(selected) >= num_samples:
+            break
+    return selected
+
+
+def _select_ambiguous_cases(
+    source_probs: torch.Tensor,
+    dcpr_probs: torch.Tensor,
+    labels: torch.Tensor,
+    ambiguity_weights: torch.Tensor,
+    num_pairs: int,
+    samples_per_pair: int,
+) -> list[dict]:
+    """Find Source Only errors corrected by DCPR, grouped by class pair."""
+    source_pred = source_probs.argmax(dim=1)
+    dcpr_pred = dcpr_probs.argmax(dim=1)
+    corrected = (source_pred != labels) & (dcpr_pred == labels)
+    grouped: dict[tuple[int, int], list[tuple[float, int]]] = defaultdict(list)
+
+    for index in corrected.nonzero(as_tuple=False).flatten().tolist():
+        true_class = int(labels[index].item())
+        confused_class = int(source_pred[index].item())
+        sample_score = (
+            float(source_probs[index, confused_class].item())
+            + float(dcpr_probs[index, true_class].item())
+            - float(source_probs[index, true_class].item())
+        )
+        grouped[(true_class, confused_class)].append((sample_score, index))
+
+    ranked_pairs = []
+    for pair, candidates in grouped.items():
+        true_class, confused_class = pair
+        ambiguity = 0.5 * (
+            float(ambiguity_weights[true_class].item())
+            + float(ambiguity_weights[confused_class].item())
+        )
+        ranked_pairs.append((len(candidates), ambiguity, pair, candidates))
+
+    cases = []
+    for count, ambiguity, pair, candidates in sorted(ranked_pairs, reverse=True)[:num_pairs]:
+        for rank, (_score, index) in enumerate(
+            sorted(candidates, reverse=True)[:samples_per_pair]
+        ):
+            cases.append(
+                {
+                    "index": index,
+                    "true_class": pair[0],
+                    "confused_class": pair[1],
+                    "pair_count": count,
+                    "pair_ambiguity": ambiguity,
+                    "sample_rank": rank,
+                }
+            )
+    return cases
+
+
+def _safe_analysis_name(value: str) -> str:
+    return "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value)
+
+
+def _copy_analysis_image(source: str, destination: Path) -> str:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    return str(destination)
+
+
+def _export_routing_materials(
+    output_dir: Path,
+    *,
+    samples: Sequence[tuple[str, int]],
+    class_names: Sequence[str],
+    source_domains: Sequence[str],
+    labels: torch.Tensor,
+    class_probs: torch.Tensor,
+    prototype_class_probs: torch.Tensor,
+    routing_weights: torch.Tensor,
+    num_samples: int,
+    candidate_classes: int,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_dir = output_dir / "images"
+    selected = _select_routing_indices(
+        class_probs,
+        routing_weights,
+        num_samples=min(num_samples, len(samples)),
+        candidate_classes=candidate_classes,
+    )
+    topk = min(max(2, candidate_classes), class_probs.size(1))
+    manifest = []
+
+    with (output_dir / "routing_weights.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "sample_id",
+                "dataset_index",
+                "candidate_class",
+                "candidate_name",
+                "source_domain",
+                "rho",
+                "is_top_candidate",
+            ],
+        )
+        writer.writeheader()
+        for sample_id, index in enumerate(selected):
+            path, _label = samples[index]
+            top_classes = class_probs[index].topk(topk).indices.tolist()
+            image_path = _copy_analysis_image(
+                path,
+                image_dir / f"{sample_id:02d}_{_safe_analysis_name(Path(path).name)}",
+            )
+            routes = routing_weights[index, top_classes]
+            diversity = float(torch.cdist(routes, routes, p=1).max().item() * 0.5)
+            manifest.append(
+                {
+                    "sample_id": sample_id,
+                    "dataset_index": index,
+                    "image": image_path,
+                    "original_image": path,
+                    "true_class": int(labels[index].item()),
+                    "true_name": class_names[int(labels[index].item())],
+                    "predicted_class": int(class_probs[index].argmax().item()),
+                    "predicted_name": class_names[int(class_probs[index].argmax().item())],
+                    "top_candidate_classes": top_classes,
+                    "top_candidate_names": [class_names[value] for value in top_classes],
+                    "routing_diversity": diversity,
+                }
+            )
+            top_set = set(top_classes)
+            for class_id in range(routing_weights.size(1)):
+                for domain_id, domain_name in enumerate(source_domains):
+                    writer.writerow(
+                        {
+                            "sample_id": sample_id,
+                            "dataset_index": index,
+                            "candidate_class": class_id,
+                            "candidate_name": class_names[class_id],
+                            "source_domain": domain_name,
+                            "rho": float(routing_weights[index, class_id, domain_id].item()),
+                            "is_top_candidate": class_id in top_set,
+                        }
+                    )
+
+    selected_tensor = torch.tensor(selected, dtype=torch.long)
+    np.savez_compressed(
+        output_dir / "routing_materials.npz",
+        dataset_indices=selected_tensor.numpy(),
+        labels=labels[selected_tensor].numpy(),
+        class_probs=class_probs[selected_tensor].numpy(),
+        prototype_class_probs=prototype_class_probs[selected_tensor].numpy(),
+        routing_weights=routing_weights[selected_tensor].numpy(),
+    )
+    (output_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "class_names": list(class_names),
+                "source_domains": list(source_domains),
+                "samples": manifest,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return output_dir / "manifest.json"
+
+
+def _export_ambiguous_materials(
+    output_dir: Path,
+    *,
+    samples: Sequence[tuple[str, int]],
+    class_names: Sequence[str],
+    source_domains: Sequence[str],
+    labels: torch.Tensor,
+    source_probs: torch.Tensor,
+    dcpr_probs: torch.Tensor,
+    routing_weights: torch.Tensor,
+    ambiguity_weights: torch.Tensor,
+    num_pairs: int,
+    samples_per_pair: int,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    image_dir = output_dir / "images"
+    cases = _select_ambiguous_cases(
+        source_probs,
+        dcpr_probs,
+        labels,
+        ambiguity_weights,
+        num_pairs=num_pairs,
+        samples_per_pair=samples_per_pair,
+    )
+    first_by_class = {}
+    for index, (_path, label) in enumerate(samples):
+        first_by_class.setdefault(int(label), index)
+
+    probability_rows = []
+    routing_rows = []
+    manifest = []
+    for case_id, case in enumerate(cases):
+        index = case["index"]
+        true_class = case["true_class"]
+        confused_class = case["confused_class"]
+        pair_name = (
+            f"{_safe_analysis_name(class_names[true_class])}__"
+            f"{_safe_analysis_name(class_names[confused_class])}"
+        )
+        case_dir = image_dir / f"{case_id:02d}_{pair_name}"
+        corrected_path = _copy_analysis_image(
+            samples[index][0],
+            case_dir / f"corrected_{Path(samples[index][0]).name}",
+        )
+        true_ref_index = first_by_class[true_class]
+        confused_ref_index = first_by_class[confused_class]
+        true_ref_path = _copy_analysis_image(
+            samples[true_ref_index][0],
+            case_dir / f"true_reference_{Path(samples[true_ref_index][0]).name}",
+        )
+        confused_ref_path = _copy_analysis_image(
+            samples[confused_ref_index][0],
+            case_dir / f"confused_reference_{Path(samples[confused_ref_index][0]).name}",
+        )
+
+        candidate_classes = [true_class, confused_class]
+        for model_name, probs in [("source_only", source_probs), ("dcpr", dcpr_probs)]:
+            for class_id in candidate_classes:
+                probability_rows.append(
+                    {
+                        "case_id": case_id,
+                        "model": model_name,
+                        "candidate_class": class_id,
+                        "candidate_name": class_names[class_id],
+                        "probability": float(probs[index, class_id].item()),
+                    }
+                )
+        for class_id in candidate_classes:
+            for domain_id, domain_name in enumerate(source_domains):
+                routing_rows.append(
+                    {
+                        "case_id": case_id,
+                        "candidate_class": class_id,
+                        "candidate_name": class_names[class_id],
+                        "source_domain": domain_name,
+                        "rho": float(routing_weights[index, class_id, domain_id].item()),
+                    }
+                )
+        manifest.append(
+            {
+                **case,
+                "case_id": case_id,
+                "true_name": class_names[true_class],
+                "confused_name": class_names[confused_class],
+                "corrected_image": corrected_path,
+                "true_reference_image": true_ref_path,
+                "confused_reference_image": confused_ref_path,
+                "original_corrected_image": samples[index][0],
+                "source_only_prediction": int(source_probs[index].argmax().item()),
+                "dcpr_prediction": int(dcpr_probs[index].argmax().item()),
+            }
+        )
+
+    for filename, rows, fields in [
+        (
+            "candidate_probabilities.csv",
+            probability_rows,
+            ["case_id", "model", "candidate_class", "candidate_name", "probability"],
+        ),
+        (
+            "candidate_routing_weights.csv",
+            routing_rows,
+            ["case_id", "candidate_class", "candidate_name", "source_domain", "rho"],
+        ),
+    ]:
+        with (output_dir / filename).open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    selected = torch.tensor([case["index"] for case in cases], dtype=torch.long)
+    np.savez_compressed(
+        output_dir / "ambiguous_materials.npz",
+        dataset_indices=selected.numpy(),
+        labels=labels[selected].numpy(),
+        source_probs=source_probs[selected].numpy(),
+        dcpr_probs=dcpr_probs[selected].numpy(),
+        routing_weights=routing_weights[selected].numpy(),
+        ambiguity_weights=ambiguity_weights.numpy(),
+    )
+    (output_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "class_names": list(class_names),
+                "source_domains": list(source_domains),
+                "cases": manifest,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    summary_lines = [
+        "# DCPR Ambiguous-Class Materials",
+        "",
+        f"- corrected cases exported: {len(cases)}",
+        f"- requested class pairs: {num_pairs}",
+        "",
+        "| case | true class | Source Only confusion | pair count | ambiguity |",
+        "|---:|---|---|---:|---:|",
+    ]
+    summary_lines.extend(
+        f"| {case['case_id']} | {case['true_name']} | {case['confused_name']} | "
+        f"{case['pair_count']} | {case['pair_ambiguity']:.4f} |"
+        for case in manifest
+    )
+    (output_dir / "summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    return output_dir / "manifest.json"
 
 
 class PrototypeRelationRouter(nn.Module):
@@ -371,6 +728,16 @@ class DCPRSolver(BaseSolver):
             raise ValueError("method.relation_space_mode must be 'standard' or 'domain_relative'")
         self.adaptive_head_scale = float(m.get("adaptive_head_scale", 10.0))
         self.ambiguity_relation_boost = float(m.get("ambiguity_relation_boost", 0.5))
+        analysis_cfg = m.get("analysis_export", {})
+        self.analysis_mode = str(analysis_cfg.get("mode", "none")).strip().lower()
+        if self.analysis_mode not in {"none", "routing", "ambiguous"}:
+            raise ValueError("method.analysis_export.mode must be none, routing, or ambiguous")
+        self.analysis_output_dir = Path(str(analysis_cfg.get("output_dir", "analysis_materials")))
+        self.analysis_num_samples = max(1, int(analysis_cfg.get("num_samples", 12)))
+        self.analysis_candidate_classes = max(2, int(analysis_cfg.get("candidate_classes", 5)))
+        self.analysis_source_checkpoint = analysis_cfg.get("source_checkpoint", None)
+        self.analysis_num_pairs = max(1, int(analysis_cfg.get("num_pairs", 6)))
+        self.analysis_samples_per_pair = max(1, int(analysis_cfg.get("samples_per_pair", 1)))
 
         self.total_epochs = int(m.get("epochs", 20))
         self.ramp_denom = float(m.get("ramp_denom", 16.0))
@@ -456,6 +823,12 @@ class DCPRSolver(BaseSolver):
             self.ramp_denom,
             str(self.cuda_batch_prefetch),
         )
+        if self.analysis_mode != "none":
+            logger.info(
+                "DCPR analysis export: mode=%s output=%s",
+                self.analysis_mode,
+                self.analysis_output_dir,
+            )
 
     def _uses_target_loader_in_training(self) -> bool:
         return self.lambda_relation_consistency > 0.0
@@ -1001,6 +1374,100 @@ class DCPRSolver(BaseSolver):
         if "relation_temperature" in state:
             self._set_relation_temperature(float(state["relation_temperature"]))
 
+    def _analysis_dataset_metadata(self):
+        dataset = self.target_test_loader.dataset
+        samples = list(getattr(dataset, "samples", []))
+        class_names = list(getattr(dataset, "class_names", []))
+        if not samples or not isinstance(samples[0][0], str):
+            raise ValueError(
+                "DCPR analysis export requires the files storage backend with image paths."
+            )
+        if len(class_names) != self.num_classes:
+            raise ValueError(
+                f"Expected {self.num_classes} target class names, got {len(class_names)}."
+            )
+        return samples, class_names
+
+    @torch.no_grad()
+    def _collect_analysis_outputs(self, model: DCPRNetwork):
+        model.eval()
+        labels_all = []
+        class_probs_all = []
+        prototype_probs_all = []
+        routing_all = []
+        for imgs, labels in self.target_test_loader:
+            imgs = self._to_device(imgs)
+            with self._auto_cast():
+                _, aux = self._forward_logits(
+                    model,
+                    x=imgs,
+                    use_target_center=True,
+                )
+            labels_all.append(labels.cpu())
+            class_probs_all.append(aux["class_probs"].float().cpu())
+            prototype_probs_all.append(aux["prototype_class_probs"].float().cpu())
+            routing_all.append(aux["domain_weights"].float().cpu())
+        return {
+            "labels": torch.cat(labels_all),
+            "class_probs": torch.cat(class_probs_all),
+            "prototype_class_probs": torch.cat(prototype_probs_all),
+            "routing_weights": torch.cat(routing_all),
+        }
+
+    def _load_analysis_source_model(self) -> DCPRNetwork:
+        if self.analysis_source_checkpoint is None:
+            raise ValueError(
+                "method.analysis_export.source_checkpoint is required for ambiguous mode."
+            )
+        checkpoint_path = Path(str(self.analysis_source_checkpoint))
+        if not checkpoint_path.is_absolute():
+            repo_root = Path(__file__).resolve().parents[2]
+            checkpoint_path = repo_root / checkpoint_path
+        checkpoint = self._load_checkpoint_file(checkpoint_path)
+        state = checkpoint.get("ema", checkpoint.get("student", checkpoint))
+        model = copy.deepcopy(self.ema_net)
+        model.load_state_dict(state, strict=False)
+        model.eval()
+        logger.info("Loaded Source Only analysis checkpoint from %s", checkpoint_path)
+        return model
+
+    def _export_analysis(self):
+        if self.analysis_mode == "none":
+            return
+        samples, class_names = self._analysis_dataset_metadata()
+        source_domains = list(self.config.dataset.sources)
+        outputs = self._collect_analysis_outputs(self.ema_net)
+        if self.analysis_mode == "routing":
+            manifest = _export_routing_materials(
+                self.analysis_output_dir,
+                samples=samples,
+                class_names=class_names,
+                source_domains=source_domains,
+                labels=outputs["labels"],
+                class_probs=outputs["class_probs"],
+                prototype_class_probs=outputs["prototype_class_probs"],
+                routing_weights=outputs["routing_weights"],
+                num_samples=self.analysis_num_samples,
+                candidate_classes=self.analysis_candidate_classes,
+            )
+        else:
+            source_model = self._load_analysis_source_model()
+            source_outputs = self._collect_analysis_outputs(source_model)
+            manifest = _export_ambiguous_materials(
+                self.analysis_output_dir,
+                samples=samples,
+                class_names=class_names,
+                source_domains=source_domains,
+                labels=outputs["labels"],
+                source_probs=source_outputs["class_probs"],
+                dcpr_probs=outputs["class_probs"],
+                routing_weights=outputs["routing_weights"],
+                ambiguity_weights=self.class_ambiguity_weights.detach().float().cpu(),
+                num_pairs=self.analysis_num_pairs,
+                samples_per_pair=self.analysis_samples_per_pair,
+            )
+        logger.info("DCPR analysis materials exported to %s", manifest)
+
     def train(self):
         self._save_start_epoch = int(self.save_ckpt_after_epoch)
         optimizer = self._build_optimizer()
@@ -1065,4 +1532,5 @@ class DCPRSolver(BaseSolver):
 
         if self._load_best_checkpoint_if_available():
             self._log_best_checkpoint_loaded("Acc")
+        self._export_analysis()
         self._log_training_complete(best_score=best_acc, score_name="Acc")

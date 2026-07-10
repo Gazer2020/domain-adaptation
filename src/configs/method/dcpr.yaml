@@ -50,3 +50,14 @@ target_aug:
 
 # Source-eval batch size used only when refreshing source prototypes.
 prototype_batch_size: 256
+
+# Optional raw-material export for routing/ambiguity figures. Disabled in
+# ordinary training and hyperparameter sweeps.
+analysis_export:
+  mode: none  # none, routing, ambiguous
+  output_dir: analysis_materials
+  num_samples: 12
+  candidate_classes: 5
+  source_checkpoint: null
+  num_pairs: 6
+  samples_per_pair: 1

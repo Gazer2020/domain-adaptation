@@ -346,6 +346,8 @@ def launch_in_screen(args: argparse.Namespace, spec: dict) -> None:
     ]
     if args.resume:
         rerun.append("--resume")
+    if args.continue_on_error:
+        rerun.append("--continue-on-error")
     if args.notify_feishu:
         rerun.append("--notify-feishu")
     if args.notify_each_run:

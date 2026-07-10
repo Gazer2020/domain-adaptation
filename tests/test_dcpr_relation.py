@@ -140,3 +140,46 @@ def test_consistency_targets_select_distinct_distributions():
 
     solver.consistency_target = "class_only"
     assert solver._consistency_distribution(aux) is aux["prototype_class_probs"]
+
+
+def test_routing_selection_prefers_class_conditioned_route_diversity():
+    probs = torch.tensor([[0.6, 0.4], [0.6, 0.4]])
+    routes = torch.tensor(
+        [
+            [[0.5, 0.5], [0.5, 0.5]],
+            [[0.95, 0.05], [0.05, 0.95]],
+        ]
+    )
+
+    assert dcpr._select_routing_indices(probs, routes, 1, 2) == [1]
+
+
+def test_ambiguous_selection_keeps_source_errors_corrected_by_dcpr():
+    source_probs = torch.tensor(
+        [
+            [0.2, 0.7, 0.1],
+            [0.1, 0.2, 0.7],
+            [0.8, 0.1, 0.1],
+        ]
+    )
+    dcpr_probs = torch.tensor(
+        [
+            [0.8, 0.1, 0.1],
+            [0.1, 0.8, 0.1],
+            [0.8, 0.1, 0.1],
+        ]
+    )
+    labels = torch.tensor([0, 1, 0])
+    cases = dcpr._select_ambiguous_cases(
+        source_probs,
+        dcpr_probs,
+        labels,
+        torch.tensor([1.0, 0.5, 0.0]),
+        num_pairs=2,
+        samples_per_pair=1,
+    )
+
+    assert {(case["true_class"], case["confused_class"]) for case in cases} == {
+        (0, 1),
+        (1, 2),
+    }
